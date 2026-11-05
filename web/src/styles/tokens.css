@@ -1,0 +1,112 @@
+/* ==========================================================================
+   Mnemos Design Tokens — "Aurora Console"
+   深空黑底 + 极光渐变 + 1px 发丝描边 + 玻璃浮层。所有页面只消费变量，不硬编码颜色。
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* 字体 */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Cascadia Code', Menlo, monospace;
+
+  /* 圆角 */
+  --radius-xs: 6px;
+  --radius-sm: 9px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --radius-full: 999px;
+
+  /* 背景与表面 */
+  --bg: #06070b;
+  --bg-deep: #030407;
+  --panel: #0a0c12;
+  --panel-2: #0d1017;
+  --surface: rgba(255, 255, 255, 0.034);
+  --surface-hover: rgba(255, 255, 255, 0.056);
+  --surface-strong: rgba(255, 255, 255, 0.085);
+  --surface-inset: rgba(0, 0, 0, 0.25);
+  --border: rgba(255, 255, 255, 0.078);
+  --border-strong: rgba(255, 255, 255, 0.15);
+  --border-faint: rgba(255, 255, 255, 0.045);
+
+  /* 文本 */
+  --text: #eef1f8;
+  --text-soft: #c5cad8;
+  --text-muted: #8d94a8;
+  --text-dim: #606779;
+  --text-inverse: #07080c;
+
+  /* 品牌色 */
+  --violet: #8b7cff;
+  --violet-strong: #7563ff;
+  --cyan: #38d4f0;
+  --pink: #f472b6;
+  --amber: #fbbf24;
+  --lime: #a3e635;
+  --blue: #60a5fa;
+  --red: #f87171;
+  --slate: #94a3b8;
+  --green: #34d399;
+
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --info: #60a5fa;
+
+  --primary: var(--violet);
+  --primary-soft: rgba(139, 124, 255, 0.14);
+  --primary-border: rgba(139, 124, 255, 0.38);
+
+  --gradient-primary: linear-gradient(135deg, #8b7cff 0%, #4fc3f7 55%, #33e6c8 100%);
+  --gradient-primary-soft: linear-gradient(135deg, rgba(139, 124, 255, 0.22), rgba(79, 195, 247, 0.12));
+  --gradient-surface: linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.012));
+  --gradient-card: linear-gradient(160deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.012) 46%, rgba(255, 255, 255, 0.025));
+  --gradient-text: linear-gradient(120deg, #ffffff 10%, #b9b2ff 48%, #6fd8f5 92%);
+
+  /* 阴影与光晕 */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 12px 32px -12px rgba(0, 0, 0, 0.65);
+  --shadow-lg: 0 32px 80px -24px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  --glow-primary: 0 0 0 1px rgba(139, 124, 255, 0.3), 0 12px 40px -12px rgba(139, 124, 255, 0.45);
+  --ring: 0 0 0 3px rgba(139, 124, 255, 0.22);
+
+  /* 动效 */
+  --ease: cubic-bezier(0.22, 0.68, 0.35, 1.02);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --dur-slow: 320ms;
+
+  /* 布局 */
+  --sidebar-w: 258px;
+  --sidebar-w-collapsed: 76px;
+  --topbar-h: 60px;
+  --content-max: 1480px;
+  --page-pad: 32px;
+}
+
+/* 语义色调（badge / 圆点 / 图表统一走 --tone 三元组） */
+.tone-violet { --tone: #a78bfa; --tone-tint: rgba(167, 139, 250, 0.14); --tone-line: rgba(167, 139, 250, 0.32); }
+.tone-cyan   { --tone: #38d4f0; --tone-tint: rgba(56, 212, 240, 0.13); --tone-line: rgba(56, 212, 240, 0.3); }
+.tone-pink   { --tone: #f472b6; --tone-tint: rgba(244, 114, 182, 0.13); --tone-line: rgba(244, 114, 182, 0.3); }
+.tone-amber  { --tone: #fbbf24; --tone-tint: rgba(251, 191, 36, 0.12); --tone-line: rgba(251, 191, 36, 0.3); }
+.tone-lime   { --tone: #a3e635; --tone-tint: rgba(163, 230, 53, 0.12); --tone-line: rgba(163, 230, 53, 0.28); }
+.tone-blue   { --tone: #60a5fa; --tone-tint: rgba(96, 165, 250, 0.13); --tone-line: rgba(96, 165, 250, 0.3); }
+.tone-red    { --tone: #f87171; --tone-tint: rgba(248, 113, 113, 0.12); --tone-line: rgba(248, 113, 113, 0.3); }
+.tone-slate  { --tone: #94a3b8; --tone-tint: rgba(148, 163, 184, 0.12); --tone-line: rgba(148, 163, 184, 0.26); }
+.tone-green  { --tone: #34d399; --tone-tint: rgba(52, 211, 153, 0.12); --tone-line: rgba(52, 211, 153, 0.3); }
+
+/* 图表色板 */
+:root {
+  --chart-1: #8b7cff;
+  --chart-2: #38d4f0;
+  --chart-3: #f472b6;
+  --chart-4: #fbbf24;
+  --chart-5: #a3e635;
+  --chart-6: #60a5fa;
+  --chart-grid: rgba(255, 255, 255, 0.055);
+}

@@ -1,0 +1,19 @@
+# Grafana 数据源：Prometheus
+# url 由 environment 中的 PROMETHEUS_URL 注入；本地 Compose 默认 http://prometheus:9090。
+# 单独运行（非 Compose）时请设置 PROMETHEUS_URL=http://prometheus:9090。
+# Grafana 的 provisioning 只支持 $VAR / ${VAR}，不支持 shell 的 :-默认值语法。
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: ${PROMETHEUS_URL}
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+      prometheusType: Prometheus
+      prometheusVersion: "2.55.1"

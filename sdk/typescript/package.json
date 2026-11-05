@@ -1,0 +1,41 @@
+{
+  "name": "@mnemos/sdk",
+  "version": "1.0.0",
+  "description": "Mnemos 官方 TypeScript SDK：记忆写入 / 混合检索 / Agent 与原任务简报 / 图谱与统计。零运行时依赖，Node ≥18 与浏览器通用。",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.ts",
+    "example": "node examples/basic.ts"
+  },
+  "keywords": [
+    "mnemos",
+    "memory",
+    "agent",
+    "rag",
+    "sdk"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

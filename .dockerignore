@@ -1,0 +1,21 @@
+# 构建上下文裁剪：镜像只依赖源码、锁文件与构建配置。
+.git
+.github
+.gitignore
+node_modules
+**/node_modules
+data
+.mnemos-data
+.run
+.screenshots
+.chrome-profile
+.chrome-*
+coverage
+docs
+*.log
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+docker-compose.yml
+README.md

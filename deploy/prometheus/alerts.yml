@@ -1,0 +1,140 @@
+# Mnemos 告警规则
+#
+# 指标来源：Mnemos /metrics（Prometheus 文本格式）
+# runbook_url 指向仓库内 docs/observability.md 的锚点；部署时可按需补全为
+# https://<your-git-host>/<org>/mnemos/blob/main/docs/observability.md#<anchor>
+groups:
+  - name: mnemos.rules
+    interval: 30s
+    rules:
+      # ------------------------------------------------------------------
+      # 可用性
+      # ------------------------------------------------------------------
+      - alert: MnemosDown
+        expr: up{job="mnemos"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: mnemos
+        annotations:
+          summary: "Mnemos 实例不可达（{{ $labels.instance }}）"
+          description: >-
+            Prometheus 已连续 2 分钟无法抓取 {{ $labels.instance }} 的 /metrics。
+            检查进程、端口、反向代理与防火墙；确认 /healthz 与 /readyz 状态。
+          runbook_url: "docs/observability.md#mnemosdown"
+
+      # ------------------------------------------------------------------
+      # 请求质量
+      # ------------------------------------------------------------------
+      - alert: MnemosHighErrorRate
+        expr: >-
+          100 * sum(rate(mnemos_http_requests_total{job="mnemos",status=~"5.."}[5m]))
+          / clamp_min(sum(rate(mnemos_http_requests_total{job="mnemos"}[5m])), 0.001) > 2
+        for: 5m
+        labels:
+          severity: warning
+          service: mnemos
+        annotations:
+          summary: "Mnemos 5xx 错误率超过 2%"
+          description: >-
+            最近 5 分钟 5xx 请求占比为 {{ printf "%.2f" $value }}%（阈值 2%）。
+            查看 Grafana「Mnemos Overview → 5xx 错误率」定位 route 与状态码，
+            再结合结构化日志中的 requestId 排查。
+          runbook_url: "docs/observability.md#mnemoshigherrorrate"
+
+      - alert: MnemosHighLatencyP95
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (le) (rate(mnemos_http_request_duration_milliseconds_bucket{job="mnemos"}[5m]))
+          ) / 1000 > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          service: mnemos
+        annotations:
+          summary: "Mnemos p95 延迟超过 500ms"
+          description: >-
+            最近 5 分钟全局 p95 延迟为 {{ printf "%.3f" $value }} 秒（阈值 0.5 秒），
+            已持续 10 分钟。检查数据库锁、慢查询、备份/VACUUM 争 I/O 或下游模型调用。
+          runbook_url: "docs/observability.md#mnemoshighlatencyp95"
+
+      # ------------------------------------------------------------------
+      # 鉴权与限流
+      # ------------------------------------------------------------------
+      - alert: MnemosAuthFailureSpike
+        expr: sum(increase(mnemos_auth_failures_total{job="mnemos"}[5m])) > 20
+        for: 2m
+        labels:
+          severity: warning
+          service: mnemos
+        annotations:
+          summary: "Mnemos 鉴权失败次数激增"
+          description: >-
+            最近 5 分钟鉴权失败 {{ printf "%.0f" $value }} 次（阈值 20）。
+            可能是凭据轮换后客户端未更新、暴力破解或登录锁定触发；
+            查看审计日志与来源 IP，必要时在反向代理层封禁。
+          runbook_url: "docs/observability.md#mnemosauthfailurespike"
+
+      - alert: MnemosRateLimitedSpike
+        expr: sum(increase(mnemos_rate_limited_total{job="mnemos"}[5m])) > 10
+        for: 2m
+        labels:
+          severity: warning
+          service: mnemos
+        annotations:
+          summary: "Mnemos 限流触发次数激增"
+          description: >-
+            最近 5 分钟被限流 {{ printf "%.0f" $value }} 次（阈值 10）。
+            确认是否为单客户端突发流量、配置错误的轮询任务或攻击；
+            查看 Grafana 限流面板的 route 维度，必要时调整配额或封禁来源。
+          runbook_url: "docs/observability.md#mnemosratelimitedspike"
+
+      # ------------------------------------------------------------------
+      # Webhook 投递
+      # ------------------------------------------------------------------
+      - alert: MnemosWebhookFailures
+        expr: >-
+          100 * sum(rate(mnemos_webhook_deliveries_total{job="mnemos",status=~"failed|dead"}[10m]))
+          / clamp_min(sum(rate(mnemos_webhook_deliveries_total{job="mnemos"}[10m])), 0.001) > 20
+        for: 5m
+        labels:
+          severity: warning
+          service: mnemos
+        annotations:
+          summary: "Mnemos Webhook 失败率超过 20%"
+          description: >-
+            最近 10 分钟 failed + dead 投递占比为 {{ printf "%.2f" $value }}%（阈值 20%）。
+            检查目标端可用性、签名/密钥、网络出口与 SSRF 白名单；
+            dead 表示已超过最大重试次数，需要手动补投或让订阅方重新注册。
+          runbook_url: "docs/observability.md#mnemoswebhookfailures"
+
+      - alert: MnemosWebhookQueueBacklog
+        expr: max(mnemos_webhook_queue_depth{job="mnemos"}) > 100
+        for: 10m
+        labels:
+          severity: warning
+          service: mnemos
+        annotations:
+          summary: "Mnemos Webhook 队列积压（> 100）"
+          description: >-
+            待投递队列长度为 {{ printf "%.0f" $value }}，已持续 10 分钟。
+            说明投递吞吐不足或目标端持续超时；检查 worker 日志、目标端限流与
+            webhook 超时配置，必要时扩容或暂停低优先级订阅。
+          runbook_url: "docs/observability.md#mnemoswebhookqueuebacklog"
+
+      # ------------------------------------------------------------------
+      # 维护任务
+      # ------------------------------------------------------------------
+      - alert: MnemosMaintenanceFailure
+        expr: sum(increase(mnemos_maintenance_runs_total{job="mnemos",status="failed"}[6h])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: mnemos
+        annotations:
+          summary: "Mnemos 维护任务失败"
+          description: >-
+            最近 6 小时有 {{ printf "%.0f" $value }} 次维护任务失败。
+            查看 /api/ops/maintenance 历史与日志中的 maintenance.* 字段；
+            常见原因：磁盘空间不足、数据库锁、备份目录不可写。
+          runbook_url: "docs/observability.md#mnemosmaintenancefailure"

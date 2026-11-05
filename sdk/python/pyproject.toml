@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mnemos-sdk"
+version = "1.0.0"
+description = "Mnemos 官方 Python SDK：记忆写入 / 混合检索 / Agent 原生任务与会话简报"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["mnemos", "memory", "agent", "rag", "sdk"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[tool.setuptools.package-data]
+mnemos_sdk = ["py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mnemos_sdk*"]

@@ -1,0 +1,63 @@
+name: mnemos-observability
+
+# 本地观测栈：Prometheus + Grafana + OpenTelemetry Collector。
+# Mnemos 本身不在此 Compose 内，作为宿主机进程运行（默认 127.0.0.1:4380）。
+#
+# 注意：本机未安装 Docker，此文件未做真机启动验证；配置按官方镜像文档编写。
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: mnemos-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ../prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    # 让容器内可以用 host.docker.internal 访问宿主机上的 Mnemos :4380。
+    # Linux 上依赖 Docker 20.10+ 的 host-gateway；macOS/Windows Docker Desktop 原生支持。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: mnemos-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      # 仅本地开发使用；生产必须换成强密码并关闭匿名访问。
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/mnemos-overview.json
+      # 供 provisioning/datasources/prometheus.yml 中的 ${PROMETHEUS_URL:-...} 使用。
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.115.0
+    container_name: mnemos-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      # 只暴露 OTLP/HTTP；Mnemos 默认端点为 http://127.0.0.1:4318/v1/traces。
+      - "4318:4318"
+
+volumes:
+  prometheus-data:
+  grafana-data:

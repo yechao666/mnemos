@@ -1,0 +1,106 @@
+# =============================================================================
+# Mnemos 单节点生产编排（Docker Compose）
+# -----------------------------------------------------------------------------
+# 用法：
+#   docker compose up -d --build
+#   docker compose logs -f mnemos
+#   docker compose exec mnemos node -e "fetch('http://127.0.0.1:4380/readyz').then(r=>console.log(r.status))"
+#
+# 注意：本机没有 Docker，本文件未经 `docker compose config` / 真机容器验证。
+# =============================================================================
+services:
+  mnemos:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mnemos:local
+    container_name: mnemos
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
+
+    # 生产建议只绑定回环地址，由 Nginx/Caddy 终止 TLS：
+    #   - '127.0.0.1:4380:4380'
+    ports:
+      - '4380:4380'
+
+    environment:
+      NODE_ENV: production
+      MNEMOS_HOST: 0.0.0.0
+      MNEMOS_PORT: 4380
+      MNEMOS_DATA_DIR: /app/data
+      MNEMOS_BACKUP_DIR: /app/data/backups
+
+      # 生产必须关闭演示数据自动写入（已有数据时此开关不影响读取）。
+      # 首次部署若数据库为空、尚无管理员，可临时设为 '1' 完成初始化，
+      # 创建管理员/改密/吊销演示密钥后改回 '0' 并重启。
+      # 管理员引导脚本为 P1 待办，见 docs/production-readiness.md。
+      MNEMOS_DEMO: '0'
+      # MNEMOS_DEMO: '1'
+
+      # 会话与安全
+      MNEMOS_SESSION_TTL_HOURS: '72'
+      MNEMOS_AUTH_DISABLED: '0'
+      MNEMOS_LOGIN_MAX_ATTEMPTS: '5'
+      MNEMOS_LOGIN_LOCK_MINUTES: '15'
+
+      # 日志与指标
+      MNEMOS_LOG_LEVEL: info
+      MNEMOS_LOG_FORMAT: json
+      MNEMOS_METRICS_ENABLED: '1'
+
+      # 运行参数
+      # 仅在反向代理之后设为 '1'（信任 X-Forwarded-For）；直接暴露端口时必须为 '0'，
+      # 否则客户端可伪造来源 IP 绕过登录限流并污染审计。
+      MNEMOS_TRUST_PROXY: '0'
+      MNEMOS_HSTS: '0' # 由反代终止 TLS 后改为 '1'
+      MNEMOS_QUOTA_ENFORCE: '1'
+      MNEMOS_REQUEST_TIMEOUT_MS: '30000'
+      MNEMOS_SHUTDOWN_TIMEOUT_MS: '10000'
+      MNEMOS_MAINTENANCE_INTERVAL_MIN: '360'
+      MNEMOS_BODY_LIMIT_BYTES: '1048576'
+
+      # 可选：接入 OpenAI 兼容模型（不配置则使用本地确定性抽取/嵌入）
+      # MNEMOS_LLM_BASE_URL: https://api.openai.com/v1
+      # MNEMOS_LLM_API_KEY: sk-...
+      # MNEMOS_LLM_MODEL: gpt-4o-mini
+      # MNEMOS_EMBEDDING_MODEL: text-embedding-3-small
+
+    volumes:
+      - mnemos-data:/app/data
+
+    # 资源限制（单机小规模建议值；按压测结果调整）
+    # 注意：mem_limit/cpus 是 Compose V2 的宿主机级限制；
+    # 使用 Swarm 时改用下方 deploy.resources。
+    # mem_limit: 512m
+    # mem_reservation: 128m
+    # cpus: 1.0
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 512M
+    #       cpus: '1.0'
+
+    healthcheck:
+      # 优先 /readyz；未上线时回退 /api/health。
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "(async()=>{const base='http://127.0.0.1:4380';let res=await fetch(base+'/readyz');if(res.status===404)res=await fetch(base+'/api/health');process.exit(res.ok?0:1)})().catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+volumes:
+  mnemos-data:
+    name: mnemos-data

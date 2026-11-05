@@ -1,0 +1,26 @@
+# 本地 Prometheus 配置：抓取宿主机上运行的 Mnemos（默认 127.0.0.1:4380）。
+#
+# 说明：
+#  - Prometheus 在容器内运行，host.docker.internal 指向宿主机（见 docker-compose.yml 的 extra_hosts）。
+#  - 若 Mnemos 也运行在同一个 Compose 网络中，把 targets 改成 mnemos:4380 即可。
+#  - /metrics 默认无需鉴权，生产环境应只在内网暴露。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: mnemos-local
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: mnemos
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 5s
+    static_configs:
+      - targets:
+          - host.docker.internal:4380
+        labels:
+          service: mnemos
+          env: local

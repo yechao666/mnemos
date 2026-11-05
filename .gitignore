@@ -1,0 +1,13 @@
+node_modules/
+dist/
+data/
+.run/
+*.log
+.DS_Store
+*.tsbuildinfo
+.mnemos-data/
+server/data/
+web/dist/
+coverage/
+.chrome-profile/
+.screenshots/
