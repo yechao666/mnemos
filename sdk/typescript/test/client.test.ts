@@ -536,6 +536,7 @@ test('任务结束与简报：snake_case 请求体、嵌套模型归一化', asy
       citations: ['mem_2'],
       builtAt: '2026-11-05T10:00:00.000Z',
       tookMs: 12,
+      brief: { text: '最近约定：查询走只读副本。', maxChars: 500, count: 3 },
     });
   });
   try {
@@ -565,6 +566,8 @@ test('任务结束与简报：snake_case 请求体、嵌套模型归一化', asy
     assert.equal(briefing.built_at, '2026-11-05T10:00:00.000Z');
     assert.equal(briefing.sections[0]?.key, 'project');
     assert.equal(briefing.agent, null);
+    assert.equal(briefing.brief?.max_chars, 500);
+    assert.equal(briefing.brief?.count, 3);
   } finally {
     await server.close();
   }
@@ -875,6 +878,174 @@ test('详情、历史、反馈与 Agent 注册表：嵌套字段归一化', asyn
       name: '开发 Agent',
       capabilities: ['code-review'],
     });
+  } finally {
+    await server.close();
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 14. 记忆简报与做梦（控制台 API）                                    */
+/* ------------------------------------------------------------------ */
+
+const briefFixture = {
+  projectId: 'prj_atlas',
+  text: '最近约定：查询走只读副本；支付回调必须带幂等键。',
+  maxChars: 500,
+  count: 2,
+  model: 'mnemos-condense',
+  cached: false,
+  generatedAt: '2026-11-05T12:00:00.000Z',
+  recent: [
+    {
+      id: 'mem_1',
+      content: '查询走只读副本。',
+      category: 'fact',
+      importance: 0.8,
+      updatedAt: '2026-11-05T11:00:00.000Z',
+      taskId: 'task-1',
+      agentId: 'agent-1',
+    },
+  ],
+};
+
+const dreamRunFixture = {
+  id: 'dream_1',
+  projectId: 'prj_atlas',
+  trigger: 'manual',
+  status: 'completed',
+  inputCount: 4,
+  insightCount: 2,
+  summary: '已整理 4 条新记忆，形成 2 条洞见',
+  startedAt: '2026-11-05T12:00:00.000Z',
+  finishedAt: '2026-11-05T12:00:03.000Z',
+};
+
+function dreamStatusFixture() {
+  return {
+    settings: { enabled: true, intervalMinutes: 1440, lastAt: '2026-11-05T12:00:03.000Z' },
+    pendingCount: 4,
+    lastRun: dreamRunFixture,
+    runs: [dreamRunFixture],
+  };
+}
+
+test('记忆简报：GET 查询参数、camelCase 响应归一化为 snake_case', async () => {
+  const server = await startMock((req, res) => {
+    if (req.method === 'GET' && req.url?.startsWith('/api/projects/prj_atlas/memory/brief')) {
+      sendJson(res, 200, briefFixture);
+      return;
+    }
+    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+  });
+  try {
+    const client = clientFor(server);
+    const brief = await client.brief('prj_atlas', {
+      force: true,
+      agentId: 'agent-coder',
+      maxChars: 800,
+    });
+
+    const url = new URL(server.requests[0]?.url ?? '', 'http://127.0.0.1');
+    assert.equal(url.pathname, '/api/projects/prj_atlas/memory/brief');
+    assert.equal(url.searchParams.get('force'), 'true');
+    assert.equal(url.searchParams.get('agentId'), 'agent-coder');
+    assert.equal(url.searchParams.get('maxChars'), '800');
+    assert.equal(url.searchParams.has('includePrivate'), false);
+
+    assert.equal(brief.project_id, 'prj_atlas');
+    assert.equal(brief.max_chars, 500);
+    assert.equal(brief.count, 2);
+    assert.equal(brief.model, 'mnemos-condense');
+    assert.equal(brief.cached, false);
+    assert.equal(brief.generated_at, '2026-11-05T12:00:00.000Z');
+    assert.equal(brief.recent[0]?.updated_at, '2026-11-05T11:00:00.000Z');
+    assert.equal(brief.recent[0]?.task_id, 'task-1');
+    assert.equal(brief.recent[0]?.agent_id, 'agent-1');
+  } finally {
+    await server.close();
+  }
+});
+
+test('记忆简报：PATCH 发送 maxChars，返回更新后的 MemoryBrief', async () => {
+  const server = await startMock((req, res) => {
+    if (req.method === 'PATCH') {
+      sendJson(res, 200, { ...briefFixture, maxChars: 1200 });
+      return;
+    }
+    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+  });
+  try {
+    const client = clientFor(server);
+    const brief = await client.updateBriefSettings('prj_atlas', 1200);
+
+    assert.equal(server.requests[0]?.method, 'PATCH');
+    assert.equal(server.requests[0]?.url, '/api/projects/prj_atlas/memory/brief');
+    assert.deepEqual(JSON.parse(server.requests[0]?.body ?? '{}'), { maxChars: 1200 });
+    assert.equal(brief.max_chars, 1200);
+    assert.equal(brief.count, 2);
+  } finally {
+    await server.close();
+  }
+});
+
+test('做梦：状态 / 设置 / 手动运行 / 409 正在做梦', async () => {
+  let runCalls = 0;
+  const server = await startMock((req, res) => {
+    const path = (req.url ?? '').split('?')[0];
+    if (req.method === 'GET' && path === '/api/projects/prj_atlas/memory/dream') {
+      sendJson(res, 200, dreamStatusFixture());
+      return;
+    }
+    if (req.method === 'PATCH' && path === '/api/projects/prj_atlas/memory/dream') {
+      sendJson(res, 200, {
+        ...dreamStatusFixture(),
+        settings: { enabled: false, intervalMinutes: 120 },
+      });
+      return;
+    }
+    if (req.method === 'POST' && path === '/api/projects/prj_atlas/memory/dream/run') {
+      runCalls += 1;
+      if (runCalls === 1) {
+        sendJson(res, 200, { run: dreamRunFixture, status: dreamStatusFixture() });
+        return;
+      }
+      sendJson(res, 409, { error: { code: 'dream_in_progress', message: '该项目正在做梦' } });
+      return;
+    }
+    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+  });
+  try {
+    const client = clientFor(server);
+
+    const status = await client.dream('prj_atlas');
+    assert.equal(status.pending_count, 4);
+    assert.equal(status.settings.interval_minutes, 1440);
+    assert.equal(status.settings.last_at, '2026-11-05T12:00:03.000Z');
+    assert.equal(status.last_run?.insight_count, 2);
+    assert.equal(status.runs[0]?.trigger, 'manual');
+
+    const updated = await client.updateDreamSettings('prj_atlas', { enabled: false, intervalMinutes: 120 });
+    assert.deepEqual(JSON.parse(server.requests[1]?.body ?? '{}'), {
+      enabled: false,
+      intervalMinutes: 120,
+    });
+    assert.equal(updated.settings.enabled, false);
+    assert.equal(updated.settings.interval_minutes, 120);
+
+    const result = await client.runDream('prj_atlas');
+    assert.equal(server.requests[2]?.method, 'POST');
+    assert.equal(server.requests[2]?.url, '/api/projects/prj_atlas/memory/dream/run');
+    assert.equal(result.run?.id, 'dream_1');
+    assert.equal(result.run?.input_count, 4);
+    assert.equal(result.run?.finished_at, '2026-11-05T12:00:03.000Z');
+    assert.equal(result.status.pending_count, 4);
+
+    // 第二次触发返回 409：SDK 返回 { run: null, status } 并回读状态。
+    const busy = await client.runDream('prj_atlas');
+    assert.equal(busy.run, null);
+    assert.equal(busy.status.pending_count, 4);
+    assert.equal(server.requests[4]?.method, 'GET');
+    assert.equal(server.requests[4]?.url, '/api/projects/prj_atlas/memory/dream');
   } finally {
     await server.close();
   }

@@ -11,6 +11,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type {
   Agent,
   Briefing,
+  BriefingBrief,
   BriefingInput,
   BriefingSection,
   BriefingSectionKey,
@@ -26,7 +27,9 @@ import type {
 import { nowIso } from '../lib/ids.ts';
 import { estimateTokens } from '../lib/usage.ts';
 import { getAgent } from './agents.ts';
+import { buildBriefText } from './brief.ts';
 import { notFound } from './errors.ts';
+import { loadSettings } from './store.ts';
 import { getTask, listTasks } from './tasks.ts';
 
 export interface BriefingDeps {
@@ -165,6 +168,21 @@ export async function buildBriefing(deps: BriefingDeps, input: BriefingInput): P
     (task ? [task.title, task.goal].filter((part) => part.length > 0).join(' ') : '') ||
     '项目经验 实践 复盘';
 
+  // 记忆简报：项目开启 briefEnabled 时，把最近记忆/洞见压缩成一段固定格式文本，
+  // 同时注入 prompt（不调 LLM、不写缓存）并出现在响应 brief 字段里。
+  const settings = loadSettings(deps.db, input.projectId);
+  let brief: BriefingBrief | undefined;
+  if (settings.briefEnabled !== false) {
+    const built = buildBriefText(deps.db, input.projectId, {
+      maxChars: settings.briefMaxChars,
+      agentId: input.agentId,
+      includePrivate: input.includePrivate ?? false,
+    });
+    if (built.count > 0) {
+      brief = { text: built.text, maxChars: settings.briefMaxChars, count: built.count };
+    }
+  }
+
   const specs: SectionSpec[] = [
     {
       key: 'project',
@@ -189,7 +207,7 @@ export async function buildBriefing(deps: BriefingDeps, input: BriefingInput): P
       title: '架构决策',
       description: '已确定的架构方案、技术选型与计划',
       query: '架构决策 方案 选型',
-      categories: ['fact', 'plan'],
+      categories: ['decision', 'fact', 'plan'],
       topK: 5,
       fill: true,
     },
@@ -277,6 +295,17 @@ export async function buildBriefing(deps: BriefingDeps, input: BriefingInput): P
       : '- 当前任务：未指定',
   );
 
+  if (brief) {
+    pushLine('');
+    pushLine('## 记忆简报（最近记忆与洞见）');
+    // 简报正文自带 `# 记忆简报…` 标题，这里去掉首行避免重复，其余按原文逐行注入。
+    const body = brief.text.split('\n');
+    if (body[0]?.startsWith('# 记忆简报')) body.shift();
+    for (const line of body) {
+      if (!pushLine(line)) break;
+    }
+  }
+
   const tasksSection = sections.find((section) => section.key === 'open_tasks');
   if (tasksSection) {
     pushLine('');
@@ -320,5 +349,6 @@ export async function buildBriefing(deps: BriefingDeps, input: BriefingInput): P
   };
   if (agent) result.agent = agent;
   if (task) result.task = task;
+  if (brief) result.brief = brief;
   return result;
 }

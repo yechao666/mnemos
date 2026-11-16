@@ -10,6 +10,7 @@ import {
   type CSSProperties,
   type InputHTMLAttributes,
   type ReactNode,
+  type PointerEvent as ReactPointerEvent,
   type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
 } from 'react';
@@ -874,6 +875,8 @@ export interface Column<T> {
   render?: (row: T, index: number) => ReactNode;
   mono?: boolean;
   className?: string;
+  sortValue?: (row: T) => string | number | null | undefined;
+  sortable?: boolean;
 }
 
 export function Table<T>({
@@ -885,6 +888,8 @@ export function Table<T>({
   empty,
   selectedKeys,
   onToggleKey,
+  sortable = false,
+  resizable = false,
 }: {
   columns: Column<T>[];
   rows: T[];
@@ -894,7 +899,66 @@ export function Table<T>({
   empty?: ReactNode;
   selectedKeys?: Set<string>;
   onToggleKey?: (key: string) => void;
+  sortable?: boolean;
+  resizable?: boolean;
 }) {
+  const [sort, setSort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>(null);
+  const [widths, setWidths] = useState<Record<string, number>>(() => {
+    const next: Record<string, number> = {};
+    for (const column of columns) next[column.key] = typeof column.width === 'number' ? column.width : 150;
+    return next;
+  });
+
+  const columnWidth = (column: Column<T>) =>
+    widths[column.key] ?? (typeof column.width === 'number' ? column.width : 150);
+
+  const sortedRows = useMemo(() => {
+    if (!sortable || !sort) return rows;
+    const column = columns.find((item) => item.key === sort.key);
+    if (!column) return rows;
+    const value = (row: T) =>
+      column.sortValue ? column.sortValue(row) : (row as unknown as Record<string, unknown>)[column.key];
+    return [...rows].sort((a, b) => {
+      const left = value(a);
+      const right = value(b);
+      if (left == null && right == null) return 0;
+      if (left == null) return 1;
+      if (right == null) return -1;
+      const result =
+        typeof left === 'number' && typeof right === 'number'
+          ? left - right
+          : String(left).localeCompare(String(right), 'zh-CN', { numeric: true });
+      return sort.dir === 'asc' ? result : -result;
+    });
+  }, [rows, sort, sortable, columns]);
+
+  const toggleSort = (key: string) => {
+    setSort((current) => {
+      if (!current || current.key !== key) return { key, dir: 'asc' };
+      if (current.dir === 'asc') return { key, dir: 'desc' };
+      return null;
+    });
+  };
+
+  const startResize = (event: ReactPointerEvent<HTMLElement>, column: Column<T>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const startX = event.clientX;
+    const startWidth = columnWidth(column);
+    const move = (moveEvent: PointerEvent) => {
+      setWidths((current) => ({
+        ...current,
+        [column.key]: Math.max(72, startWidth + moveEvent.clientX - startX),
+      }));
+    };
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
+  };
+
   if (loading) {
     return (
       <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -908,23 +972,46 @@ export function Table<T>({
 
   return (
     <div className="table-wrap">
-      <table className="table">
+      <table className={`table${resizable ? ' table-resizable' : ''}`}>
+        {resizable ? (
+          <colgroup>
+            {onToggleKey ? <col style={{ width: 36 }} /> : null}
+            {columns.map((column) => <col key={column.key} style={{ width: columnWidth(column) }} />)}
+          </colgroup>
+        ) : null}
         <thead>
           <tr>
             {onToggleKey ? <th style={{ width: 36 }} aria-label="选择" /> : null}
-            {columns.map((c) => (
-              <th
-                key={c.key}
-                style={{ width: c.width, textAlign: c.align ?? 'left' }}
-                className={c.className}
-              >
-                {c.header}
-              </th>
-            ))}
+            {columns.map((column) => {
+              const canSort = sortable && (column.sortable ?? true);
+              const active = sort?.key === column.key ? sort.dir : null;
+              return (
+                <th
+                  key={column.key}
+                  style={{ width: resizable ? columnWidth(column) : column.width, textAlign: column.align ?? 'left' }}
+                  className={[column.className, canSort ? 'th-sortable' : '', resizable ? 'th-resizable' : ''].filter(Boolean).join(' ')}
+                  onClick={canSort ? () => toggleSort(column.key) : undefined}
+                  title={canSort ? '点击排序' : undefined}
+                >
+                  <span className="th-sort">
+                    {column.header}
+                    {canSort ? <span className="th-sort-arrow">{active === 'asc' ? '↑' : active === 'desc' ? '↓' : '↕'}</span> : null}
+                  </span>
+                  {resizable ? (
+                    <span
+                      className="th-resize"
+                      onPointerDown={(event) => startResize(event, column)}
+                      onClick={(event) => event.stopPropagation()}
+                      aria-hidden="true"
+                    />
+                  ) : null}
+                </th>
+              );
+            })}
           </tr>
         </thead>
         <tbody>
-          {rows.map((row, i) => {
+          {sortedRows.map((row, i) => {
             const key = rowKey(row);
             const selected = selectedKeys?.has(key);
             return (
@@ -947,13 +1034,13 @@ export function Table<T>({
                     />
                   </td>
                 ) : null}
-                {columns.map((c) => (
+                {columns.map((column) => (
                   <td
-                    key={c.key}
-                    className={[c.mono ? 'cell-mono' : '', c.className ?? ''].join(' ')}
-                    style={{ textAlign: c.align ?? 'left' }}
+                    key={column.key}
+                    className={[column.mono ? 'cell-mono' : '', column.className ?? ''].join(' ')}
+                    style={{ textAlign: column.align ?? 'left' }}
                   >
-                    {c.render ? c.render(row, i) : String((row as unknown as Record<string, unknown>)[c.key] ?? '')}
+                    {column.render ? column.render(row, i) : String((row as unknown as Record<string, unknown>)[column.key] ?? '')}
                   </td>
                 ))}
               </tr>

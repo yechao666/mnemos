@@ -21,6 +21,8 @@ import {
 import {
   addSample,
   authSample,
+  briefSample,
+  dreamSample,
   graphSample,
   manageSample,
   quickstartSample,
@@ -47,6 +49,7 @@ const DOC_NAV = [
   { id: 'write', label: '记忆写入' },
   { id: 'search', label: '记忆检索' },
   { id: 'agent', label: 'Agent 原生接入' },
+  { id: 'brief-dream', label: '记忆简报与复盘总结' },
   { id: 'manage', label: '记忆管理' },
   { id: 'graph', label: '图谱与统计' },
   { id: 'errors', label: '错误码' },
@@ -142,6 +145,16 @@ export function ApiDocsPage() {
         </span>
       ),
     },
+  ];
+
+  const briefParams: DocParam[] = [
+    {
+      name: 'agentId',
+      type: 'string',
+      desc: '不传 = 审计全量视角（含所有 Agent 私有）；传 = 该 Agent 视角（项目共享 + 其私有，排除其他 Agent 私有）。',
+    },
+    { name: 'maxChars', type: 'number', desc: '临时覆盖项目 briefMaxChars，100–5000；不落库。' },
+    { name: 'force', type: 'boolean', desc: 'true / 1 跳过缓存重新生成。' },
   ];
 
   const scopeRows = SCOPES.map((scope) => ({
@@ -430,6 +443,57 @@ curl -s -X POST "$BASE/v1/memories" \
   -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d "{\"text\":\"私有草稿：跨分片统计走离线汇总\",\"agent_id\":\"agent-coder\",\"task_id\":\"$TASK\",\"visibility\":\"agent\"}"`}
                 />
+              </div>
+            </Card>
+          </section>
+
+          <section id="brief-dream" className="doc-section">
+            <Card pad>
+              <div className="vstack gap-16">
+                <div>
+                  <div className="doc-h2">记忆简报与复盘总结</div>
+                  <p className="doc-p">
+                    记忆简报把最近的项目共享记忆压成有字符上限、可直接注入 system prompt 的文本；
+                    记忆复盘总结增量巩固尚未整理的新记忆，产出 <span className="code-inline">category=insight</span>、
+                    <span className="code-inline">source=dream</span> 的项目共享洞见。两者都通过控制台接口管理。
+                  </p>
+                </div>
+
+                <div className="vstack gap-8">
+                  <Endpoint method="GET" path="/api/projects/{id}/memory/brief" note="读取简报；agentId / maxChars / force 可选" />
+                  <Endpoint method="PATCH" path="/api/projects/{id}/memory/brief" note="更新字符上限（100–5000）并重新生成" />
+                  <Endpoint method="GET" path="/api/projects/{id}/memory/dream" note="设置、待整理数、最近 10 次运行" />
+                  <Endpoint method="PATCH" path="/api/projects/{id}/memory/dream" note="enabled / intervalMinutes（至少一个）" />
+                  <Endpoint method="POST" path="/api/projects/{id}/memory/dream/run" note="手动触发；运行中返回 409" />
+                </div>
+
+                <Callout tone="amber" icon="key">
+                  <span className="mono">/api</span> 控制台接口需要登录后的会话令牌（<span className="code-inline">MNEMOS_SESSION_TOKEN</span>），
+                  不是 <span className="mono">mnemos_live_*</span> API Key。
+                </Callout>
+
+                <div className="doc-h3">读取简报参数</div>
+                <DocParamTable items={briefParams} />
+
+                <div className="doc-h3">示例：读取 / 更新简报</div>
+                <CodeBlock
+                  code={briefSample(baseUrl, projectId, lang)}
+                  language={CODE_LABEL[lang]}
+                  title={`${CODE_LABEL[lang]} · 记忆简报`}
+                />
+
+                <div className="doc-h3">示例：查看状态 / 配置 / 手动复盘总结</div>
+                <CodeBlock
+                  code={dreamSample(baseUrl, projectId, lang)}
+                  language={CODE_LABEL[lang]}
+                  title={`${CODE_LABEL[lang]} · 记忆复盘总结`}
+                />
+
+                <Callout tone="cyan" icon="shield">
+                  复盘总结只巩固 <span className="mono">visibility='project'</span> 的项目共享记忆；Agent 私有与任务记忆不参与，
+                  不会被写进项目洞见。洞见固定 <span className="mono">visibility='project'</span>，并通过
+                  <span className="mono"> metadata.dreamRunId / sourceMemoryIds</span> 保留来源。
+                </Callout>
               </div>
             </Card>
           </section>

@@ -100,6 +100,7 @@ python3 sdk/python/examples/basic.py
 | 健康检查 | `client.health()` | `client.health()` |
 | 导出 / 导入 | `client.export()` / `client.import(doc)` | `client.export()` / `client.import_memories(doc)` |
 | Webhook（**beta**） | `client.webhooks.*` | `client.webhooks.*` |
+| 记忆简报 / 做梦（控制台） | `client.brief()` / `updateBriefSettings()` / `dream()` / `updateDreamSettings()` / `runDream()` | 暂未覆盖 |
 
 > Python 的 `import` 是关键字，导入方法命名为 `import_memories`，并提供 `import_` 别名。
 

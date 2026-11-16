@@ -178,7 +178,8 @@ CREATE TABLE IF NOT EXISTS memories (
   expires_at      TEXT,
   embedding       BLOB,
   embedding_model TEXT,
-  dim             INTEGER
+  dim             INTEGER,
+  dreamed_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(project_id, user_id, agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_memories_recent ON memories(project_id, created_at DESC);
@@ -316,4 +317,33 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS idx_usage_project ON usage_events(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_usage_org ON usage_events(org_id, created_at DESC);
 
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '3');
+/* ------------------------------------------------------------------ */
+/* 记忆简报 / 做梦                                                      */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS memory_briefs (
+  project_id   TEXT NOT NULL,
+  scope        TEXT NOT NULL,
+  text         TEXT NOT NULL DEFAULT '',
+  max_chars    INTEGER NOT NULL,
+  model        TEXT NOT NULL,
+  source_hash  TEXT NOT NULL,
+  generated_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, scope)
+);
+
+CREATE TABLE IF NOT EXISTS memory_dream_runs (
+  id            TEXT PRIMARY KEY,
+  project_id    TEXT NOT NULL,
+  trigger       TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  input_count   INTEGER NOT NULL DEFAULT 0,
+  insight_count INTEGER NOT NULL DEFAULT 0,
+  summary       TEXT,
+  error         TEXT,
+  started_at    TEXT NOT NULL,
+  finished_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dream_runs_project ON memory_dream_runs(project_id, started_at DESC);
+
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '4');

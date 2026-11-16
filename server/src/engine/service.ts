@@ -21,8 +21,15 @@ import type {
   ListMemoriesInput,
   LiveEvent,
   Memory,
+  MemoryBrief,
+  MemoryBriefInput,
   MemoryCategory,
   MemoryDetail,
+  MemoryDreamInput,
+  MemoryDreamResult,
+  MemoryDreamRun,
+  MemoryDreamSettingsInput,
+  MemoryDreamStatus,
   MemoryHistoryEntry,
   MemoryService,
   MemorySource,
@@ -36,6 +43,8 @@ import type {
   TaskStatus,
   UpdateMemoryInput,
 } from '../../../shared/src/types.ts';
+import type { LlmConfig } from '../env.ts';
+import { writeAudit } from '../lib/audit.ts';
 import type { EventBus } from '../lib/bus.ts';
 import { newId, nowIso } from '../lib/ids.ts';
 import { estimateTokens, recordUsage } from '../lib/usage.ts';
@@ -43,10 +52,12 @@ import { tx } from '../db/index.ts';
 import { buildGraph, buildStats } from './analytics.ts';
 import { createAgent as createAgentRecord, getAgent, listAgents, touchAgent, updateAgent as updateAgentRecord } from './agents.ts';
 import { buildBriefing } from './briefing.ts';
+import { clampBriefChars, ensureBrief } from './brief.ts';
 import { listHistory, listMemories, listMemoryEntities, listNeighborEntities, listRelationsForEntities } from './detail.ts';
 import { embedText } from './embed.ts';
 import { conflict, notFound, unprocessable } from './errors.ts';
 import { extractEntities, extractFromMessages, extractFromText, extractRelations, type ExtractedFact } from './extract.ts';
+import { getDreamStatus, runDream, updateDreamSettings as updateDreamSettingsRecord } from './dream.ts';
 import { retrieve } from './retrieve.ts';
 import {
   attachEntities,
@@ -72,15 +83,23 @@ export interface MemoryServiceOptions {
   bus?: EventBus;
   /** 是否由引擎写 usage_events；默认 false（HTTP 层负责，避免重复计数） */
   recordUsage?: boolean;
+  /** 可选大模型配置（记忆简报润色 / 做梦归纳）；缺省时全部走确定性逻辑 */
+  llm?: LlmConfig | null;
 }
 
-const CATEGORIES: MemoryCategory[] = ['preference', 'identity', 'fact', 'plan', 'relationship', 'event', 'skill', 'constraint', 'context'];
+const CATEGORIES: MemoryCategory[] = ['preference', 'identity', 'fact', 'plan', 'relationship', 'event', 'skill', 'constraint', 'context', 'insight', 'decision', 'progress', 'lesson', 'risk', 'change', 'acceptance', 'assumption', 'dependency'];
 const VISIBILITIES: MemoryVisibility[] = ['project', 'agent', 'task'];
 
-/** finishTask 的三类沉淀：决策 → fact、经验 → constraint、备注 → event。 */
-const FINISH_BUCKETS: { key: 'decisions' | 'lessons' | 'notes'; category: MemoryCategory; importance: number }[] = [
-  { key: 'decisions', category: 'fact', importance: 0.82 },
-  { key: 'lessons', category: 'constraint', importance: 0.78 },
+/** finishTask 的沉淀：决策、进展、经验分别成为结构化项目记录，备注仍为事件。 */
+const FINISH_BUCKETS: { key: 'decisions' | 'progress' | 'lessons' | 'risks' | 'changes' | 'acceptance' | 'assumptions' | 'dependencies' | 'notes'; category: MemoryCategory; importance: number }[] = [
+  { key: 'decisions', category: 'decision', importance: 0.86 },
+  { key: 'progress', category: 'progress', importance: 0.66 },
+  { key: 'lessons', category: 'lesson', importance: 0.82 },
+  { key: 'risks', category: 'risk', importance: 0.9 },
+  { key: 'changes', category: 'change', importance: 0.84 },
+  { key: 'acceptance', category: 'acceptance', importance: 0.78 },
+  { key: 'assumptions', category: 'assumption', importance: 0.72 },
+  { key: 'dependencies', category: 'dependency', importance: 0.76 },
   { key: 'notes', category: 'event', importance: 0.6 },
 ];
 
@@ -94,6 +113,17 @@ function asCategory(value: unknown): MemoryCategory | null {
 
 function asUnit(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? clamp01(value) : null;
+}
+
+/** 解析项目 settings 原始 JSON（保留未知字段，写回时不丢配置）。 */
+function parseSettingsJson(raw: string | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 function actorLabelOf(actor: Actor | undefined): string {
@@ -152,6 +182,15 @@ function collectFacts(input: AddMemoryInput): ExtractedFact[] {
 export function createMemoryService(db: DatabaseSync, options: MemoryServiceOptions = {}): MemoryService {
   const bus = options.bus;
   const shouldRecordUsage = options.recordUsage ?? false;
+  const llm = options.llm ?? null;
+
+  /** 读取项目 orgId（审计归属）；项目不存在时返回 undefined。 */
+  function projectOrgId(projectId: string): string | undefined {
+    const row = db.prepare('SELECT org_id FROM projects WHERE id = ?').get(projectId) as unknown as
+      | { org_id?: string }
+      | undefined;
+    return row?.org_id;
+  }
 
   function publish(type: LiveEvent['type'], projectId: string, actor: string, summary: string, meta?: Record<string, unknown>): void {
     if (!bus) return;
@@ -615,6 +654,107 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
     return buildBriefing({ db, search, list }, input);
   }
 
+  /* ------------------------------------------------------------------ */
+  /* 记忆简报 / 做梦                                                      */
+  /* ------------------------------------------------------------------ */
+
+  async function brief(input: MemoryBriefInput): Promise<MemoryBrief> {
+    return ensureBrief({ db, llm }, input);
+  }
+
+  /** 保存简报字符上限并立即重新生成一次（force + LLM 润色），返回最新简报。 */
+  async function updateBriefSettings(projectId: string, maxChars: number, actor: Actor): Promise<MemoryBrief> {
+    const row = db.prepare('SELECT id, org_id, settings FROM projects WHERE id = ?').get(projectId) as unknown as
+      | { id: string; org_id: string; settings: string }
+      | undefined;
+    if (!row) throw notFound('项目不存在');
+
+    const value = clampBriefChars(maxChars);
+    const settings = parseSettingsJson(row.settings);
+    settings.briefMaxChars = value;
+    db.prepare('UPDATE projects SET settings = ?, updated_at = ? WHERE id = ?').run(
+      JSON.stringify(settings),
+      nowIso(),
+      projectId,
+    );
+
+    const generated = await ensureBrief(
+      { db, llm },
+      { projectId, maxChars: value, includePrivate: true, force: true, allowLlm: true },
+    );
+
+    writeAudit(db, {
+      orgId: row.org_id,
+      projectId,
+      actor,
+      action: 'memory.brief.settings',
+      resourceType: 'project',
+      resourceId: projectId,
+      detail: { maxChars: value },
+    });
+    return generated;
+  }
+
+  async function dreamStatus(projectId: string): Promise<MemoryDreamStatus> {
+    return getDreamStatus(db, projectId);
+  }
+
+  async function updateDreamSettings(
+    projectId: string,
+    input: MemoryDreamSettingsInput,
+    actor: Actor,
+  ): Promise<MemoryDreamStatus> {
+    const status = updateDreamSettingsRecord(db, projectId, input);
+    writeAudit(db, {
+      orgId: projectOrgId(projectId),
+      projectId,
+      actor,
+      action: 'memory.dream.settings',
+      resourceType: 'project',
+      resourceId: projectId,
+      detail: {
+        enabled: status.settings.enabled,
+        intervalMinutes: status.settings.intervalMinutes,
+      },
+    });
+    return status;
+  }
+
+  async function dream(input: MemoryDreamInput, actor: Actor): Promise<MemoryDreamResult> {
+    const projectId = input.projectId;
+    let run: MemoryDreamRun | null = null;
+    let failedRun: MemoryDreamRun | undefined;
+    try {
+      // addMemory 用本文件的 add 闭包：洞见走完整引擎路径（索引/实体/历史一致）。
+      run = await runDream({ db, llm, addMemory: add }, projectId, input.trigger ?? 'manual', input.batchSize);
+      return { run, status: getDreamStatus(db, projectId) };
+    } catch (error) {
+      // 手动触发失败会 rethrow；仍要留下审计（failed run 已落库）。
+      const latest = getDreamStatus(db, projectId).runs[0];
+      failedRun = latest?.status === 'failed' ? latest : undefined;
+      throw error;
+    } finally {
+      const audited = run ?? failedRun;
+      if (audited) {
+        writeAudit(db, {
+          orgId: projectOrgId(projectId),
+          projectId,
+          actor,
+          action: 'memory.dream.run',
+          resourceType: 'project',
+          resourceId: projectId,
+          detail: {
+            runId: audited.id,
+            trigger: audited.trigger,
+            status: audited.status,
+            inputCount: audited.inputCount,
+            insightCount: audited.insightCount,
+          },
+        });
+      }
+    }
+  }
+
   return {
     add,
     search,
@@ -637,5 +777,10 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
     updateTask,
     finishTask,
     briefing,
+    brief,
+    updateBriefSettings,
+    dreamStatus,
+    updateDreamSettings,
+    dream,
   };
 }

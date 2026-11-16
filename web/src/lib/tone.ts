@@ -11,6 +11,15 @@ const CATEGORY_TONES: Record<MemoryCategory, Tone> = {
   skill: 'lime',
   constraint: 'red',
   context: 'slate',
+  insight: 'amber',
+  decision: 'blue',
+  progress: 'green',
+  lesson: 'red',
+  risk: 'red',
+  change: 'amber',
+  acceptance: 'green',
+  assumption: 'violet',
+  dependency: 'blue',
 };
 
 export function toneForCategory(category: string): Tone {

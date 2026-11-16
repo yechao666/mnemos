@@ -7,6 +7,7 @@ import {
   Callout,
   Card,
   CodeBlock,
+  CopyButton,
   EmptyState,
   ErrorState,
   Icon,
@@ -52,6 +53,12 @@ export function ProjectOverviewPage() {
   const { project } = useProjectContext();
   const { data, loading, error, refresh } = useAsync(
     () => api.projects.overview(projectId),
+    [projectId],
+    Boolean(projectId),
+  );
+  // Agent 接入时拿到的记忆简报摘要（与「记忆浏览器」页同一接口）。
+  const briefAsync = useAsync(
+    () => api.memoryBrief(projectId),
     [projectId],
     Boolean(projectId),
   );
@@ -124,7 +131,14 @@ export function ProjectOverviewPage() {
             <Button icon="play" onClick={() => navigate(`/projects/${projectId}/playground`)}>
               前往演练场
             </Button>
-            <Button variant="ghost" icon="refresh" onClick={() => void refresh()}>
+            <Button
+              variant="ghost"
+              icon="refresh"
+              onClick={() => {
+                void refresh();
+                void briefAsync.refresh();
+              }}
+            >
               刷新
             </Button>
           </>
@@ -171,6 +185,62 @@ export function ProjectOverviewPage() {
       </div>
 
       <AgentActivityCard projectId={projectId} />
+
+      <Card pad>
+        <SectionHead
+          title={
+            <>
+              <Icon name="sparkles" size={14} />
+              记忆简报
+            </>
+          }
+          desc="Agent 接入时拿到的最近记忆摘要"
+          actions={
+            <>
+              {briefAsync.data?.text ? (
+                <CopyButton value={briefAsync.data.text} label="复制简报" />
+              ) : null}
+              <Button
+                size="sm"
+                variant="ghost"
+                iconRight="arrowRight"
+                onClick={() => navigate(`/projects/${projectId}/memories`)}
+              >
+                查看完整
+              </Button>
+            </>
+          }
+        />
+        <div className="mt-12">
+          {briefAsync.loading && !briefAsync.data ? (
+            <Skeleton h={104} style={{ borderRadius: 10 }} />
+          ) : briefAsync.error ? (
+            <ErrorState message={briefAsync.error} onRetry={() => void briefAsync.refresh()} />
+          ) : briefAsync.data?.text ? (
+            <>
+              <div className="memory-brief-preview">
+                <div className="memory-brief-preview-text">{briefAsync.data.text}</div>
+              </div>
+              <div className="memory-brief-preview-foot">
+                <span className="tiny dim">
+                  {briefAsync.data.count} 条最近记忆 · 上限 {briefAsync.data.maxChars} 字
+                  {briefAsync.data.generatedAt
+                    ? ` · 生成于 ${fmtRelative(briefAsync.data.generatedAt)}`
+                    : ''}
+                </span>
+                <span className="tiny dim">{briefAsync.data.cached ? '缓存命中' : '实时生成'}</span>
+              </div>
+            </>
+          ) : (
+            <EmptyState
+              compact
+              icon="brain"
+              title="当前还没有可用的活跃记忆"
+              description="写入记忆后，Agent 接入时会拿到最近记忆摘要。"
+            />
+          )}
+        </div>
+      </Card>
 
       <div className="grid grid-2">
         <Card pad>

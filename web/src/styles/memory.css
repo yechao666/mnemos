@@ -1,0 +1,253 @@
+/* ==========================================================================
+   记忆简报 / 复盘总结 — MemoriesPage 置顶简报卡、紧凑状态条与设置/记录弹窗
+   仅消费 tokens.css 中的变量，不依赖任何外部（aiwo）类名。
+   ========================================================================== */
+
+/* ------------------------------ 记忆简报卡 ------------------------------ */
+
+.memory-brief-card {
+  border-color: rgba(139, 124, 255, 0.24);
+  background:
+    radial-gradient(520px 180px at 100% 0%, rgba(139, 124, 255, 0.1), transparent 70%),
+    var(--gradient-card);
+}
+
+.memory-brief-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.memory-brief-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.memory-brief-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--primary-border);
+  background: var(--primary-soft);
+  color: #c9c2ff;
+}
+
+.memory-brief-body {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+  color: var(--text-soft);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+/* 正文单独裁切：外层只有内边距，裁切发生在外层内容盒内，避免文字在 padding 区域被切半行。 */
+.memory-brief-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  max-height: calc(1.7em * 4);
+  overflow: hidden;
+  white-space: pre-wrap;
+}
+
+.memory-brief-body.is-expanded {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.memory-brief-body.is-expanded .memory-brief-text {
+  display: block;
+  max-height: none;
+  overflow: visible;
+}
+
+/* 空态 / 加载 / 错误：不做 4 行截断，避免骨架或错误提示被裁切 */
+.memory-brief-body.is-plain {
+  white-space: normal;
+}
+
+.memory-brief-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+/* 概览页简报预览 */
+.memory-brief-preview {
+  padding: 12px 14px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+  color: var(--text-soft);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.memory-brief-preview-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  max-height: calc(1.7em * 5);
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.memory-brief-preview-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+/* ------------------------------ 复盘总结状态条 ------------------------------ */
+
+.memory-status-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.memory-status-strip > .callout {
+  flex: 1 0 100%;
+}
+
+.memory-metrics {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.memory-metrics > div {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.memory-metrics strong {
+  font-size: 17px;
+  font-weight: 650;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.memory-metrics span {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.memory-dream-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ------------------------------ 设置弹窗 ------------------------------ */
+
+.memory-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-faint);
+}
+
+.memory-dream-cycle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.memory-dream-number {
+  width: 110px;
+}
+
+.memory-dream-unit {
+  width: 120px;
+}
+
+/* ------------------------------ 运行记录 ------------------------------ */
+
+.memory-run-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-run-item {
+  padding: 10px 12px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.memory-run-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.memory-run-text {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.memory-run-error {
+  color: #fda4a4;
+}
+
+/* ------------------------------ 响应式 ------------------------------ */
+
+@media (max-width: 760px) {
+  .memory-brief-head {
+    flex-direction: column;
+  }
+
+  .memory-status-strip {
+    align-items: flex-start;
+  }
+
+  .memory-metrics {
+    gap: 14px;
+  }
+
+  .memory-dream-inline {
+    width: 100%;
+  }
+
+  .memory-brief-foot,
+  .memory-brief-preview-foot {
+    align-items: flex-start;
+  }
+
+  .memory-settings-row {
+    align-items: flex-start;
+  }
+
+  .memory-run-head {
+    flex-wrap: wrap;
+  }
+}

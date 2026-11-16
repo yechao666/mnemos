@@ -25,13 +25,14 @@ export type MemoryCategory =
   | 'event'
   | 'skill'
   | 'constraint'
-  | 'context';
+  | 'context'
+  | 'insight';
 /** 可见性：项目共享 / 仅 Agent 私有 / 仅任务可见。 */
 export type MemoryVisibility = 'project' | 'agent' | 'task';
 /** 记忆状态。 */
 export type MemoryStatus = 'active' | 'archived' | 'deleted';
 /** 记忆来源。 */
-export type MemorySource = 'conversation' | 'api' | 'agent' | 'import' | 'playground';
+export type MemorySource = 'conversation' | 'api' | 'agent' | 'import' | 'playground' | 'dream';
 /** 事实抽取模式：追加或相似去重合并。 */
 export type ExtractionMode = 'additive' | 'consolidate';
 /** 记忆变更事件类型。 */
@@ -221,6 +222,115 @@ export interface Briefing {
   citations: string[];
   built_at: string;
   took_ms: number;
+  /** 记忆简报（最近记忆压缩）；项目开启 briefEnabled 时同时注入 `prompt` 首段。 */
+  brief?: BriefingBrief;
+}
+
+/** 任务简报里携带的“记忆简报”快照：控制台预览与 Agent 实际拿到的一致。 */
+export interface BriefingBrief {
+  /** 简报正文（Markdown / 纯文本）。 */
+  text: string;
+  /** 生成的字符上限。 */
+  max_chars: number;
+  /** 纳入简报的记忆条数。 */
+  count: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* 记忆简报（brief）与做梦（dream）                                     */
+/* ------------------------------------------------------------------ */
+
+/** 简报中引用的记忆摘要，便于控制台展示“这条简报由什么组成”。 */
+export interface MemoryBriefItem {
+  id: string;
+  content: string;
+  category: MemoryCategory;
+  importance: number;
+  updated_at: string;
+  task_id?: string;
+  agent_id?: string;
+}
+
+/** 记忆简报：最近的活跃记忆/洞见压缩成有字符上限、可直接注入提示词的文本。 */
+export interface MemoryBrief {
+  project_id: string;
+  /** 简报正文；暂无可用记忆时为空串。 */
+  text: string;
+  max_chars: number;
+  /** 纳入简报的记忆条数。 */
+  count: number;
+  /** `mnemos-condense`（确定性压缩）或实际调用的 LLM 模型名。 */
+  model: string;
+  /** 是否命中 `memory_briefs` 缓存。 */
+  cached: boolean;
+  generated_at: string;
+  recent: MemoryBriefItem[];
+}
+
+/** 生成记忆简报的查询参数。 */
+export interface MemoryBriefInput {
+  /** 覆盖项目设置里的 `brief_max_chars`（不落库，服务端 clamp 到 100–5000）。 */
+  maxChars?: number;
+  max_chars?: number;
+  /**
+   * 不传 = 控制台审计全量视角（含所有 Agent 私有）；传 = 按该 Agent 视角生成
+   * （项目共享 + 该 Agent 私有，排除其他 Agent 私有）。
+   */
+  agentId?: string;
+  agent_id?: string;
+  /** 忽略缓存、重新生成。 */
+  force?: boolean;
+}
+
+/** 一次做梦（增量记忆巩固）的运行状态。 */
+export type MemoryDreamRunStatus = 'running' | 'completed' | 'skipped' | 'failed';
+/** 做梦触发方式：定时调度 / 手动。 */
+export type MemoryDreamTrigger = 'schedule' | 'manual';
+
+/** 一次做梦的运行记录。 */
+export interface MemoryDreamRun {
+  id: string;
+  project_id: string;
+  trigger: MemoryDreamTrigger;
+  status: MemoryDreamRunStatus;
+  input_count: number;
+  insight_count: number;
+  summary?: string;
+  error?: string;
+  started_at: string;
+  finished_at?: string;
+}
+
+/** 项目级做梦设置。 */
+export interface MemoryDreamSettings {
+  enabled: boolean;
+  interval_minutes: number;
+  /** 上次做梦时间（取最近一次运行）。 */
+  last_at?: string;
+}
+
+/** 做梦状态：设置 + 待整理数 + 最近运行记录。 */
+export interface MemoryDreamStatus {
+  settings: MemoryDreamSettings;
+  /** 尚未做梦的活跃记忆数。 */
+  pending_count: number;
+  last_run?: MemoryDreamRun;
+  /** 最近 10 次运行记录（新 → 旧）。 */
+  runs: MemoryDreamRun[];
+}
+
+/** 更新做梦设置的入参。 */
+export interface MemoryDreamSettingsInput {
+  enabled?: boolean;
+  intervalMinutes?: number;
+  interval_minutes?: number;
+}
+
+/** 手动触发一次做梦的响应。 */
+export interface MemoryDreamResult {
+  /** 该项目正在做梦时为 `null`（HTTP 409）。 */
+  run: MemoryDreamRun | null;
+  status: MemoryDreamStatus;
 }
 
 /* ------------------------------------------------------------------ */

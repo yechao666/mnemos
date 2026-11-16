@@ -1,6 +1,7 @@
 import type {
   ApiScope,
   MemoryCategory,
+  MemorySource,
   MemoryStatus,
   ProjectStatus,
   Role,
@@ -39,6 +40,24 @@ export const MEMORY_CATEGORIES: { value: MemoryCategory; label: string; color: s
   { value: 'skill', label: '技能', color: 'lime' },
   { value: 'constraint', label: '约束', color: 'red' },
   { value: 'context', label: '上下文', color: 'slate' },
+  { value: 'insight', label: '洞见', color: 'amber' },
+  { value: 'decision', label: '重要决策', color: 'blue' },
+  { value: 'progress', label: '关键进展', color: 'green' },
+  { value: 'lesson', label: '经验教训', color: 'red' },
+  { value: 'risk', label: '风险与阻塞', color: 'red' },
+  { value: 'change', label: '变更', color: 'amber' },
+  { value: 'acceptance', label: '验收与质量', color: 'green' },
+  { value: 'assumption', label: '假设与待确认', color: 'violet' },
+  { value: 'dependency', label: '依赖与承诺', color: 'blue' },
+];
+
+export const MEMORY_SOURCES: { value: MemorySource; label: string }[] = [
+  { value: 'conversation', label: '对话抽取' },
+  { value: 'api', label: 'API 写入' },
+  { value: 'agent', label: 'Agent 写入' },
+  { value: 'import', label: '导入' },
+  { value: 'playground', label: '演练场' },
+  { value: 'dream', label: '复盘总结' },
 ];
 
 export const CATEGORY_LABEL: Record<MemoryCategory, string> = Object.fromEntries(
@@ -121,7 +140,36 @@ export const DEFAULT_PROJECT_SETTINGS = {
   weights: { semantic: 0.45, keyword: 0.3, entity: 0.15, recency: 0.1 },
   monthlyQuota: 5_000_000,
   locale: 'zh-CN',
+  briefMaxChars: 500,
+  briefEnabled: true,
+  dreamEnabled: true,
+  dreamIntervalMinutes: 1440,
+  reportsEnabled: true,
+  weeklyReportDay: 5,
+  weeklyReportTime: '17:00',
+  monthlyReportDay: 1,
+  monthlyReportTime: '09:00',
 };
+
+/* ------------------------------------------------------------------ */
+/* 记忆简报 / 做梦                                                     */
+/* ------------------------------------------------------------------ */
+
+export const BRIEF_MIN_CHARS = 100;
+export const BRIEF_MAX_CHARS = 5_000;
+export const BRIEF_DEFAULT_CHARS = 500;
+/** 生成简报时最多扫描/纳入的最近记忆条数。 */
+export const BRIEF_RECENT_LIMIT = 40;
+
+export const DREAM_MIN_INTERVAL_MINUTES = 1;
+export const DREAM_MAX_INTERVAL_MINUTES = 60 * 24 * 30;
+export const DREAM_DEFAULT_INTERVAL_MINUTES = 1440;
+export const DREAM_BATCH_SIZE = 50;
+export const DREAM_MAX_BATCH_SIZE = 200;
+/** 洞见正文的最短长度，过短视为无效输出。 */
+export const DREAM_MIN_INSIGHT_CHARS = 20;
+/** 每次做梦最多写入的洞见条数。 */
+export const DREAM_MAX_INSIGHTS = 5;
 
 /** 记忆分类 → CSS 变量后缀（与 web 端 tokens 对应）。 */
 export const TONE_COLORS = ['violet', 'cyan', 'pink', 'amber', 'lime', 'blue', 'red', 'slate'] as const;

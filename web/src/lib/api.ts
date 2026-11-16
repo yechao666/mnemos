@@ -36,8 +36,12 @@ import type {
   GraphData,
   LiveEvent,
   Memory,
+  MemoryBrief,
   MemoryCategory,
   MemoryDetail,
+  MemoryDreamResult,
+  MemoryDreamStatus,
+  MemoryReport,
   MemoryHistoryEntry,
   MemoryStatus,
   Org,
@@ -256,6 +260,41 @@ export const api = {
     feedback: (id: string, input: { helpful: boolean; query?: string }) =>
       request<Memory>(`/api/memories/${id}/feedback`, { method: 'POST', body: JSON.stringify(input) }),
   },
+
+  /**
+   * 记忆简报：最近活跃记忆/洞见压缩成的可注入文本。
+   * 可能触发 LLM 润色（较慢），force=true 时忽略缓存重新生成。GET 需 viewer。
+   */
+  memoryBrief: (projectId: string, params: { force?: boolean; agentId?: string; maxChars?: number } = {}) =>
+    request<MemoryBrief>(`/api/projects/${projectId}/memory/brief${qs(params)}`),
+
+  /** 保存简报字数上限（需 admin；保存后立即重新生成）。 */
+  updateMemoryBriefSettings: (projectId: string, maxChars: number) =>
+    request<MemoryBrief>(`/api/projects/${projectId}/memory/brief`, {
+      method: 'PATCH',
+      body: JSON.stringify({ maxChars }),
+    }),
+
+  /** 项目周报/月报：按自然周或自然月聚合结构化项目记录。 */
+  memoryReport: (projectId: string, params: { period?: 'week' | 'month'; anchor?: string } = {}) =>
+    request<MemoryReport>(`/api/projects/${projectId}/memory/reports${qs(params)}`),
+
+  /** 复盘总结（增量记忆巩固）状态：设置、待整理数量与最近运行记录。 */
+  memoryDream: (projectId: string) => request<MemoryDreamStatus>(`/api/projects/${projectId}/memory/dream`),
+
+  /** 更新复盘总结开关与周期（需 admin）。 */
+  updateMemoryDream: (projectId: string, input: { enabled?: boolean; intervalMinutes?: number }) =>
+    request<MemoryDreamStatus>(`/api/projects/${projectId}/memory/dream`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    }),
+
+  /** 立即执行一次复盘总结（需 admin）；该项目正在复盘总结时后端返回 409。 */
+  runMemoryDream: (projectId: string) =>
+    request<MemoryDreamResult>(`/api/projects/${projectId}/memory/dream/run`, {
+      method: 'POST',
+      body: '{}',
+    }),
 
   agents: {
     list: (projectId: string) => request<Agent[]>(`/api/projects/${projectId}/agents`),

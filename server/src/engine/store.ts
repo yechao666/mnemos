@@ -6,7 +6,13 @@
  */
 
 import type { DatabaseSync } from 'node:sqlite';
-import { DEFAULT_PROJECT_SETTINGS } from '../../../shared/src/constants.ts';
+import {
+  BRIEF_MAX_CHARS,
+  BRIEF_MIN_CHARS,
+  DEFAULT_PROJECT_SETTINGS,
+  DREAM_MAX_INTERVAL_MINUTES,
+  DREAM_MIN_INTERVAL_MINUTES,
+} from '../../../shared/src/constants.ts';
 import type {
   Memory,
   MemoryCategory,
@@ -100,6 +106,31 @@ export function mergeSettings(raw: unknown): ProjectSettings {
     weights,
     monthlyQuota: Math.max(1, Math.round(asNumber(source.monthlyQuota, defaults.monthlyQuota))),
     locale: asString(source.locale, defaults.locale),
+    briefMaxChars: Math.max(
+      BRIEF_MIN_CHARS,
+      Math.min(BRIEF_MAX_CHARS, Math.round(asNumber(source.briefMaxChars, defaults.briefMaxChars))),
+    ),
+    briefEnabled: typeof source.briefEnabled === 'boolean' ? source.briefEnabled : defaults.briefEnabled,
+    dreamEnabled: typeof source.dreamEnabled === 'boolean' ? source.dreamEnabled : defaults.dreamEnabled,
+    dreamIntervalMinutes: Math.max(
+      DREAM_MIN_INTERVAL_MINUTES,
+      Math.min(
+        DREAM_MAX_INTERVAL_MINUTES,
+        Math.round(asNumber(source.dreamIntervalMinutes, defaults.dreamIntervalMinutes)),
+      ),
+    ),
+    reportsEnabled:
+      typeof source.reportsEnabled === 'boolean' ? source.reportsEnabled : defaults.reportsEnabled,
+    weeklyReportDay: Math.max(1, Math.min(7, Math.round(asNumber(source.weeklyReportDay, defaults.weeklyReportDay)))),
+    weeklyReportTime:
+      typeof source.weeklyReportTime === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(source.weeklyReportTime)
+        ? source.weeklyReportTime
+        : defaults.weeklyReportTime,
+    monthlyReportDay: Math.max(1, Math.min(28, Math.round(asNumber(source.monthlyReportDay, defaults.monthlyReportDay)))),
+    monthlyReportTime:
+      typeof source.monthlyReportTime === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(source.monthlyReportTime)
+        ? source.monthlyReportTime
+        : defaults.monthlyReportTime,
   };
   if (typeof source.webhookUrl === 'string' && source.webhookUrl.length > 0) settings.webhookUrl = source.webhookUrl;
   return settings;

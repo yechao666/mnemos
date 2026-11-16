@@ -1,7 +1,22 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import type { Memory, MemoryCategory, MemoryStatus, MemoryVisibility, SearchHit } from '@shared';
-import { CATEGORY_LABEL, MEMORY_CATEGORIES, MEMORY_STATUSES, PAGE_SIZE } from '@shared';
+import type {
+  Memory,
+  MemoryCategory,
+  MemorySource,
+  MemoryStatus,
+  MemoryVisibility,
+  SearchHit,
+} from '@shared';
+import {
+  BRIEF_DEFAULT_CHARS,
+  CATEGORY_LABEL,
+  MEMORY_CATEGORIES,
+  MEMORY_SOURCES,
+  MEMORY_STATUSES,
+  PAGE_SIZE,
+  ROLE_RANK,
+} from '@shared';
 import {
   Badge,
   Button,
@@ -24,6 +39,7 @@ import {
 } from '@ui';
 import { useAsync, useDebounced } from '@lib/hooks.ts';
 import { api, type MemoryListParams, type MemoryListResponse } from '@lib/api.ts';
+import { useAuth } from '@lib/auth.tsx';
 import {
   downloadText,
   fmtFullDateTime,
@@ -35,6 +51,10 @@ import { toneForCategory } from '@lib/tone.ts';
 import { useProjectContext } from '@lib/project-context.tsx';
 import { MemoryDrawer } from '../../components/project/MemoryDrawer.tsx';
 import { MemoryContent, ScopeChips, ScoreMeter } from '../../components/project/shared.tsx';
+import { MemoryBriefCard } from '../../components/project/memory/MemoryBriefCard.tsx';
+import { DreamStatusCard } from '../../components/project/memory/DreamStatusCard.tsx';
+import { MemorySettingsModal } from '../../components/project/memory/MemorySettingsModal.tsx';
+import { DreamRunsModal } from '../../components/project/memory/DreamRunsModal.tsx';
 import {
   TaskIdChip,
   VisibilityBadge,
@@ -73,18 +93,24 @@ const BULK_DESC: Record<BulkAction, string> = {
   restore: '恢复后这些记忆会重新参与检索。',
 };
 
+const SOURCE_LABEL_MAP = Object.fromEntries(
+  MEMORY_SOURCES.map((source) => [source.value, source.label]),
+) as Record<MemorySource, string>;
+
 /** 记忆浏览器：混合检索、多维筛选、批量维护与详情抽屉。 */
 export function MemoriesPage() {
   const { projectId = '' } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
   const toast = useToast();
   const { project } = useProjectContext();
+  const { user } = useAuth();
 
   const [searchParams] = useSearchParams();
   const urlQuery = searchParams.get('q') ?? '';
   const [q, setQ] = useState(urlQuery);
   const [term, setTerm] = useState(urlQuery.trim());
   const debouncedQ = useDebounced(q, 350);
+  const urlCategory = (searchParams.get('category') ?? '') as MemoryCategory | '';
 
   useEffect(() => {
     setQ(urlQuery);
@@ -92,9 +118,13 @@ export function MemoriesPage() {
     setPage(1);
   }, [urlQuery]);
 
+  useEffect(() => {
+    setCategory(urlCategory);
+  }, [urlCategory]);
+
   const [userId, setUserId] = useState('');
   const [agentId, setAgentId] = useState('');
-  const [category, setCategory] = useState<MemoryCategory | ''>('');
+  const [category, setCategory] = useState<MemoryCategory | ''>(urlCategory);
   const [status, setStatus] = useState<MemoryStatus | ''>('');
   const [visibility, setVisibility] = useState<MemoryVisibility | ''>('');
   const [taskId, setTaskId] = useState('');
@@ -105,6 +135,10 @@ export function MemoriesPage() {
   const [confirm, setConfirm] = useState<{ action: BulkAction; ids: string[] } | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [detail, setDetail] = useState<{ id: string; hit?: SearchHit } | null>(null);
+
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [runsOpen, setRunsOpen] = useState(false);
+  const [dreaming, setDreaming] = useState(false);
 
   useEffect(() => {
     setTerm(debouncedQ.trim());
@@ -131,6 +165,35 @@ export function MemoriesPage() {
     if (taskId.trim()) params.taskId = taskId.trim();
     return api.memories.list(projectId, params);
   }, [projectId, term, userId, agentId, category, status, visibility, taskId, sort, page], Boolean(projectId));
+
+  // 记忆简报与复盘总结状态：与记忆列表同页加载，成功后由操作联动刷新。
+  const briefAsync = useAsync(
+    () => api.memoryBrief(projectId),
+    [projectId],
+    Boolean(projectId),
+  );
+  const dreamAsync = useAsync(
+    () => api.memoryDream(projectId),
+    [projectId],
+    Boolean(projectId),
+  );
+  // 项目级洞见数：列表分页只覆盖当前页，单独取一次 total 才是全量。
+  const insightAsync = useAsync(
+    () => api.memories.list(projectId, { category: 'insight', pageSize: 1 }).then((result) => result.total),
+    [projectId],
+    Boolean(projectId),
+  );
+
+  // 写接口（PATCH/POST）要求项目管理员：组织管理员直接放行，其余角色读项目成员角色。
+  const isOrgAdmin = Boolean(user && ROLE_RANK[user.role] >= ROLE_RANK.admin);
+  const membersAsync = useAsync(
+    () => api.projects.members.list(projectId),
+    [projectId, isOrgAdmin, user?.id],
+    Boolean(projectId) && Boolean(user) && !isOrgAdmin,
+  );
+  const memberRole = membersAsync.data?.find((member) => member.userId === user?.id)?.role ?? null;
+  const effectiveRole = user ? (isOrgAdmin ? user.role : memberRole) : null;
+  const canManage = effectiveRole === 'admin' || effectiveRole === 'owner';
 
   const isSearch = term.length > 0;
   const rows: MemoryRow[] = useMemo(() => {
@@ -167,6 +230,38 @@ export function MemoriesPage() {
   const total = data?.total ?? 0;
   const totalPages = data?.totalPages ?? 1;
   const hasFilters = Boolean(term || userId || agentId || category || status || visibility || taskId);
+
+  // 状态条指标：记忆总数取项目上下文的全量统计（兜底列表 total），洞见数为项目级全量。
+  const insightCount = insightAsync.data ?? 0;
+
+  /** 记忆写入/删除/复盘总结后：列表、简报、复盘总结状态一起刷新（列表阻塞，其余后台刷新）。 */
+  const refreshMemoryData = async () => {
+    void briefAsync.refresh();
+    void dreamAsync.refresh();
+    void insightAsync.refresh();
+    await refresh();
+  };
+
+  const runDream = async () => {
+    if (!projectId || dreaming) return;
+    setDreaming(true);
+    try {
+      const result = await api.runMemoryDream(projectId);
+      const run = result.run;
+      if (!run || run.status === 'skipped') {
+        toast.info('没有需要整理的新记忆');
+      } else {
+        toast.success(
+          `复盘总结完成：${fmtInt(run.inputCount)} 条新记忆 → ${fmtInt(run.insightCount)} 条洞见`,
+        );
+      }
+      await refreshMemoryData();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : '复盘总结失败');
+    } finally {
+      setDreaming(false);
+    }
+  };
 
   const visibleIds = useMemo(() => rows.map((row) => row.id), [rows]);
   const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selected.has(id));
@@ -230,7 +325,7 @@ export function MemoriesPage() {
       if (detail && confirm.ids.includes(detail.id)) setDetail(null);
       setConfirm(null);
       setSelected(new Set());
-      await refresh();
+      await refreshMemoryData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : `${BULK_LABEL[confirm.action]}失败`);
     } finally {
@@ -242,7 +337,7 @@ export function MemoriesPage() {
   columns.push({
     key: 'content',
     header: '记忆内容',
-    width: '36%',
+    width: '34%',
     render: (row) => (
       <MemoryContent content={row.content} category={row.category} tags={row.tags} maxWidth={520} />
     ),
@@ -320,6 +415,16 @@ export function MemoriesPage() {
       render: (row) => (
         <Badge tone={toneForCategory(row.category)} size="sm">
           {CATEGORY_LABEL[row.category]}
+        </Badge>
+      ),
+    },
+    {
+      key: 'source',
+      header: '来源',
+      width: 100,
+      render: (row) => (
+        <Badge tone={row.source === 'dream' ? 'violet' : 'slate'} size="sm">
+          {SOURCE_LABEL_MAP[row.source] ?? row.source}
         </Badge>
       ),
     },
@@ -418,6 +523,29 @@ export function MemoriesPage() {
             写入记忆
           </Button>
         }
+      />
+
+      <MemoryBriefCard
+        brief={briefAsync.data}
+        loading={briefAsync.loading}
+        error={briefAsync.error}
+        canManage={canManage}
+        onRefresh={() => void briefAsync.refresh()}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
+
+      <DreamStatusCard
+        status={dreamAsync.data}
+        loading={dreamAsync.loading}
+        error={dreamAsync.error}
+        memoryCount={project?.stats.memories ?? total}
+        insightCount={insightCount}
+        canManage={canManage}
+        running={dreaming}
+        onRun={() => void runDream()}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenRuns={() => setRunsOpen(true)}
+        onRetry={() => void dreamAsync.refresh()}
       />
 
       {error && data ? (
@@ -618,10 +746,10 @@ export function MemoriesPage() {
         query={term}
         onClose={() => setDetail(null)}
         onChanged={() => {
-          void refresh();
+          void refreshMemoryData();
         }}
         onDeleted={() => {
-          void refresh();
+          void refreshMemoryData();
         }}
       />
 
@@ -640,6 +768,26 @@ export function MemoriesPage() {
         confirmLabel={confirm ? BULK_LABEL[confirm.action] : '确认'}
         tone={confirm?.action === 'delete' ? 'red' : 'violet'}
         loading={confirmBusy}
+      />
+
+      <MemorySettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        projectId={projectId}
+        dream={dreamAsync.data}
+        briefMaxChars={briefAsync.data?.maxChars ?? BRIEF_DEFAULT_CHARS}
+        onSaved={() => {
+          void briefAsync.refresh();
+          void dreamAsync.refresh();
+        }}
+      />
+
+      <DreamRunsModal
+        open={runsOpen}
+        onClose={() => setRunsOpen(false)}
+        runs={dreamAsync.data?.runs ?? []}
+        loading={dreamAsync.loading}
+        error={dreamAsync.error}
       />
     </div>
   );

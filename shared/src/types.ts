@@ -11,7 +11,7 @@ export type Role = 'owner' | 'admin' | 'developer' | 'viewer';
 export type ApiScope = 'memories:read' | 'memories:write' | 'graph:read' | 'admin';
 export type ProjectStatus = 'active' | 'paused' | 'archived';
 export type MemoryStatus = 'active' | 'archived' | 'deleted';
-export type MemorySource = 'conversation' | 'api' | 'agent' | 'import' | 'playground';
+export type MemorySource = 'conversation' | 'api' | 'agent' | 'import' | 'playground' | 'dream';
 export type ExtractionMode = 'additive' | 'consolidate';
 export type ActorType = 'user' | 'api_key' | 'system';
 
@@ -26,7 +26,16 @@ export type MemoryCategory =
   | 'event'
   | 'skill'
   | 'constraint'
-  | 'context';
+  | 'context'
+  | 'insight'
+  | 'decision'
+  | 'progress'
+  | 'lesson'
+  | 'risk'
+  | 'change'
+  | 'acceptance'
+  | 'assumption'
+  | 'dependency';
 
 export interface Actor {
   type: ActorType;
@@ -82,6 +91,23 @@ export interface ProjectSettings {
   monthlyQuota: number;
   webhookUrl?: string;
   locale: string;
+  /* --- 记忆简报（最近记忆压缩，可直接注入 Agent 上下文） --- */
+  /** 简报字符上限（100–5000） */
+  briefMaxChars: number;
+  /** 是否把记忆简报注入任务简报 prompt */
+  briefEnabled: boolean;
+  /* --- 记忆做梦（增量记忆巩固） --- */
+  dreamEnabled: boolean;
+  /** 复盘总结周期（分钟，1–43200） */
+  dreamIntervalMinutes: number;
+  /* --- 周报/月报 --- */
+  reportsEnabled: boolean;
+  /** 1=周一 … 7=周日 */
+  weeklyReportDay: number;
+  weeklyReportTime: string;
+  /** 1–28 */
+  monthlyReportDay: number;
+  monthlyReportTime: string;
 }
 
 export interface Project {
@@ -317,6 +343,18 @@ export interface FinishTaskInput {
   decisions?: string[];
   /** 本次任务踩过的坑 / 可复用经验，写入项目共享记忆 */
   lessons?: string[];
+  /** 本次任务的关键进展，写入项目共享记录 */
+  progress?: string[];
+  /** 风险、阻塞及其状态变化 */
+  risks?: string[];
+  /** 范围、排期、验收标准等变更 */
+  changes?: string[];
+  /** 验收与质量证据 */
+  acceptance?: string[];
+  /** 未验证假设与待确认问题 */
+  assumptions?: string[];
+  /** 跨团队依赖与承诺 */
+  dependencies?: string[];
   /** 额外记录（默认项目共享） */
   notes?: string[];
   agentId?: string;
@@ -358,7 +396,145 @@ export interface Briefing {
   citations: string[];
   builtAt: string;
   tookMs: number;
+  /** 记忆简报（最近记忆压缩）；项目开启 briefEnabled 时同时注入 prompt 首段 */
+  brief?: BriefingBrief;
 }
+
+/** 任务简报里携带的“记忆简报”快照：控制台预览与 Agent 实际拿到的一致。 */
+export interface BriefingBrief {
+  text: string;
+  maxChars: number;
+  count: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* 记忆简报（brief）与做梦（dream）                                     */
+/* ------------------------------------------------------------------ */
+
+/** 简报中引用的记忆摘要，便于控制台展示“这条简报由什么组成”。 */
+export interface MemoryBriefItem {
+  id: string;
+  content: string;
+  category: MemoryCategory;
+  importance: number;
+  updatedAt: string;
+  taskId?: string;
+  agentId?: string;
+}
+
+/** 记忆简报：取最近的活跃记忆/洞见压缩成有字符上限、可直接注入提示词的文本。 */
+export interface MemoryBrief {
+  projectId: string;
+  /** 简报正文；暂无可用记忆时为空串 */
+  text: string;
+  maxChars: number;
+  /** 纳入简报的记忆条数 */
+  count: number;
+  /** mnemos-condense（确定性压缩）或实际调用的 LLM 模型名 */
+  model: string;
+  /** 是否命中缓存 */
+  cached: boolean;
+  generatedAt: string;
+  recent: MemoryBriefItem[];
+}
+
+export interface MemoryBriefInput {
+  projectId: string;
+  /** 覆盖项目设置里的 briefMaxChars（不落库） */
+  maxChars?: number;
+  /** 按该 Agent 的可见性生成；不传时只使用项目共享记忆 */
+  agentId?: string;
+  /** 控制台/审计视角：包含所有 Agent 私有记忆（默认 false） */
+  includePrivate?: boolean;
+  /** 忽略缓存，重新生成 */
+  force?: boolean;
+  /** 是否允许调用 LLM 润色（默认 false，热路径只用确定性压缩） */
+  allowLlm?: boolean;
+}
+
+export type MemoryDreamRunStatus = 'running' | 'completed' | 'skipped' | 'failed';
+export type MemoryDreamTrigger = 'schedule' | 'manual';
+
+/** 一次做梦（增量记忆巩固）的运行记录。 */
+export interface MemoryDreamRun {
+  id: string;
+  projectId: string;
+  trigger: MemoryDreamTrigger;
+  status: MemoryDreamRunStatus;
+  inputCount: number;
+  insightCount: number;
+  summary?: string;
+  error?: string;
+  startedAt: string;
+  finishedAt?: string;
+}
+
+export interface MemoryDreamSettings {
+  enabled: boolean;
+  intervalMinutes: number;
+  /** 上次做梦时间（取最近一次运行） */
+  lastAt?: string;
+}
+
+
+export type MemoryReportPeriod = 'week' | 'month';
+
+export interface MemoryReportItem {
+  id: string;
+  content: string;
+  category: MemoryCategory;
+  createdAt: string;
+  agentId?: string;
+  taskId?: string;
+  status?: string;
+  severity?: string;
+}
+
+export interface MemoryReportSection {
+  key: 'progress' | 'decisions' | 'lessons' | 'risks' | 'changes' | 'acceptance' | 'assumptions' | 'dependencies' | 'insights';
+  title: string;
+  count: number;
+  items: MemoryReportItem[];
+}
+
+export interface MemoryReport {
+  projectId: string;
+  period: MemoryReportPeriod;
+  title: string;
+  start: string;
+  end: string;
+  sections: MemoryReportSection[];
+  counts: Record<'progress' | 'decisions' | 'lessons' | 'risks' | 'changes' | 'acceptance' | 'assumptions' | 'dependencies' | 'insights', number>;
+  markdown: string;
+}
+
+export interface MemoryDreamStatus {
+  settings: MemoryDreamSettings;
+  /** 尚未做梦的活跃记忆数 */
+  pendingCount: number;
+  lastRun?: MemoryDreamRun;
+  /** 最近 10 次运行记录（新 → 旧） */
+  runs: MemoryDreamRun[];
+}
+
+export interface MemoryDreamSettingsInput {
+  enabled?: boolean;
+  intervalMinutes?: number;
+}
+
+export interface MemoryDreamInput {
+  projectId: string;
+  trigger?: MemoryDreamTrigger;
+  /** 单批最多处理的记忆条数（1–200，默认 50） */
+  batchSize?: number;
+}
+
+export interface MemoryDreamResult {
+  /** 该项目正在做梦时返回 null（路由层转 409） */
+  run: MemoryDreamRun | null;
+  status: MemoryDreamStatus;
+}
+
 
 export interface TaskWithMemories {
   task: Task;
@@ -894,4 +1070,10 @@ export interface MemoryService {
   updateTask(projectId: string, taskId: string, input: Partial<TaskInput> & { summary?: string }, actor: Actor): Promise<Task>;
   finishTask(projectId: string, taskId: string, input: FinishTaskInput, actor: Actor): Promise<{ task: Task; memories: Memory[] }>;
   briefing(input: BriefingInput): Promise<Briefing>;
+  /* --- 记忆简报 / 做梦 --- */
+  brief(input: MemoryBriefInput): Promise<MemoryBrief>;
+  updateBriefSettings(projectId: string, maxChars: number, actor: Actor): Promise<MemoryBrief>;
+  dreamStatus(projectId: string): Promise<MemoryDreamStatus>;
+  updateDreamSettings(projectId: string, input: MemoryDreamSettingsInput, actor: Actor): Promise<MemoryDreamStatus>;
+  dream(input: MemoryDreamInput, actor: Actor): Promise<MemoryDreamResult>;
 }

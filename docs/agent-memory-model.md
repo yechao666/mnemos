@@ -58,6 +58,8 @@ Agent 注册（角色/能力/模型）
 下一个 Agent（或同一 Agent 下周）继续 → 简报里出现前人的结论
 ```
 
+> 在这条「任务生命周期」之上，还有一条**项目级**的增量巩固通道——记忆做梦（dream）：只处理 `dreamed_at` 为空的新记忆，把跨任务洞见写成 `category=insight` 的项目共享记忆；下一次简报/上下文会自动带上。详见第 4 节。
+
 ### 为什么"简报"比"搜索"重要
 
 Agent 启动时不应只做一次相似度检索，而需要一个**结构化、有预算、可直接拼进提示词**的上下文包：
@@ -67,7 +69,51 @@ Agent 启动时不应只做一次相似度检索，而需要一个**结构化、
 - 每条记忆带 `id / agent / task / date` 来源，Agent 可以引用，人类可以追溯。
 - 返回 `prompt`（Markdown）+ `citations`（记忆 id）+ `tokenEstimate`，SDK 直接使用。
 
-## 4. Python 项目开发场景（`Orion 订单服务`）
+## 4. 记忆简报与做梦：检索之外的两种复用
+
+任务生命周期解决「把经验写下来、下次能查到」；简报（brief）与做梦（dream）解决「**不用每次重查，也能把经验稳定带进上下文**」和「**把零散新记忆巩固成高层洞见**」。
+
+```
+                ┌──────────────── 项目共享记忆（visibility=project）
+                │                        │
+   新增记忆 ────┤                        ├──► 记忆简报 brief（最近的活跃记忆 ≤ N 字）
+（dreamed_at    │                        │       └─► POST /v1/context 的 prompt「记忆简报」段落
+  为空）        │                        │
+                │                        └──► 记忆做梦 dream（增量巩固）
+                │                                └─► category=insight / source=dream
+                └──────────────────────────────────────────────┘
+```
+
+### 4.1 记忆简报（brief）
+
+- **位置**：`POST /v1/context` 响应里的 `brief`，以及 `prompt` 中「项目简报」元信息之后、各分区之前的「记忆简报」段落。项目 `briefEnabled !== false` 且 `count > 0` 时才注入；否则不产生该段落、响应也不带 `brief`。
+- **生成**：取最近的活跃记忆与洞见（含 `category=insight` 的做梦产物），按重要度与时效压缩到项目 `briefMaxChars`（默认 500 字，范围 100–5000）。`/v1/context` 注入路径固定使用确定性压缩（`model=mnemos-condense`，不调 LLM、不写缓存）；控制台预览在配置 `MNEMOS_LLM_*` 后可用模型润色，调用失败静默回退。
+- **缓存**：结果写入 `memory_briefs`，以「记忆集合 + 字符上限」的 `source_hash` 判断是否复用；记忆变化或上限调整后自动失效，`force=true` 强制重算。
+- **可见性（关键）**：`/v1/context` 注入路径按调用方 `agent_id` 生成——只取 `visibility='project'` 的项目共享记忆 **+ 该 Agent 自己的** `visibility='agent'` 私有记忆；其他 Agent 的私有记忆不进入该 Agent 的简报。控制台 GET brief 不传 `agentId` 时是审计全量视角（含所有私有/任务记忆）；传 `agentId` 时预览该 Agent 实际看到的简报（项目共享 + 其私有，排除其他 Agent 私有）。
+- **与任务简报的关系**：`brief` 是任务简报的一部分，不替代 `sections`；即使简报为空，原有分层检索结果照常返回。
+
+### 4.2 记忆做梦（dream）
+
+- **定位**：项目级的后台巩固任务，不属于任何 Agent 任务；由调度器周期触发（仅 `active` 项目）或控制台/API 手动触发。
+- **增量水位 `dreamed_at`**：只扫描 `dreamed_at IS NULL`、`visibility='project'` 且非 `insight` 的活跃记忆（正文 ≥10 字）；处理完成后把这批记忆的 `dreamed_at` 置为本次运行时间。因此旧记忆不会被重放，重复运行也不会重复归纳。
+- **产物**：每次运行新增 `category='insight'`、`source='dream'`、`visibility='project'` 的**项目共享洞见**；`metadata` 记录 `dreamRunId` 与 `sourceMemoryIds`，可从洞见反查它归纳自哪些记忆。
+- **隐私边界**：`visibility='agent'`（Agent 私有）与 `visibility='task'`（任务）记忆不参与做梦、不会被标记 `dreamed_at`，也不会被写进项目共享洞见；洞见固定 `visibility='project'`。`pendingCount` 与调度到期判断使用同一过滤条件。
+- **不破坏原记忆**：原记忆保留（只写 `dreamed_at`），不做删除或改写；相同/高度相似内容不会重复写入；没有待整理记忆时运行记为 `skipped`，有输入但未形成洞见时记为 `completed`（`insightCount=0`），不硬凑洞见。
+- **运行记录**：每条 `memory_dream_runs` 记录 `trigger`（`schedule` / `manual`）、`status`、`inputCount`、`insightCount`、起止时间与 `summary`/`error`；控制台与 `GET /api/projects/{id}/memory/dream` 可看最近 10 次。
+- **可见性结果**：洞见以项目共享记忆落库，之后会进入其他 Agent 的简报、检索与任务简报——这正是「一个 Agent 的踩坑，变成所有 Agent 的经验」的巩固环节。
+
+### 4.3 两者在记忆模型中的位置
+
+| 维度 | 记忆简报 brief | 记忆做梦 dream |
+| --- | --- | --- |
+| 作用 | 读：把已有经验压成可注入文本 | 写：把零散新记忆归纳为新洞见 |
+| 触发 | 每次 `/v1/context`（有缓存） | 定时调度 / 手动 |
+| 数据范围 | 最近活跃记忆 + 洞见 | `dreamed_at IS NULL` 且 `visibility='project'` 的新记忆 |
+| 产物 | `prompt` 内的「记忆简报」段落 + `brief` 字段 | `category=insight` 的项目共享记忆 |
+| 可见性 | `/v1/context`：project + 该 Agent 私有；控制台可切审计全量 | 洞见固定 project 共享；私有/任务记忆不参与 |
+| 失败影响 | 回退确定性压缩，不影响主流程 | 运行记为 `failed`，原记忆保持不变 |
+
+## 5. Python 项目开发场景（`Orion 订单服务`）
 
 演示数据中的 4 个 Agent、6 个任务，按真实研发节奏排列：
 
@@ -93,32 +139,38 @@ Agent 启动时不应只做一次相似度检索，而需要一个**结构化、
 
 这正是"让智能体工作有经验参考、有记录可查"。
 
-## 5. 与常见做法的差异
+## 6. 与常见做法的差异
 
 | 常见做法 | 本项目 |
 | --- | --- |
 | 每个 Agent 独立记忆库 | 项目共享库 + Agent 私有层 + 任务层，三档可见性 |
 | 只做相似度检索 | 分层简报 + token 预算 + 来源标注，可直接注入提示词 |
+| 每次开工全量检索 | 记忆简报缓存最近经验，`/v1/context` 直接注入 prompt |
+| 记忆只增不炼 | 做梦增量把新记忆归纳为 `insight` 洞见（不重放、不删原记忆） |
 | 记忆无归属 | 每条记忆带 `agent_id`、`task_id`、`actor`、`history` |
 | 任务结束即失忆 | `finish` 自动把决策/教训写成共享记忆，下一次任务可检索 |
 | 人类直接翻日志 | 控制台按 Agent / 任务 / 可见性观测，可审计到每次写入 |
 
-## 6. 接口速览
+## 7. 接口速览
 
 | 场景 | 接口 |
 | --- | --- |
 | Agent 注册/查询 | `POST /v1/agents`、`GET /v1/agents` |
 | 开始任务 | `POST /v1/tasks` |
-| 拉取上下文简报 | `POST /v1/context` |
+| 拉取上下文简报（含记忆简报） | `POST /v1/context`（响应 `brief`） |
 | 写记忆（带任务/可见性） | `POST /v1/memories`（`task_id`、`visibility`） |
 | 结束任务并沉淀经验 | `POST /v1/tasks/{id}/finish`（`decisions`、`lessons`） |
+| 记忆简报（控制台） | `GET/PATCH /api/projects/{id}/memory/brief` |
+| 记忆做梦（控制台） | `GET/PATCH /api/projects/{id}/memory/dream`、`POST .../dream/run` |
 | 任务详情/记忆 | `GET /v1/tasks/{id}` |
-| 人类观测 | 控制台「Agent」「任务」页签 |
+| 人类观测 | 控制台「Agent」「任务」「记忆」页签 |
 
-## 7. 设计取舍
+## 8. 设计取舍
 
 - **任务不是聊天会话**：task 有目标、分支、结论与时间范围，可跨多次运行（run_id 仍保留用于单次调用）。
 - **可见性在写入时确定**：Agent 必须显式声明私有；默认共享，避免"经验孤岛"。
+- **简报是缓存视图，不新增事实**：brief 只压缩已有记忆，不编造、不覆盖原记忆；缓存失效由记忆变化驱动。
+- **做梦是增量巩固，不是重写**：只处理 `dreamed_at IS NULL` 的新记忆，洞见是新增的共享记忆，原记忆与历史保持可追溯。
 - **不自动跨项目共享**：项目隔离是硬边界；跨项目经验迁移需要显式导出/导入（后续 Roadmap）。
 - **冲突留给检索时裁决**：不同 Agent 的结论可能矛盾，简报按重要度/时效排序并保留来源，由 Agent 判断；后续可加"记忆冲突"检测。
 - **删除仍可追溯**：软删除 + history + audit，不物理抹除决策证据。

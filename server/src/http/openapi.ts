@@ -34,7 +34,10 @@ const CATEGORIES = [
   'skill',
   'constraint',
   'context',
+  'insight',
 ];
+
+const SOURCES = ['conversation', 'api', 'agent', 'import', 'playground', 'dream'];
 
 const SCOPES = ['memories:read', 'memories:write', 'graph:read', 'admin'];
 
@@ -149,7 +152,7 @@ const memorySchema = objectSchema(
     category: { type: 'string', enum: CATEGORIES },
     importance: { type: 'number', minimum: 0, maximum: 1 },
     confidence: { type: 'number', minimum: 0, maximum: 1 },
-    source: { type: 'string', enum: ['conversation', 'api', 'agent', 'import', 'playground'] },
+    source: { type: 'string', enum: SOURCES },
     status: { type: 'string', enum: ['active', 'archived', 'deleted'] },
     tags: arrayOf({ type: 'string' }),
     metadata: { type: 'object', additionalProperties: true },
@@ -269,6 +272,15 @@ const briefingSectionSchema = objectSchema(
   ['key', 'title', 'description', 'hits'],
 );
 
+const briefingBriefSchema = objectSchema(
+  {
+    text: { type: 'string', description: '记忆简报正文（Markdown）' },
+    maxChars: { type: 'integer', minimum: 100, maximum: 5000 },
+    count: { type: 'integer', minimum: 0, description: '纳入简报的记忆条数' },
+  },
+  ['text', 'maxChars', 'count'],
+);
+
 const briefingSchema = objectSchema(
   {
     project: objectSchema(
@@ -287,8 +299,74 @@ const briefingSchema = objectSchema(
     citations: arrayOf({ type: 'string' }),
     builtAt: { type: 'string', format: 'date-time' },
     tookMs: { type: 'number', minimum: 0 },
+    brief: {
+      anyOf: [ref('BriefingBrief'), { type: 'null' }],
+      description: '记忆简报快照；项目关闭 briefEnabled 或无可用记忆时省略',
+    },
   },
   ['project', 'sections', 'prompt', 'tokenEstimate', 'citations', 'builtAt', 'tookMs'],
+);
+
+const memoryBriefItemSchema = objectSchema(
+  {
+    id: { type: 'string' },
+    content: { type: 'string' },
+    category: { type: 'string', enum: CATEGORIES },
+    importance: { type: 'number', minimum: 0, maximum: 1 },
+    updatedAt: { type: 'string', format: 'date-time' },
+    taskId: { type: 'string' },
+    agentId: { type: 'string' },
+  },
+  ['id', 'content', 'category', 'importance', 'updatedAt'],
+);
+
+const memoryBriefSchema = objectSchema(
+  {
+    projectId: { type: 'string' },
+    text: { type: 'string', description: '简报正文；暂无可用记忆时为空串' },
+    maxChars: { type: 'integer', minimum: 100, maximum: 5000 },
+    count: { type: 'integer', minimum: 0 },
+    model: { type: 'string', description: 'mnemos-condense（确定性压缩）或实际 LLM 模型名' },
+    cached: { type: 'boolean' },
+    generatedAt: { type: 'string', format: 'date-time' },
+    recent: arrayOf(ref('MemoryBriefItem')),
+  },
+  ['projectId', 'text', 'maxChars', 'count', 'model', 'cached', 'generatedAt', 'recent'],
+);
+
+const memoryDreamRunSchema = objectSchema(
+  {
+    id: { type: 'string' },
+    projectId: { type: 'string' },
+    trigger: { type: 'string', enum: ['schedule', 'manual'] },
+    status: { type: 'string', enum: ['running', 'completed', 'skipped', 'failed'] },
+    inputCount: { type: 'integer', minimum: 0 },
+    insightCount: { type: 'integer', minimum: 0 },
+    summary: { type: ['string', 'null'] },
+    error: { type: ['string', 'null'] },
+    startedAt: { type: 'string', format: 'date-time' },
+    finishedAt: { type: ['string', 'null'], format: 'date-time' },
+  },
+  ['id', 'projectId', 'trigger', 'status', 'inputCount', 'insightCount', 'startedAt'],
+);
+
+const memoryDreamSettingsSchema = objectSchema(
+  {
+    enabled: { type: 'boolean' },
+    intervalMinutes: { type: 'integer', minimum: 1, maximum: 43200 },
+    lastAt: { type: ['string', 'null'], format: 'date-time' },
+  },
+  ['enabled', 'intervalMinutes'],
+);
+
+const memoryDreamStatusSchema = objectSchema(
+  {
+    settings: ref('MemoryDreamSettings'),
+    pendingCount: { type: 'integer', minimum: 0, description: '尚未复盘总结的活跃记忆数' },
+    lastRun: { anyOf: [ref('MemoryDreamRun'), { type: 'null' }] },
+    runs: arrayOf(ref('MemoryDreamRun'), { description: '最近 10 次运行（新 → 旧）' }),
+  },
+  ['settings', 'pendingCount', 'runs'],
 );
 
 const apiKeySchema = objectSchema(
@@ -1137,6 +1215,82 @@ export function buildOpenApiDocument(app: AppContext): Record<string, unknown> {
       }),
     },
 
+    /* ---------------------------- /api 记忆简报 / 复盘总结 -------------------- */
+    '/api/projects/{id}/memory/brief': {
+      get: operation({
+        summary: '记忆简报预览（viewer+）',
+        description:
+          '取最近活跃记忆/洞见压缩成有字符上限的 Markdown；默认包含全部 Agent 私有记忆并允许 LLM 润色（失败自动回退确定性文本）。',
+        tags: ['Memory Insights'],
+        operationId: 'getMemoryBrief',
+        security: SESSION_SECURITY,
+        parameters: [
+          ID_PARAM,
+          parameter('force', 'query', { type: 'boolean' }, '忽略缓存重新生成'),
+          parameter('agentId', 'query', { type: 'string' }, '按该 Agent 可见性生成（不传则仅项目共享记忆）'),
+          parameter('maxChars', 'query', { type: 'integer', minimum: 100, maximum: 5000 }, '覆盖项目设置的字数上限'),
+        ],
+        responses: withErrors({ 200: jsonResponse('记忆简报', ref('MemoryBrief')) }),
+      }),
+      patch: operation({
+        summary: '保存记忆简报字数上限（admin+）',
+        description: '写入项目 settings.briefMaxChars（100–5000）后立即重新生成一次并返回最新简报。',
+        tags: ['Memory Insights'],
+        operationId: 'updateMemoryBriefSettings',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM],
+        requestBody: jsonBody(objectSchema({ maxChars: { type: 'integer', minimum: 100, maximum: 5000 } }, ['maxChars'])),
+        responses: withErrors({ 200: jsonResponse('更新后的记忆简报', ref('MemoryBrief')) }),
+      }),
+    },
+    '/api/projects/{id}/memory/dream': {
+      get: operation({
+        summary: '记忆复盘总结状态（viewer+）',
+        tags: ['Memory Insights'],
+        operationId: 'getMemoryDreamStatus',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM],
+        responses: withErrors({ 200: jsonResponse('复盘总结状态', ref('MemoryDreamStatus')) }),
+      }),
+      patch: operation({
+        summary: '配置记忆复盘总结（admin+）',
+        description: 'enabled / intervalMinutes 至少提供一个；写入项目 settings。',
+        tags: ['Memory Insights'],
+        operationId: 'updateMemoryDreamSettings',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM],
+        requestBody: jsonBody(
+          objectSchema({
+            enabled: { type: 'boolean' },
+            intervalMinutes: { type: 'integer', minimum: 1, maximum: 43200 },
+          }),
+        ),
+        responses: withErrors({ 200: jsonResponse('复盘总结状态', ref('MemoryDreamStatus')) }),
+      }),
+    },
+    '/api/projects/{id}/memory/dream/run': {
+      post: operation({
+        summary: '手动触发一次增量复盘总结（admin+）',
+        description: '该项目正在复盘总结时返回 409 CONFLICT；成功返回运行记录与最新状态。',
+        tags: ['Memory Insights'],
+        operationId: 'runMemoryDream',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM],
+        responses: withErrors({
+          200: jsonResponse(
+            '复盘总结结果',
+            objectSchema(
+              {
+                run: ref('MemoryDreamRun'),
+                status: ref('MemoryDreamStatus'),
+              },
+              ['run', 'status'],
+            ),
+          ),
+        }),
+      }),
+    },
+
     /* ---------------------------- /api 项目数据 --------------------------- */
     '/api/projects/{id}/export': {
       get: operation({
@@ -1242,6 +1396,12 @@ export function buildOpenApiDocument(app: AppContext): Record<string, unknown> {
     Task: taskSchema,
     Briefing: briefingSchema,
     BriefingSection: briefingSectionSchema,
+    BriefingBrief: briefingBriefSchema,
+    MemoryBrief: memoryBriefSchema,
+    MemoryBriefItem: memoryBriefItemSchema,
+    MemoryDreamRun: memoryDreamRunSchema,
+    MemoryDreamSettings: memoryDreamSettingsSchema,
+    MemoryDreamStatus: memoryDreamStatusSchema,
     SearchHit: searchHitSchema,
     Error: errorSchema,
     ApiKey: apiKeySchema,

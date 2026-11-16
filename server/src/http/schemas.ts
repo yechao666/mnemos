@@ -24,9 +24,18 @@ export const memoryCategorySchema = z.enum([
   'skill',
   'constraint',
   'context',
+  'insight',
+  'decision',
+  'progress',
+  'lesson',
+  'risk',
+  'change',
+  'acceptance',
+  'assumption',
+  'dependency',
 ]);
 export const extractionModeSchema = z.enum(['additive', 'consolidate']);
-export const memorySourceSchema = z.enum(['conversation', 'api', 'agent', 'import', 'playground']);
+export const memorySourceSchema = z.enum(['conversation', 'api', 'agent', 'import', 'playground', 'dream']);
 export const memorySortSchema = z.enum(['recent', 'importance', 'accessed']);
 export const environmentSchema = z.enum(['production', 'staging', 'sandbox']);
 
@@ -61,6 +70,16 @@ export const projectSettingsSchema = z.object({
   monthlyQuota: z.coerce.number().int().min(0),
   webhookUrl: z.string().trim().max(500).nullable(),
   locale: z.string().trim().min(2).max(20),
+  /* --- 记忆简报 / 做梦 --- */
+  briefMaxChars: z.coerce.number().int().min(100).max(5000),
+  briefEnabled: z.boolean(),
+  dreamEnabled: z.boolean(),
+  dreamIntervalMinutes: z.coerce.number().int().min(1).max(43_200),
+  reportsEnabled: z.boolean(),
+  weeklyReportDay: z.coerce.number().int().min(1).max(7),
+  weeklyReportTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/),
+  monthlyReportDay: z.coerce.number().int().min(1).max(28),
+  monthlyReportTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/),
 });
 
 export const projectSettingsPatchSchema = projectSettingsSchema.partial();
@@ -212,8 +231,19 @@ export const finishTaskSchema = z.object({
   summary: z.string().trim().max(8000).optional(),
   decisions: z.array(finishItemSchema).max(50).optional(),
   lessons: z.array(finishItemSchema).max(50).optional(),
+  progress: z.array(finishItemSchema).max(50).optional(),
+  risks: z.array(finishItemSchema).max(50).optional(),
+  changes: z.array(finishItemSchema).max(50).optional(),
+  acceptance: z.array(finishItemSchema).max(50).optional(),
+  assumptions: z.array(finishItemSchema).max(50).optional(),
+  dependencies: z.array(finishItemSchema).max(50).optional(),
   notes: z.array(finishItemSchema).max(50).optional(),
   agentId: z.string().trim().max(128).optional(),
+});
+
+export const reportQuerySchema = z.object({
+  period: z.enum(['week', 'month']).optional().default('week'),
+  anchor: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 });
 
 export const briefingQuerySchema = z.object({
@@ -223,6 +253,29 @@ export const briefingQuerySchema = z.object({
   budgetTokens: z.coerce.number().int().min(60).max(8000).optional(),
   includePrivate: booleanQuerySchema.optional(),
 });
+
+/* ------------------------------------------------------------------ */
+/* 记忆简报 / 做梦                                                      */
+/* ------------------------------------------------------------------ */
+
+export const briefQuerySchema = z.object({
+  /** 忽略缓存重新生成 */
+  force: booleanQuerySchema.optional(),
+  agentId: z.string().trim().max(128).optional(),
+  /** 不传时使用项目 settings.briefMaxChars */
+  maxChars: z.coerce.number().int().optional(),
+});
+
+export const briefSettingsSchema = z.object({
+  maxChars: z.coerce.number().int().min(100).max(5000),
+});
+
+export const dreamSettingsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    intervalMinutes: z.coerce.number().int().min(1).max(43_200).optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
 
 /* ------------------------------------------------------------------ */
 /* API Key 生命周期                                                     */

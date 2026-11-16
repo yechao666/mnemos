@@ -232,6 +232,36 @@ export function parseSettings(raw: string | null | undefined): ProjectSettings {
       typeof parsed.monthlyQuota === 'number' ? parsed.monthlyQuota : DEFAULT_PROJECT_SETTINGS.monthlyQuota,
     webhookUrl: parsed.webhookUrl,
     locale: parsed.locale ?? DEFAULT_PROJECT_SETTINGS.locale,
+    briefMaxChars:
+      typeof parsed.briefMaxChars === 'number' && Number.isFinite(parsed.briefMaxChars)
+        ? parsed.briefMaxChars
+        : DEFAULT_PROJECT_SETTINGS.briefMaxChars,
+    briefEnabled:
+      typeof parsed.briefEnabled === 'boolean' ? parsed.briefEnabled : DEFAULT_PROJECT_SETTINGS.briefEnabled,
+    dreamEnabled:
+      typeof parsed.dreamEnabled === 'boolean' ? parsed.dreamEnabled : DEFAULT_PROJECT_SETTINGS.dreamEnabled,
+    dreamIntervalMinutes:
+      typeof parsed.dreamIntervalMinutes === 'number' && Number.isFinite(parsed.dreamIntervalMinutes)
+        ? parsed.dreamIntervalMinutes
+        : DEFAULT_PROJECT_SETTINGS.dreamIntervalMinutes,
+    reportsEnabled:
+      typeof parsed.reportsEnabled === 'boolean' ? parsed.reportsEnabled : DEFAULT_PROJECT_SETTINGS.reportsEnabled,
+    weeklyReportDay:
+      typeof parsed.weeklyReportDay === 'number' && Number.isInteger(parsed.weeklyReportDay)
+        ? Math.max(1, Math.min(7, parsed.weeklyReportDay))
+        : DEFAULT_PROJECT_SETTINGS.weeklyReportDay,
+    weeklyReportTime:
+      typeof parsed.weeklyReportTime === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(parsed.weeklyReportTime)
+        ? parsed.weeklyReportTime
+        : DEFAULT_PROJECT_SETTINGS.weeklyReportTime,
+    monthlyReportDay:
+      typeof parsed.monthlyReportDay === 'number' && Number.isInteger(parsed.monthlyReportDay)
+        ? Math.max(1, Math.min(28, parsed.monthlyReportDay))
+        : DEFAULT_PROJECT_SETTINGS.monthlyReportDay,
+    monthlyReportTime:
+      typeof parsed.monthlyReportTime === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(parsed.monthlyReportTime)
+        ? parsed.monthlyReportTime
+        : DEFAULT_PROJECT_SETTINGS.monthlyReportTime,
   };
 }
 

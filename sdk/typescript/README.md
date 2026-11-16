@@ -1,11 +1,11 @@
 # `@mnemos/sdk` — Mnemos TypeScript SDK
 
-Mnemos 官方 TypeScript 客户端：记忆写入、混合检索、Agent 注册表、任务会话与任务简报、图谱 / 统计、导入导出，以及 Webhook（beta）。
+Mnemos 官方 TypeScript 客户端：记忆写入、混合检索、Agent 注册表、任务会话与任务简报、记忆简报 / 做梦、图谱 / 统计、导入导出，以及 Webhook（beta）。
 
 - **零运行时依赖**：只用全局 `fetch`、`URL`、`AbortSignal`；
 - **Node ≥18 与浏览器通用**（依赖全局 `fetch`）；
 - **TypeScript 优先**：类型手写在 `src/types.ts`，`dist/` 带 `.d.ts`；
-- 面向 `/v1/*` 公开 API（API Key 鉴权、snake_case 线上契约）。
+- 面向 `/v1/*` 公开 API（API Key 鉴权、snake_case 线上契约）；记忆简报 / 做梦 5 个方法走控制台 `/api/*`（会话令牌），入参为 camelCase、出参仍按 SDK 惯例归一化为 snake_case。
 
 ## 安装
 
@@ -90,7 +90,7 @@ const client = new MnemosClient({
 | `client.agents` | `list` / `create` |
 | `client.tasks` | `list` / `create` / `get` / `finish` |
 | `client.context` | `build` |
-| `client` | `graph(limit?)` / `stats()` / `health()` / `export()` / `import(doc)` |
+| `client` | `graph(limit?)` / `stats()` / `health()` / `export()` / `import(doc)` / `brief(projectId, params?)` / `updateBriefSettings(projectId, maxChars)` / `dream(projectId)` / `updateDreamSettings(projectId, input)` / `runDream(projectId)` |
 | `client.webhooks` | `list` / `create` / `update` / `delete` / `rotateSecret` / `deliveries` / `replay`（**beta**） |
 
 写请求可传第二个参数：
@@ -228,6 +228,39 @@ await client.webhooks.replay('del_xxx');           // POST /v1/webhook-deliverie
 事件类型：`memory.created`、`memory.updated`、`memory.deleted`、`task.finished`、
 `agent.registered`、`key.created`、`key.revoked`、`quota.exceeded`。
 
+## 记忆简报与做梦（控制台 API）
+
+这 5 个方法对应控制台接口 `/api/projects/{id}/memory/*`，用**控制台会话令牌**鉴权（登录 `/api/auth/login` 拿 `token`），而不是 `mnemos_live_*` API Key；构造客户端时把会话令牌传给 `apiKey` 即可。入参按控制台接口使用 camelCase，响应统一归一化为 snake_case。
+
+```ts
+const consoleClient = new MnemosClient({
+  apiKey: sessionToken, // 控制台会话 token
+  baseUrl: 'http://127.0.0.1:4380',
+});
+const projectId = 'prj_orion_python';
+
+// 读取简报（可临时覆盖字数、跳过缓存）
+const brief = await consoleClient.brief(projectId, { maxChars: 800, force: true });
+console.log(brief.count, brief.max_chars, brief.text);
+
+// 不传 agentId = 审计全量视角（含所有 Agent 私有）；
+// 传 agentId = 该 Agent 实际看到的简报（项目共享 + 其私有，排除其他 Agent 私有）
+const agentBrief = await consoleClient.brief(projectId, { agentId: 'agent-coder' });
+
+// 更新项目简报字符上限（100–5000），返回更新后的简报
+await consoleClient.updateBriefSettings(projectId, 1200);
+
+// 做梦状态 / 设置 / 手动触发
+const status = await consoleClient.dream(projectId);
+console.log(status.pending_count, status.settings.interval_minutes);
+await consoleClient.updateDreamSettings(projectId, { enabled: true, intervalMinutes: 720 });
+const result = await consoleClient.runDream(projectId);
+// 项目正在做梦时返回 409，SDK 返回 { run: null, status }（status 为回读的当前状态）
+if (result.run) console.log(result.run.input_count, result.run.insight_count);
+```
+
+对应的服务端契约、`MemoryBrief` / `MemoryDreamStatus` 字段与 409 说明见 [`docs/api.md`](../../docs/api.md) 的「8.1 记忆简报与做梦」。
+
 ## 构建与测试
 
 从仓库根目录执行：
@@ -238,7 +271,7 @@ node --test sdk/typescript/test/*.test.ts       # 本地 mock server 测试
 ```
 
 测试使用随机端口的 `node:http` mock，覆盖鉴权头、请求体、查询参数、错误映射、幂等键、
-429 / 5xx 重试、`Retry-After`、超时与 webhook 路径，共 13 个用例。
+429 / 5xx 重试、`Retry-After`、超时、webhook 路径，以及记忆简报 / 做梦的控制台端点，共 16 个用例。
 
 ## 版本兼容
 

@@ -148,11 +148,21 @@ export const CATEGORY_LEXICON: Record<Exclude<MemoryCategory, 'fact'>, string[]>
   skill: ['熟悉', '精通', '擅长', '掌握', '熟练', '经验', '技能', '会写', '开发', '编程', '搭建', '实现', 'skilled', 'experienced', 'familiar', 'expert'],
   constraint: ['必须', '不要', '禁止', '不能', '只能', '务必', '限制', '要求', '避免', '不允许', '切记', 'must', 'never', 'avoid', 'required'],
   context: ['当前', '目前', '现在', '正在', '本次', '这个项目', '本项目', '这次', '当下', 'currently', 'ongoing', 'this project'],
+  // insight 只由「复盘总结」生成，不参与文本分类（保留空词典以满足类型完整性）。
+  insight: [],
+  decision: ['决定', '决策', '拍板', '采用', '选定', '选择', '确定方案', 'decision', 'decided'],
+  progress: ['进展', '完成', '已实现', '已上线', '推进', '里程碑', 'progress', 'milestone'],
+  lesson: ['教训', '踩坑', '经验', '复盘', '下次', '避免', 'lesson', 'learned'],
+  risk: ['风险', '阻塞', '隐患', '可能影响', '升级', 'risk', 'blocker', 'blocked'],
+  change: ['变更', '范围变化', '排期调整', '改期', '方案调整', 'change', 'scope change'],
+  acceptance: ['验收', '质量门禁', '测试通过', '评审通过', 'acceptance', 'quality gate', 'verified'],
+  assumption: ['假设', '待确认', '未决', '前提', 'assumption', 'open question'],
+  dependency: ['依赖', '承诺', '上游', '外部团队', 'dependency', 'depends on', 'commitment'],
 };
 
 /** 分类平局时的优先级（越靠前越优先）。 */
 export const CATEGORY_PRIORITY: MemoryCategory[] = [
-  'constraint', 'preference', 'identity', 'relationship', 'plan', 'skill', 'event', 'context', 'fact',
+  'constraint', 'preference', 'identity', 'relationship', 'decision', 'lesson', 'risk', 'change', 'acceptance', 'assumption', 'dependency', 'plan', 'skill', 'event', 'progress', 'context', 'fact',
 ];
 
 /** 各分类的基础重要度。 */
@@ -166,6 +176,16 @@ export const IMPORTANCE_BASE: Record<MemoryCategory, number> = {
   skill: 0.62,
   constraint: 0.8,
   context: 0.38,
+  // insight 只由复盘总结生成，不参与检索分类的默认重要度计算。
+  insight: 0,
+  decision: 0.86,
+  progress: 0.66,
+  lesson: 0.82,
+  risk: 0.9,
+  change: 0.84,
+  acceptance: 0.78,
+  assumption: 0.72,
+  dependency: 0.76,
 };
 
 /** 强调词 → 提高重要度。 */

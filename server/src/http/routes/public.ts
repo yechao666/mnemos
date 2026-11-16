@@ -68,7 +68,18 @@ const v1SearchSchema = z.object({
       agent_id: z.string().trim().max(128).optional(),
       run_id: z.string().trim().max(128).optional(),
       category: z
-        .enum(['preference', 'identity', 'fact', 'plan', 'relationship', 'event', 'skill', 'constraint', 'context'])
+        .enum([
+          'preference',
+          'identity',
+          'fact',
+          'plan',
+          'relationship',
+          'event',
+          'skill',
+          'constraint',
+          'context',
+          'insight',
+        ])
         .optional(),
       status: z.enum(['active', 'archived', 'deleted']).optional(),
       tags: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
@@ -88,7 +99,18 @@ const v1ListQuerySchema = z.object({
   task_id: z.string().trim().max(128).optional(),
   visibility: v1VisibilitySchema.optional(),
   category: z
-    .enum(['preference', 'identity', 'fact', 'plan', 'relationship', 'event', 'skill', 'constraint', 'context'])
+    .enum([
+      'preference',
+      'identity',
+      'fact',
+      'plan',
+      'relationship',
+      'event',
+      'skill',
+      'constraint',
+      'context',
+      'insight',
+    ])
     .optional(),
   page: z.coerce.number().int().min(1).default(1),
   page_size: z.coerce.number().int().min(1).max(100).default(20),
@@ -99,7 +121,18 @@ const v1UpdateSchema = z
     text: z.string().min(1).max(20_000).optional(),
     content: z.string().min(1).max(20_000).optional(),
     category: z
-      .enum(['preference', 'identity', 'fact', 'plan', 'relationship', 'event', 'skill', 'constraint', 'context'])
+      .enum([
+        'preference',
+        'identity',
+        'fact',
+        'plan',
+        'relationship',
+        'event',
+        'skill',
+        'constraint',
+        'context',
+        'insight',
+      ])
       .optional(),
     importance: z.coerce.number().min(0).max(1).optional(),
   })
@@ -280,6 +313,7 @@ function v1Briefing(briefing: Briefing): Record<string, unknown> {
     citations: briefing.citations,
     built_at: briefing.builtAt,
     took_ms: briefing.tookMs,
+    ...(briefing.brief ? { brief: briefing.brief } : {}),
   };
 }
 

@@ -89,6 +89,8 @@ function wipe(db: DatabaseSync): void {
     'maintenance_runs',
     'usage_events',
     'audit_logs',
+    'memory_briefs',
+    'memory_dream_runs',
     'memory_terms',
     'relations',
     'memory_entities',
@@ -479,6 +481,99 @@ export async function runSeed(options: SeedOptions): Promise<SeedSummary> {
         meta.memoryIds.push(memory.id);
         memories += 1;
       }
+    }
+  }
+
+  // 记忆做梦演示数据：为 orion-python 补 2 次已完成运行 + 3 条 insight 洞见。
+  // 洞见通过引擎 add 写入（索引/词项/实体/历史一致），再回填 dreamed_at 与 seeded 时间线。
+  log?.('写入记忆做梦演示数据…');
+  const dreamDemoProject = projectMeta.find((project) => project.slug === 'orion-python');
+  if (dreamDemoProject) {
+    const sourceMemoryIds = [...dreamDemoProject.memoryIds];
+    const dreamRuns = [
+      {
+        id: 'dream_seed_orion_py_0901',
+        trigger: 'schedule',
+        inputCount: 14,
+        startedAt: isoDaysAgo(9, 2),
+        summary: '把库存超卖与支付回调的修复结论归纳为 2 条可复用洞见',
+        insights: [
+          {
+            title: '并发扣减必须锁行并走统一入口',
+            content:
+              '库存超卖的本质是「读-改-写」跨事务：读取库存时未加锁，两个并发请求同时读到同一份余量。修复必须用 SELECT ... FOR UPDATE 锁住库存行，把扣减与订单写入放进同一事务，并统一走 deduct_stock(sku_id, qty, order_id) 入口；上线前补 50 并发压测。',
+            sourceIds: sourceMemoryIds.slice(0, 5),
+          },
+          {
+            title: '支付回调幂等键绑定业务单号',
+            content:
+              '支付回调重复处理会导致重复发货。用 payment_events 幂等表并以 (channel, event_id) 建唯一键，处理顺序固定为验签 → 落幂等表 → 更新订单 → 发领域事件，任一步失败整体回滚；超过重试上限的通知进死信队列人工处理。',
+            sourceIds: sourceMemoryIds.slice(8, 14),
+          },
+        ],
+      },
+      {
+        id: 'dream_seed_orion_py_0902',
+        trigger: 'schedule',
+        inputCount: 9,
+        startedAt: isoDaysAgo(4, 5),
+        summary: '归纳 Python 3.12 升级收益与查询服务拆分前置约束',
+        insights: [
+          {
+            title: 'Python 3.12 升级只保留单一运行时',
+            content:
+              '升级 Python 3.12、pydantic v2 与 SQLAlchemy 2.0 后，asyncio 默认使用 uvloop，订单查询压测 QPS 提升约 12%。项目不再维护 3.9 兼容分支；后续依赖升级以 3.12 为基线，CI 只跑一个 Python 版本。',
+            sourceIds: sourceMemoryIds.slice(0, 7),
+          },
+        ],
+      },
+    ];
+
+    const dreamRunInsert = db.prepare(
+      `INSERT INTO memory_dream_runs
+         (id, project_id, trigger, status, input_count, insight_count, summary, error, started_at, finished_at)
+       VALUES (?, ?, ?, 'running', 0, 0, NULL, NULL, ?, NULL)`,
+    );
+    const dreamRunComplete = db.prepare(
+      `UPDATE memory_dream_runs
+          SET status = 'completed', input_count = ?, insight_count = ?, summary = ?, finished_at = ?
+        WHERE id = ?`,
+    );
+    const dreamMark = db.prepare('UPDATE memories SET dreamed_at = ? WHERE id = ?');
+
+    for (const run of dreamRuns) {
+      const finishedAt = addDays(run.startedAt, 2 / 1_440);
+      dreamRunInsert.run(run.id, dreamDemoProject.id, run.trigger, run.startedAt);
+      let insightCount = 0;
+      for (const insight of run.insights) {
+        const result = await engine.add({
+          projectId: dreamDemoProject.id,
+          text: insight.content,
+          infer: false,
+          visibility: 'project',
+          source: 'dream',
+          tags: ['洞见', '复盘总结'],
+          metadata: {
+            category: 'insight',
+            importance: 0.78,
+            confidence: 0.8,
+            channel: 'seed',
+            dreamRunId: run.id,
+            sourceMemoryIds: insight.sourceIds,
+            dreamTitle: insight.title,
+          },
+          actor: { type: 'system', id: 'seed', label: '演示数据导入' },
+        });
+        for (const memory of result.results) {
+          memoryPatch.run(finishedAt, finishedAt, null, 0, memory.id);
+          historyPatch.run(finishedAt, memory.id);
+          dreamMark.run(finishedAt, memory.id);
+          dreamDemoProject.memoryIds.push(memory.id);
+          memories += 1;
+          insightCount += 1;
+        }
+      }
+      dreamRunComplete.run(run.inputCount, insightCount, run.summary, finishedAt, run.id);
     }
   }
 

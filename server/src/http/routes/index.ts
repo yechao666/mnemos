@@ -10,6 +10,7 @@ import { registerHealthRoutes } from './health.ts';
 import { registerKeyRoutes } from './keys.ts';
 import { registerMemberRoutes } from './members.ts';
 import { registerMemoryRoutes } from './memories.ts';
+import { registerMemoryInsightRoutes } from './memory-insights.ts';
 import { registerOpsRoutes } from './ops.ts';
 import { registerOrgRoutes } from './org.ts';
 import { registerPlaygroundRoutes } from './playground.ts';
@@ -26,6 +27,7 @@ export function registerRoutes(router: Router): void {
   registerMemberRoutes(router);
   registerKeyRoutes(router);
   registerMemoryRoutes(router);
+  registerMemoryInsightRoutes(router);
   registerAgentRoutes(router);
   registerTaskRoutes(router);
   registerWebhookRoutes(router);

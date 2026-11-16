@@ -15,6 +15,7 @@ import type {
   AgentCreateInput,
   AgentListResponse,
   Briefing,
+  BriefingBrief,
   ChatMessage,
   ContextBuildInput,
   EntityRef,
@@ -29,7 +30,17 @@ import type {
   ImportResult,
   Memory,
   MemoryAddInput,
+  MemoryBrief,
+  MemoryBriefInput,
+  MemoryBriefItem,
   MemoryDetail,
+  MemoryDreamResult,
+  MemoryDreamRun,
+  MemoryDreamRunStatus,
+  MemoryDreamSettings,
+  MemoryDreamSettingsInput,
+  MemoryDreamStatus,
+  MemoryDreamTrigger,
   MemoryEvent,
   MemoryHistoryEntry,
   MemoryHistoryResponse,
@@ -255,13 +266,16 @@ const MEMORY_CATEGORIES = [
   'skill',
   'constraint',
   'context',
+  'insight',
 ] as const;
 const VISIBILITIES = ['project', 'agent', 'task'] as const;
 const MEMORY_STATUSES = ['active', 'archived', 'deleted'] as const;
-const MEMORY_SOURCES = ['conversation', 'api', 'agent', 'import', 'playground'] as const;
+const MEMORY_SOURCES = ['conversation', 'api', 'agent', 'import', 'playground', 'dream'] as const;
 const MEMORY_EVENTS = ['ADD', 'UPDATE', 'DELETE', 'MERGE', 'NOOP'] as const;
 const AGENT_STATUSES = ['active', 'idle', 'retired'] as const;
 const TASK_STATUSES = ['open', 'active', 'done', 'abandoned'] as const;
+const DREAM_RUN_STATUSES = ['running', 'completed', 'skipped', 'failed'] as const;
+const DREAM_TRIGGERS = ['schedule', 'manual'] as const;
 const WEBHOOK_EVENT_TYPES = [
   'memory.created',
   'memory.updated',
@@ -431,7 +445,7 @@ function normalizeTask(value: unknown): Task {
 function normalizeBriefing(value: unknown): Briefing {
   const record = asRecord(value);
   const project = asRecord(record.project);
-  return {
+  const briefing: Briefing = {
     project: {
       id: asString(project.id),
       name: asString(project.name),
@@ -453,6 +467,100 @@ function normalizeBriefing(value: unknown): Briefing {
     citations: asStringArray(record.citations),
     built_at: asString(record.built_at, asString(record.builtAt)),
     took_ms: asNumber(record.took_ms, asNumber(record.tookMs)),
+  };
+  if (isRecord(record.brief)) briefing.brief = normalizeBriefingBrief(record.brief);
+  return briefing;
+}
+
+function normalizeBriefingBrief(value: unknown): BriefingBrief {
+  const record = asRecord(value);
+  return {
+    text: asString(record.text),
+    max_chars: asNumber(record.max_chars, asNumber(record.maxChars)),
+    count: asNumber(record.count),
+  };
+}
+
+function normalizeBriefItem(value: unknown): MemoryBriefItem {
+  const record = asRecord(value);
+  const item: MemoryBriefItem = {
+    id: asString(record.id),
+    content: asString(record.content, asString(record.memory)),
+    category: oneOf(record.category, MEMORY_CATEGORIES, 'fact'),
+    importance: asNumber(record.importance),
+    updated_at: asString(record.updated_at, asString(record.updatedAt)),
+  };
+  const taskId = asNullableString(record.task_id ?? record.taskId);
+  if (taskId) item.task_id = taskId;
+  const agentId = asNullableString(record.agent_id ?? record.agentId);
+  if (agentId) item.agent_id = agentId;
+  return item;
+}
+
+/** 归一化记忆简报；兼容控制台 `{ brief: … }` 包装。 */
+function normalizeBrief(value: unknown): MemoryBrief {
+  const record = asRecord(value);
+  const brief = isRecord(record.brief) ? record.brief : record;
+  return {
+    project_id: asString(brief.project_id, asString(brief.projectId, asString(record.projectId))),
+    text: asString(brief.text),
+    max_chars: asNumber(brief.max_chars, asNumber(brief.maxChars, asNumber(record.maxChars))),
+    count: asNumber(brief.count),
+    model: asString(brief.model),
+    cached: asBoolean(brief.cached),
+    generated_at: asString(brief.generated_at, asString(brief.generatedAt)),
+    recent: asArray(brief.recent).map(normalizeBriefItem),
+  };
+}
+
+function normalizeDreamRun(value: unknown): MemoryDreamRun {
+  const record = asRecord(value);
+  const run: MemoryDreamRun = {
+    id: asString(record.id),
+    project_id: asString(record.project_id, asString(record.projectId)),
+    trigger: oneOf(record.trigger, DREAM_TRIGGERS, 'manual'),
+    status: oneOf(record.status, DREAM_RUN_STATUSES, 'completed'),
+    input_count: asNumber(record.input_count, asNumber(record.inputCount)),
+    insight_count: asNumber(record.insight_count, asNumber(record.insightCount)),
+    started_at: asString(record.started_at, asString(record.startedAt)),
+  };
+  const summary = asNullableString(record.summary);
+  if (summary) run.summary = summary;
+  const error = asNullableString(record.error);
+  if (error) run.error = error;
+  const finishedAt = asNullableString(record.finished_at ?? record.finishedAt);
+  if (finishedAt) run.finished_at = finishedAt;
+  return run;
+}
+
+function normalizeDreamSettings(value: unknown): MemoryDreamSettings {
+  const record = asRecord(value);
+  const settings: MemoryDreamSettings = {
+    enabled: asBoolean(record.enabled, true),
+    interval_minutes: asNumber(record.interval_minutes, asNumber(record.intervalMinutes, 1440)),
+  };
+  const lastAt = asNullableString(record.last_at ?? record.lastAt);
+  if (lastAt) settings.last_at = lastAt;
+  return settings;
+}
+
+function normalizeDreamStatus(value: unknown): MemoryDreamStatus {
+  const record = asRecord(value);
+  const status: MemoryDreamStatus = {
+    settings: normalizeDreamSettings(record.settings),
+    pending_count: asNumber(record.pending_count, asNumber(record.pendingCount)),
+    runs: asArray(record.runs).map(normalizeDreamRun),
+  };
+  if (isRecord(record.last_run)) status.last_run = normalizeDreamRun(record.last_run);
+  else if (isRecord(record.lastRun)) status.last_run = normalizeDreamRun(record.lastRun);
+  return status;
+}
+
+function normalizeDreamResult(value: unknown): MemoryDreamResult {
+  const record = asRecord(value);
+  return {
+    run: isRecord(record.run) ? normalizeDreamRun(record.run) : null,
+    status: normalizeDreamStatus(record.status),
   };
 }
 
@@ -762,6 +870,28 @@ function taskListQuery(input: TaskListInput): Query {
     status: input.status,
     agent_id: pick(input.agentId, input.agent_id),
     limit: input.limit,
+  });
+}
+
+/**
+ * 记忆简报查询参数。
+ *
+ * 注意：`/api/*` 控制台接口使用 camelCase 查询参数，这里按服务端契约发送
+ * `force / agentId / maxChars`（控制台视角固定 includePrivate=true、allowLlm=true）。
+ */
+function briefQuery(input: MemoryBriefInput): Query {
+  return queryFrom({
+    force: input.force,
+    agentId: pick(input.agentId, input.agent_id),
+    maxChars: pick(input.maxChars, input.max_chars),
+  });
+}
+
+/** 更新做梦设置（控制台 API 使用 camelCase 请求体）。 */
+function dreamSettingsBody(input: MemoryDreamSettingsInput): JsonRecord {
+  return compact({
+    enabled: input.enabled,
+    intervalMinutes: pick(input.intervalMinutes, input.interval_minutes),
   });
 }
 
@@ -1333,6 +1463,83 @@ export class MnemosClient implements RequestTransport {
     throw new MnemosApiError('请求失败', { status: 0, code: 'unknown_error', requestId: null });
   }
 
+  /* ------------------------------------------------------------------ */
+  /* 记忆简报 / 做梦（控制台 API，需会话 token）                          */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 获取项目记忆简报：最近的活跃记忆/洞见压缩成不超过 `maxChars` 的文本。
+   *
+   * 走控制台 API `GET /api/projects/{id}/memory/brief`，`apiKey` 需要传控制台
+   * 会话 token（而非 `mnemos_live_*` API Key）。命中缓存时 `cached=true`；
+   * 传 `force: true` 可跳过缓存重新生成。
+   */
+  async brief(
+    projectId: string,
+    input: MemoryBriefInput = {},
+    options?: RequestOptions,
+  ): Promise<MemoryBrief> {
+    const raw = await this.request<unknown>(
+      'GET',
+      `/api/projects/${encodeURIComponent(projectId)}/memory/brief`,
+      { query: briefQuery(input), options },
+    );
+    return normalizeBrief(raw);
+  }
+
+  /** 更新项目简报字符上限（100–5000），返回更新后的记忆简报。 */
+  async updateBriefSettings(projectId: string, maxChars: number, options?: RequestOptions): Promise<MemoryBrief> {
+    const raw = await this.request<unknown>(
+      'PATCH',
+      `/api/projects/${encodeURIComponent(projectId)}/memory/brief`,
+      { body: { maxChars }, options },
+    );
+    return normalizeBrief(raw);
+  }
+
+  /** 读取项目做梦状态：设置、尚未做梦的记忆数、最近 10 次运行记录。 */
+  async dream(projectId: string, options?: RequestOptions): Promise<MemoryDreamStatus> {
+    const raw = await this.request<unknown>('GET', `/api/projects/${encodeURIComponent(projectId)}/memory/dream`, {
+      options,
+    });
+    return normalizeDreamStatus(raw);
+  }
+
+  /** 更新做梦设置（是否开启、周期分钟数），返回最新状态。 */
+  async updateDreamSettings(
+    projectId: string,
+    input: MemoryDreamSettingsInput,
+    options?: RequestOptions,
+  ): Promise<MemoryDreamStatus> {
+    const raw = await this.request<unknown>('PATCH', `/api/projects/${encodeURIComponent(projectId)}/memory/dream`, {
+      body: dreamSettingsBody(input),
+      options,
+    });
+    return normalizeDreamStatus(raw);
+  }
+
+  /**
+   * 手动触发一次增量做梦。
+   *
+   * 服务端同一项目同时只允许一次做梦：正在运行时返回 HTTP 409，
+   * SDK 会据此返回 `{ run: null, status }`（`status` 为重新读取的当前状态）。
+   */
+  async runDream(projectId: string, options?: RequestOptions): Promise<MemoryDreamResult> {
+    try {
+      const raw = await this.request<unknown>(
+        'POST',
+        `/api/projects/${encodeURIComponent(projectId)}/memory/dream/run`,
+        { body: {}, options },
+      );
+      return normalizeDreamResult(raw);
+    } catch (error) {
+      if (error instanceof MnemosApiError && error.status === 409) {
+        return { run: null, status: await this.dream(projectId, options) };
+      }
+      throw error;
+    }
+  }
+
   /** 实体关系图谱。 */
   async graph(input: number | GraphInput = {}, options?: RequestOptions): Promise<GraphData> {
     const query: GraphInput = typeof input === 'number' ? { limit: input } : input;
@@ -1399,6 +1606,7 @@ export type {
   AgentCreateInput,
   AgentListResponse,
   Briefing,
+  BriefingBrief,
   ChatMessage,
   ContextBuildInput,
   EntityRef,
@@ -1411,8 +1619,18 @@ export type {
   ImportResult,
   Memory,
   MemoryAddInput,
+  MemoryBrief,
+  MemoryBriefInput,
+  MemoryBriefItem,
   MemoryCategory,
   MemoryDetail,
+  MemoryDreamResult,
+  MemoryDreamRun,
+  MemoryDreamRunStatus,
+  MemoryDreamSettings,
+  MemoryDreamSettingsInput,
+  MemoryDreamStatus,
+  MemoryDreamTrigger,
   MemoryEvent,
   MemoryHistoryEntry,
   MemoryHistoryResponse,

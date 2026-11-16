@@ -56,11 +56,12 @@ curl -X POST $BASE/v1/context \
 - **记忆写入**：`infer=true` 时规则抽取事实（离线可跑），`infer=false` 原文入库；`additive` 只增不改、`consolidate` 高相似去重合并。
 - **多信号混合检索**：语义向量 + BM25 关键词 + 实体命中 + 时效性 + 重要度加权融合，返回逐信号分解。
 - **本地确定性嵌入**：CJK 感知的 char n-gram + 词特征哈希到 384 维，L2 归一化；同一文本永远得到同一向量，无需 API Key。
+- **记忆简报与做梦**：把最近活跃记忆压成有字符上限、可直接注入提示词的简报；增量做梦把尚未整理的新记忆归纳为 `insight` 洞见（不重放旧记忆、不删原记忆，LLM 可选）。
 - **知识图谱**：事实抽取实体（人物/组织/产品/技术/时间/地点）与关系，实体共现建边，控制台可视化。
 - **版本与历史**：每次变更写入 `memory_history`，记录 old/new、actor、reason。
 - **企业治理**：API Key 作用域、RBAC、限流、审计日志、用量分析（p50/p95/p99、错误率、Token）。
 - **实时控制台**：SSE 事件流（`/api/events`）、命令面板、记忆浏览器、图谱、检索演练场。
-- **演示数据**：6 个项目、230 条中文策展记忆、15 个 Agent、6 个任务、8500+ 条用量事件与审计日志，首次启动自动 seed。
+- **演示数据**：6 个项目、233 条中文策展记忆（含 3 条做梦洞见）、15 个 Agent、6 个任务、8500+ 条用量事件与审计日志，首次启动自动 seed。
 
 ---
 
@@ -211,6 +212,155 @@ curl "$BASE/v1/stats" -H "Authorization: Bearer $KEY"
 
 ---
 
+## 记忆简报与做梦
+
+Agent 每次开工都重新检索一遍既慢又容易漏掉「最近发生了什么」。Mnemos 提供两条**记忆再利用**通道：
+
+- **记忆简报（brief）**：把最近活跃的记忆与洞见压成一段**不超过项目字符上限（默认 500 字）**的文本，缓存后可零成本重复读取，并注入 `POST /v1/context` 返回的 `prompt`（「记忆简报」段落）。
+- **记忆做梦（dream）**：**增量**记忆巩固——只归纳 `dreamed_at` 为空、`visibility='project'` 的项目共享记忆，产出 `category=insight`、`source=dream` 的项目共享洞见；私有（`agent`）与任务（`task`）记忆不参与、不会外泄。不重放旧记忆、不删除原记忆，同一内容不会重复写入。
+
+两者都优先使用本地确定性实现：未配置 LLM 时简报走 `mnemos-condense` 压缩、做梦走确定性归并；配置 `MNEMOS_LLM_*` 后，控制台预览的简报会用模型润色、做梦会用模型归纳，调用失败静默回退。`/v1/context` 注入的简报始终使用确定性压缩（不调 LLM、不写缓存），保证 Agent 热路径稳定。
+
+### 控制台入口
+
+项目 → **记忆** 页顶部：
+
+- **记忆简报**卡：查看当前简报与纳入条数，调整字数和「重新生成」。
+- **做梦状态**条：待整理条数（仅项目共享记忆，不含洞见自身）、最近一次运行、周期与开关，支持「立即做梦」并查看最近运行记录。
+- 设置项（`briefMaxChars` / `briefEnabled` / `dreamEnabled` / `dreamIntervalMinutes`）也可通过 `PATCH /api/projects/{id}/settings` 修改。
+
+### 控制台 API
+
+以下 5 个接口使用**控制台会话令牌**（`Authorization: Bearer $SESSION`），不是 `mnemos_live_*` API Key；读取需要项目 `viewer` 及以上，修改/触发需要 `admin` 及以上。
+
+```bash
+BASE=http://127.0.0.1:4380
+PROJECT=prj_orion_python
+# 登录演示账号，取出会话令牌（控制台接口用它鉴权）
+SESSION=$(curl -s -X POST $BASE/api/auth/login -H 'content-type: application/json' \
+  -d '{"email":"lin.wei@mnemos.dev","password":"mnemos-demo"}' \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).token')
+
+# 1) 读取记忆简报；force=true 跳过缓存，maxChars 临时覆盖项目设置（100–5000）
+curl "$BASE/api/projects/$PROJECT/memory/brief?maxChars=800&force=true" \
+  -H "Authorization: Bearer $SESSION"
+
+# 2) 更新简报字符上限（落库），返回重新生成后的简报
+curl -X PATCH "$BASE/api/projects/$PROJECT/memory/brief" \
+  -H "Authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{"maxChars":1200}'
+
+# 3) 读取做梦状态：设置、尚未做梦的记忆数、最近 10 次运行记录
+curl "$BASE/api/projects/$PROJECT/memory/dream" -H "Authorization: Bearer $SESSION"
+
+# 4) 更新做梦设置（enabled / intervalMinutes 至少一个）
+curl -X PATCH "$BASE/api/projects/$PROJECT/memory/dream" \
+  -H "Authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{"enabled":true,"intervalMinutes":720}'
+
+# 5) 手动触发一次增量做梦；同一项目正在做梦时返回 409
+curl -X POST "$BASE/api/projects/$PROJECT/memory/dream/run" \
+  -H "Authorization: Bearer $SESSION"
+```
+
+`GET .../brief` 响应（`recent` 说明简报由哪些记忆组成）：
+
+```json
+{
+  "projectId": "prj_orion_python",
+  "text": "# 记忆简报（最近记忆与洞见）\n- [约束] 库存扣减统一走 deduct_stock 服务方法…\n- [事实] 支付回调必须绑定业务单号做幂等…",
+  "maxChars": 800,
+  "count": 12,
+  "model": "mnemos-condense",
+  "cached": false,
+  "generatedAt": "2026-11-05T15:40:00.000Z",
+  "recent": [
+    {
+      "id": "mem_…",
+      "content": "支付回调幂等键必须绑定业务单号。",
+      "category": "constraint",
+      "importance": 0.82,
+      "updatedAt": "2026-11-05T14:02:00.000Z",
+      "taskId": "task_orion_payment_idempotency",
+      "agentId": "agent-reviewer"
+    }
+  ]
+}
+```
+
+`POST .../dream/run` 响应（`trigger` 为 `manual` 或 `schedule`；`status.pendingCount` 会随本次做梦下降）：
+
+```json
+{
+  "run": {
+    "id": "dream_…",
+    "projectId": "prj_orion_python",
+    "trigger": "manual",
+    "status": "completed",
+    "inputCount": 8,
+    "insightCount": 2,
+    "summary": "归纳出并发扣减与回调幂等两条可复用约束",
+    "startedAt": "2026-11-05T15:42:00.000Z",
+    "finishedAt": "2026-11-05T15:42:02.000Z"
+  },
+  "status": {
+    "settings": { "enabled": true, "intervalMinutes": 720, "lastAt": "2026-11-05T15:42:00.000Z" },
+    "pendingCount": 0,
+    "runs": [{ "id": "dream_…", "status": "completed", "inputCount": 8, "insightCount": 2 }]
+  }
+}
+```
+
+并发触发时返回 `409 CONFLICT`（标准错误信封 `{ "error": { "code": "CONFLICT", "message": "该项目正在做梦，请稍后再试", "requestId": "…" } }`），不会重复执行。
+
+### 简报如何注入 Agent
+
+`POST /v1/context` 在项目 `briefEnabled` 为真且简报非空时，除了原有的 `sections` / `prompt`，还会返回 `brief`，并在 `prompt` 中「项目简报」元信息之后、各分区之前插入「记忆简报」段落：
+
+```bash
+curl -X POST $BASE/v1/context \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"agent_id":"agent-coder","task_id":"task_orion_split_query"}'
+```
+
+```json
+{
+  "prompt": "# 项目简报：Orion 订单服务 · Python\n- 生成时间：…\n\n## 记忆简报（最近记忆与洞见）\n- [约束] …\n\n## 项目背景\n…",
+  "brief": { "text": "# 记忆简报（最近记忆与洞见）\n- [约束] …", "maxChars": 500, "count": 9 }
+}
+```
+
+简报可见性：`/v1/context` 按调用方 `agent_id` 生成——**项目共享记忆 + 该 Agent 自己的私有记忆**。控制台 GET brief 不传 `agentId` 时是审计全量视角（含所有 Agent 私有）；传 `agentId` 时预览该 Agent 实际看到的简报（项目共享 + 其私有，排除其他 Agent 私有）。项目关闭 `briefEnabled` 或没有可用记忆（`count=0`）时不注入、不返回 `brief`。
+
+### 行为边界
+
+- **只处理新记忆**：做梦只扫描 `dreamed_at IS NULL`、`visibility='project'` 且非 `insight` 的活跃记忆（正文至少 10 字），处理完写入 `dreamed_at` 作为增量水位，旧记忆不会被重放。
+- **不删除原记忆**：洞见是新增的 `category=insight`、`source=dream` 记忆（固定 `visibility='project'`），`metadata` 记录 `dreamRunId` 与 `sourceMemoryIds`，可反查来源。
+- **隐私边界**：Agent 私有（`visibility='agent'`）与任务（`visibility='task'`）记忆**不参与做梦**、不会被标记 `dreamed_at`，也不会被写进项目共享洞见。
+- **不重复写入**：相同内容不会生成重复洞见；没有待整理记忆时运行记为 `skipped`，有输入但未形成洞见时记为 `completed`（`insightCount=0`），不硬凑洞见。
+- **简报有缓存**：按「记忆集合 + 字符上限」计算 `source_hash` 缓存到 `memory_briefs`，记忆变化或调大/调小上限后自动失效；`force=true` 强制重算。
+- **LLM 可选**：`MNEMOS_LLM_*` 未配置时纯确定性压缩/归纳，零外部依赖；配置后控制台预览的简报与做梦归纳会调用模型，超时或报错时回退确定性结果，不阻塞请求；`/v1/context` 注入路径固定走确定性压缩。
+- **运行可追溯**：每次做梦在 `memory_dream_runs` 留一条记录（`trigger` / `status` / `inputCount` / `insightCount` / 起止时间），控制台与 `GET .../dream` 均可查看最近 10 次。
+
+### 环境变量
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `MNEMOS_DREAM_SCHEDULER` | 开启 | 定时做梦调度器；设为 `0` / `false`（或空串）关闭，仅保留控制台手动触发 |
+| `MNEMOS_DREAM_TICK_MS` | `60000` | 调度器轮询间隔（毫秒），最小 `5000` |
+| `MNEMOS_LLM_BASE_URL` + `MNEMOS_LLM_API_KEY` | 空 | 可选的 OpenAI 兼容模型；未配置时简报/做梦走确定性实现 |
+| `MNEMOS_LLM_MODEL` | `gpt-4o-mini` | LLM 模型名（配置了 baseUrl + apiKey 才生效） |
+
+调度器每次轮询只挑选「状态为 `active`、已开启做梦、有未整理的项目共享新记忆、且距上次运行超过项目周期」的项目，单次最多处理 5 个项目；单个项目单批最多处理 50 条新记忆（可在内部调用时放宽到 200）。
+
+### 手动触发与查看运行记录
+
+- 控制台：项目 → 记忆 → 「立即做梦」，状态条与最近运行记录自动刷新。
+- API：`POST /api/projects/{id}/memory/dream/run` 立即执行一次；`GET /api/projects/{id}/memory/dream` 读取 `runs`（最近 10 次，新 → 旧）。
+- 诊断：`GET /api/projects/{id}/memories?category=insight` 可看到做梦生成的洞见；公开 API `GET /v1/memories?category=insight` 同样支持；`source=dream` 便于筛选。
+
+---
+
 ## 架构
 
 ```mermaid
@@ -283,7 +433,9 @@ mnemos/
 | `MNEMOS_DEMO` | `1` | 空库时自动写入演示数据 |
 | `MNEMOS_AUTH_DISABLED` | `0` | 仅本地调试使用 |
 | `MNEMOS_SESSION_TTL_HOURS` | `72` | 控制台会话有效期 |
-| `MNEMOS_LLM_BASE_URL` + `MNEMOS_LLM_API_KEY` | 空 | 配置后启用模型抽取/嵌入（可选） |
+| `MNEMOS_DREAM_SCHEDULER` | 开启 | 定时做梦调度器；`0` 关闭（详见[记忆简报与做梦](#记忆简报与做梦)） |
+| `MNEMOS_DREAM_TICK_MS` | `60000` | 做梦调度轮询间隔（毫秒，最小 `5000`） |
+| `MNEMOS_LLM_BASE_URL` + `MNEMOS_LLM_API_KEY` | 空 | 配置后启用模型抽取/嵌入（可选），简报润色与做梦归纳复用此配置 |
 
 ---
 

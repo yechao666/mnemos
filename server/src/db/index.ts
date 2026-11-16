@@ -7,7 +7,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** 打开 SQLite（WAL）。:memory: 用于测试。 */
 export function openDatabase(dbPath: string): Db {
@@ -46,6 +46,7 @@ function ensureColumns(db: Db): void {
   ensure('memories', {
     task_id: 'TEXT',
     visibility: "TEXT NOT NULL DEFAULT 'project'",
+    dreamed_at: 'TEXT',
   });
   ensure('users', {
     status: "TEXT NOT NULL DEFAULT 'active'",
@@ -92,6 +93,14 @@ interface Migration {
  * 列级变更写进 ensureColumns（幂等），数据回填/索引等写进 up()。
  */
 const MIGRATIONS: Migration[] = [
+  {
+    version: 4,
+    name: 'brief-and-dream',
+    up: () => {
+      // memories.dreamed_at、memory_briefs、memory_dream_runs 由 ensureColumns + schema.sql 幂等创建；
+      // 无需数据回填（存量记忆 dreamed_at 为 NULL，首次做梦会做一次增量巩固）。
+    },
+  },
   {
     version: 3,
     name: 'webhooks-and-observability',

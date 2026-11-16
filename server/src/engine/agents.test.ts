@@ -137,8 +137,8 @@ test('Task：创建、结束自动沉淀记忆（visibility=project、taskId 关
 
   const decision = finished.memories.find((memory) => memory.content.includes('payment_events'));
   assert.ok(decision);
-  assert.equal(decision.category, 'fact');
-  assert.equal(decision.importance, 0.82);
+  assert.equal(decision.category, 'decision');
+  assert.equal(decision.importance, 0.86);
   assert.equal(decision.visibility, 'project');
   assert.equal(decision.taskId, task.id);
   assert.equal(decision.agentId, agent.id);
@@ -147,8 +147,8 @@ test('Task：创建、结束自动沉淀记忆（visibility=project、taskId 关
 
   const lesson = finished.memories.find((memory) => memory.content.includes('唯一键'));
   assert.ok(lesson);
-  assert.equal(lesson.category, 'constraint');
-  assert.equal(lesson.importance, 0.78);
+  assert.equal(lesson.category, 'lesson');
+  assert.equal(lesson.importance, 0.82);
 
   const note = finished.memories.find((memory) => memory.content.includes('50 并发'));
   assert.ok(note);

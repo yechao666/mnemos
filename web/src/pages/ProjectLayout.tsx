@@ -28,6 +28,9 @@ interface TabDefinition {
 const PROJECT_TABS: TabDefinition[] = [
   { to: '.', label: '概览', end: true },
   { to: 'memories', label: '记忆', end: true },
+  { to: 'records', label: '项目记录', end: true },
+  { to: 'retrospective', label: '复盘总结', end: true },
+  { to: 'members', label: '成员', end: true },
   { to: 'graph', label: '图谱', end: true },
   { to: 'agents', label: 'Agent', end: true },
   { to: 'tasks', label: '任务', end: true },
@@ -64,6 +67,10 @@ export function ProjectLayout() {
 
   // 切换项目时避免短暂展示上一个项目的数据。
   const activeProject = project && project.id === id ? project : null;
+
+  const tabs = activeProject && !activeProject.settings.reportsEnabled
+    ? PROJECT_TABS.filter((tab) => tab.to !== 'retrospective')
+    : PROJECT_TABS;
 
   const contextValue = useMemo<ProjectContextValue>(
     () => ({ project: activeProject, loading, error, refresh, setProject }),
@@ -167,7 +174,7 @@ export function ProjectLayout() {
         </div>
 
         <nav className="tabs" aria-label="项目页签">
-          {PROJECT_TABS.map((tab) => (
+          {tabs.map((tab) => (
             <NavLink
               key={tab.to}
               to={tab.to}

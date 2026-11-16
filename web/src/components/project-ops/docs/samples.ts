@@ -334,3 +334,156 @@ export function statsSample(lang: DocLang): string {
     'stats = res.json()',
   ].join('\n');
 }
+
+/**
+ * 记忆简报（控制台 API）：读取简报 + 更新字符上限。
+ *
+ * 控制台接口使用会话令牌（`/api/auth/login` 返回的 `token`），不是 `mnemos_live_*` API Key。
+ */
+export function briefSample(baseUrl: string, projectId: string, lang: DocLang): string {
+  if (lang === 'curl') {
+    return [
+      `PROJECT_ID="${projectId}"`,
+      '# 控制台接口使用会话令牌：POST /api/auth/login → { token }',
+      'SESSION="$MNEMOS_SESSION_TOKEN"',
+      '',
+      '# 读取简报：maxChars 临时覆盖项目设置，force=1 跳过缓存',
+      'curl "$MNEMOS_BASE_URL/api/projects/$PROJECT_ID/memory/brief?maxChars=800&force=1" \\',
+      '  -H "Authorization: Bearer $SESSION"',
+      '',
+      '# 更新项目简报字数上限（100–5000），返回重新生成后的简报',
+      'curl -X PATCH "$MNEMOS_BASE_URL/api/projects/$PROJECT_ID/memory/brief" \\',
+      '  -H "Authorization: Bearer $SESSION" \\',
+      '  -H "Content-Type: application/json" \\',
+      '  -d \'{"maxChars":1200}\'',
+    ].join('\n');
+  }
+  if (lang === 'typescript') {
+    return [
+      `const BASE_URL = '${baseUrl}';`,
+      `const PROJECT_ID = '${projectId}';`,
+      'const SESSION = process.env.MNEMOS_SESSION_TOKEN!; // 登录 /api/auth/login 获取',
+      '',
+      '// 读取简报：不传 agentId = 审计全量；传 agentId = 该 Agent 视角（项目共享 + 其私有）',
+      'const brief = await fetch(',
+      '  `${BASE_URL}/api/projects/${PROJECT_ID}/memory/brief?maxChars=800`,',
+      "  { headers: { Authorization: `Bearer ${SESSION}` } },",
+      ').then((res) => res.json());',
+      'console.log(brief.count, brief.maxChars);',
+      '',
+      '// 更新字数上限（100–5000）',
+      'await fetch(`${BASE_URL}/api/projects/${PROJECT_ID}/memory/brief`, {',
+      "  method: 'PATCH',",
+      '  headers: { Authorization: `Bearer ${SESSION}`, \'Content-Type\': \'application/json\' },',
+      '  body: JSON.stringify({ maxChars: 1200 }),',
+      '});',
+    ].join('\n');
+  }
+  return [
+    'import os',
+    'import requests',
+    '',
+    `BASE_URL = "${baseUrl}"`,
+    `PROJECT_ID = "${projectId}"`,
+    'SESSION = os.environ["MNEMOS_SESSION_TOKEN"]  # 登录 /api/auth/login 获取',
+    'HEADERS = {"Authorization": f"Bearer {SESSION}"}',
+    '',
+    '# 读取简报：不传 agentId = 审计全量；传 agentId = 该 Agent 视角（项目共享 + 其私有）',
+    'brief = requests.get(',
+    '    f"{BASE_URL}/api/projects/{PROJECT_ID}/memory/brief",',
+    '    params={"maxChars": 800},',
+    '    headers=HEADERS,',
+    ').json()',
+    'print(brief["count"], brief["maxChars"])',
+    '',
+    '# 更新字数上限（100–5000）',
+    'requests.patch(',
+    '    f"{BASE_URL}/api/projects/{PROJECT_ID}/memory/brief",',
+    '    json={"maxChars": 1200},',
+    '    headers=HEADERS,',
+    ')',
+  ].join('\n');
+}
+
+/** 记忆复盘总结（控制台 API）：状态 / 设置 / 手动触发。 */
+export function dreamSample(baseUrl: string, projectId: string, lang: DocLang): string {
+  if (lang === 'curl') {
+    return [
+      `PROJECT_ID="${projectId}"`,
+      'SESSION="$MNEMOS_SESSION_TOKEN" # 控制台接口传会话令牌，不是 API Key',
+      '',
+      '# 1) 读取状态：settings / pendingCount / 最近 10 次运行记录',
+      'curl "$MNEMOS_BASE_URL/api/projects/$PROJECT_ID/memory/dream" \\',
+      '  -H "Authorization: Bearer $SESSION"',
+      '',
+      '# 2) 更新设置：enabled 与 intervalMinutes 至少提供一个（1–43200 分钟）',
+      'curl -X PATCH "$MNEMOS_BASE_URL/api/projects/$PROJECT_ID/memory/dream" \\',
+      '  -H "Authorization: Bearer $SESSION" \\',
+      '  -H "Content-Type: application/json" \\',
+      '  -d \'{"enabled":true,"intervalMinutes":720}\'',
+      '',
+      '# 3) 手动触发一次增量复盘总结；运行中返回 409 CONFLICT',
+      'curl -X POST "$MNEMOS_BASE_URL/api/projects/$PROJECT_ID/memory/dream/run" \\',
+      '  -H "Authorization: Bearer $SESSION"',
+    ].join('\n');
+  }
+  if (lang === 'typescript') {
+    return [
+      `const BASE_URL = '${baseUrl}';`,
+      `const PROJECT_ID = '${projectId}';`,
+      'const SESSION = process.env.MNEMOS_SESSION_TOKEN!;',
+      'const auth = { Authorization: `Bearer ${SESSION}` };',
+      '',
+      '// 状态：settings、尚未复盘总结的项目共享记忆数、最近运行记录',
+      'const status = await fetch(',
+      '  `${BASE_URL}/api/projects/${PROJECT_ID}/memory/dream`,',
+      '  { headers: auth },',
+      ').then((res) => res.json());',
+      'console.log(status.pendingCount, status.runs.length);',
+      '',
+      '// 更新设置',
+      'await fetch(`${BASE_URL}/api/projects/${PROJECT_ID}/memory/dream`, {',
+      "  method: 'PATCH',",
+      '  headers: { ...auth, \'Content-Type\': \'application/json\' },',
+      '  body: JSON.stringify({ enabled: true, intervalMinutes: 720 }),',
+      '});',
+      '',
+      '// 手动触发一次（运行中返回 409）',
+      'const result = await fetch(`${BASE_URL}/api/projects/${PROJECT_ID}/memory/dream/run`, {',
+      "  method: 'POST',",
+      '  headers: auth,',
+      '}).then((res) => res.json());',
+      'console.log(result.run?.inputCount, result.run?.insightCount);',
+    ].join('\n');
+  }
+  return [
+    'import os',
+    'import requests',
+    '',
+    `BASE_URL = "${baseUrl}"`,
+    `PROJECT_ID = "${projectId}"`,
+    'SESSION = os.environ["MNEMOS_SESSION_TOKEN"]',
+    'HEADERS = {"Authorization": f"Bearer {SESSION}"}',
+    '',
+    '# 状态：settings、尚未复盘总结的项目共享记忆数、最近运行记录',
+    'status = requests.get(',
+    '    f"{BASE_URL}/api/projects/{PROJECT_ID}/memory/dream",',
+    '    headers=HEADERS,',
+    ').json()',
+    'print(status["pendingCount"], len(status["runs"]))',
+    '',
+    '# 更新设置',
+    'requests.patch(',
+    '    f"{BASE_URL}/api/projects/{PROJECT_ID}/memory/dream",',
+    '    json={"enabled": True, "intervalMinutes": 720},',
+    '    headers=HEADERS,',
+    ')',
+    '',
+    '# 手动触发一次（运行中返回 409）',
+    'result = requests.post(',
+    '    f"{BASE_URL}/api/projects/{PROJECT_ID}/memory/dream/run",',
+    '    headers=HEADERS,',
+    ').json()',
+    'print(result["run"]["inputCount"], result["run"]["insightCount"])',
+  ].join('\n');
+}

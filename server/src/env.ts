@@ -54,6 +54,11 @@ export interface Env {
   webhookMaxAttempts: number;
   webhookWorkerIntervalMs: number;
   webhookAllowPrivate: boolean;
+  /* --- 记忆做梦调度 --- */
+  /** MNEMOS_DREAM_SCHEDULER≠0/'' 时开启（默认 true） */
+  dreamSchedulerEnabled: boolean;
+  /** 调度 tick 间隔（毫秒，默认 60000，最小 5000） */
+  dreamTickMs: number;
   /* --- OpenTelemetry --- */
   otelEnabled: boolean;
   otelEndpoint: string;
@@ -71,6 +76,13 @@ function num(value: string | undefined, fallback: number): number {
 function flag(value: string | undefined, fallback = false): boolean {
   if (value === undefined || value === '') return fallback;
   return value === '1' || value.toLowerCase() === 'true';
+}
+
+/** 默认开启的开关：MNEMOS_DREAM_SCHEDULER=0 或 '' 时关闭，其余保持开启。 */
+function flagDefaultOn(value: string | undefined): boolean {
+  if (value === undefined) return true;
+  const normalized = value.trim().toLowerCase();
+  return !(normalized === '' || normalized === '0' || normalized === 'false');
 }
 
 function level(value: string | undefined): LogLevel {
@@ -129,6 +141,8 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     webhookMaxAttempts: Math.min(12, num(process.env.MNEMOS_WEBHOOK_MAX_ATTEMPTS, 6)),
     webhookWorkerIntervalMs: num(process.env.MNEMOS_WEBHOOK_WORKER_INTERVAL_MS, 2_000),
     webhookAllowPrivate: flag(process.env.MNEMOS_WEBHOOK_ALLOW_PRIVATE, false),
+    dreamSchedulerEnabled: flagDefaultOn(process.env.MNEMOS_DREAM_SCHEDULER),
+    dreamTickMs: Math.max(5_000, num(process.env.MNEMOS_DREAM_TICK_MS, 60_000)),
     otelEnabled: flag(process.env.MNEMOS_OTEL_ENABLED, false),
     otelEndpoint: process.env.MNEMOS_OTEL_ENDPOINT ?? 'http://127.0.0.1:4318/v1/traces',
     otelSampleRate: Math.min(1, Math.max(0, Number(process.env.MNEMOS_OTEL_SAMPLE_RATE ?? 0.1) || 0.1)),

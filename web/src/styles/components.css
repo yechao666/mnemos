@@ -1947,3 +1947,23 @@
   .overlay { padding: 12px; }
   .toaster { left: 12px; right: 12px; bottom: 12px; max-width: none; }
 }
+
+/* 可排序 / 可调列宽表格 */
+.table th { position: relative; }
+.table th.th-sortable { cursor: pointer; user-select: none; }
+.table th.th-sortable:hover { color: var(--text); }
+.th-sort { display: inline-flex; align-items: center; gap: 4px; }
+.th-sort-arrow { font-size: 9px; color: var(--text-muted); opacity: .65; }
+.table th.th-sortable:hover .th-sort-arrow { opacity: 1; }
+.table th.th-resizable { padding-right: 14px; }
+.th-resize {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.th-resize:hover { background: rgba(139, 124, 255, .35); }
+.table-resizable { table-layout: fixed; }

@@ -5,6 +5,7 @@ import { createHttpServer, drainConnections } from './http/server.ts';
 import { EventBus } from './lib/bus.ts';
 import { createPlatform } from './platform/index.ts';
 import { createWebhookDispatcher } from './webhooks/index.ts';
+import { startDreamScheduler } from './engine/dream-scheduler.ts';
 import { initObservability } from './observability/otel.ts';
 import type { AppContext } from './contracts.ts';
 import { APP_VERSION } from '../../shared/src/constants.ts';
@@ -27,7 +28,7 @@ const db = openDatabase(env.dbPath);
 migrate(db);
 
 const bus = new EventBus();
-const engine = createMemoryService(db, { bus });
+const engine = createMemoryService(db, { bus, llm: env.llm });
 const platform = createPlatform({ db, env, bus });
 const { logger, metrics } = platform;
 
@@ -84,6 +85,9 @@ try {
 
 const server = createHttpServer(context);
 
+/** 做梦调度器的停止函数（listen 成功后赋值，停机时调用）。 */
+let stopDreamScheduler: () => void = () => {};
+
 server.listen(env.port, env.host, () => {
   const base = `http://${env.host}:${env.port}`;
   logger.info('Mnemos 已启动', {
@@ -99,6 +103,7 @@ server.listen(env.port, env.host, () => {
   // 启动 60s 后首次维护，之后按间隔重复
   platform.maintenance.start();
   webhooks.start();
+  stopDreamScheduler = startDreamScheduler({ db, env, engine, logger, metrics });
 });
 
 let shuttingDown = false;
@@ -120,6 +125,7 @@ async function shutdown(signal: string): Promise<void> {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await drain;
     webhooks.stop();
+    stopDreamScheduler();
     await observability.shutdown();
     await platform.shutdown();
     try {

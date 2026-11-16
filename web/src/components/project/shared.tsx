@@ -37,6 +37,7 @@ export const SOURCE_LABEL: Record<MemorySource, string> = {
   agent: 'Agent',
   import: '批量导入',
   playground: '演练场',
+  dream: '复盘总结整理',
 };
 
 export function fmtRate(value: number | null | undefined): string {

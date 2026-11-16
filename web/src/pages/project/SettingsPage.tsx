@@ -36,6 +36,14 @@ interface RetrievalForm {
   weights: RetrievalWeights;
 }
 
+interface ReportForm {
+  enabled: boolean;
+  weeklyDay: number;
+  weeklyTime: string;
+  monthlyDay: number;
+  monthlyTime: string;
+}
+
 interface IntegrationForm {
   monthlyQuota: number;
   webhookUrl: string;
@@ -61,6 +69,14 @@ const DEFAULT_RETRIEVAL: RetrievalForm = {
   topK: 8,
   threshold: 0.12,
   weights: { semantic: 0.45, keyword: 0.3, entity: 0.15, recency: 0.1 },
+};
+
+const DEFAULT_REPORT: ReportForm = {
+  enabled: true,
+  weeklyDay: 5,
+  weeklyTime: '17:00',
+  monthlyDay: 1,
+  monthlyTime: '09:00',
 };
 
 const DEFAULT_INTEGRATION: IntegrationForm = {
@@ -103,6 +119,16 @@ function retrievalFromSettings(settings: ProjectSettings): RetrievalForm {
     topK: settings.topK,
     threshold: settings.threshold,
     weights: { ...settings.weights },
+  };
+}
+
+function reportFromSettings(settings: ProjectSettings): ReportForm {
+  return {
+    enabled: settings.reportsEnabled,
+    weeklyDay: settings.weeklyReportDay,
+    weeklyTime: settings.weeklyReportTime,
+    monthlyDay: settings.monthlyReportDay,
+    monthlyTime: settings.monthlyReportTime,
   };
 }
 
@@ -154,6 +180,8 @@ export function SettingsPage() {
   const [memoryBase, setMemoryBase] = useState<MemoryForm>(DEFAULT_MEMORY);
   const [retrieval, setRetrieval] = useState<RetrievalForm>(DEFAULT_RETRIEVAL);
   const [retrievalBase, setRetrievalBase] = useState<RetrievalForm>(DEFAULT_RETRIEVAL);
+  const [report, setReport] = useState<ReportForm>(DEFAULT_REPORT);
+  const [reportBase, setReportBase] = useState<ReportForm>(DEFAULT_REPORT);
   const [integration, setIntegration] = useState<IntegrationForm>(DEFAULT_INTEGRATION);
   const [integrationBase, setIntegrationBase] = useState<IntegrationForm>(DEFAULT_INTEGRATION);
   const [info, setInfo] = useState<InfoForm>(DEFAULT_INFO);
@@ -161,11 +189,13 @@ export function SettingsPage() {
 
   const [savingMemory, setSavingMemory] = useState(false);
   const [savingRetrieval, setSavingRetrieval] = useState(false);
+  const [savingReport, setSavingReport] = useState(false);
   const [savingIntegration, setSavingIntegration] = useState(false);
   const [savingInfo, setSavingInfo] = useState(false);
 
   const [memoryError, setMemoryError] = useState<string | null>(null);
   const [retrievalError, setRetrievalError] = useState<string | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
   const [integrationError, setIntegrationError] = useState<string | null>(null);
   const [infoError, setInfoError] = useState<string | null>(null);
 
@@ -178,12 +208,15 @@ export function SettingsPage() {
     const settings = project.settings;
     const nextMemory = memoryFromSettings(settings);
     const nextRetrieval = retrievalFromSettings(settings);
+    const nextReport = reportFromSettings(settings);
     const nextIntegration = integrationFromSettings(settings);
     const nextInfo = infoFromProject(project);
     setMemory(nextMemory);
     setMemoryBase(nextMemory);
     setRetrieval(nextRetrieval);
     setRetrievalBase(nextRetrieval);
+    setReport(nextReport);
+    setReportBase(nextReport);
     setIntegration(nextIntegration);
     setIntegrationBase(nextIntegration);
     setInfo(nextInfo);
@@ -208,6 +241,7 @@ export function SettingsPage() {
 
   const memoryDirty = JSON.stringify(memory) !== JSON.stringify(memoryBase);
   const retrievalDirty = JSON.stringify(retrieval) !== JSON.stringify(retrievalBase);
+  const reportDirty = JSON.stringify(report) !== JSON.stringify(reportBase);
   const integrationDirty = JSON.stringify(integration) !== JSON.stringify(integrationBase);
   const infoDirty = JSON.stringify(info) !== JSON.stringify(infoBase);
 
@@ -288,6 +322,28 @@ export function SettingsPage() {
       setRetrievalError(messageOf(cause));
     } finally {
       setSavingRetrieval(false);
+    }
+  };
+
+  const saveReport = async () => {
+    if (savingReport) return;
+    setSavingReport(true);
+    setReportError(null);
+    try {
+      await api.projects.settings.update(projectId, {
+        reportsEnabled: report.enabled,
+        weeklyReportDay: report.weeklyDay,
+        weeklyReportTime: report.weeklyTime,
+        monthlyReportDay: report.monthlyDay,
+        monthlyReportTime: report.monthlyTime,
+      });
+      setReportBase(report);
+      toast.success('复盘报告设置已保存');
+      await refresh();
+    } catch (cause) {
+      setReportError(messageOf(cause));
+    } finally {
+      setSavingReport(false);
     }
   };
 
@@ -566,6 +622,55 @@ export function SettingsPage() {
               </Callout>
             )}
           </div>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection
+        title="复盘与报告"
+        desc="控制是否显示「复盘总结」，并设置周报/月报的计划生成时间；关闭后项目导航隐藏该页签。"
+        dirty={reportDirty}
+        saving={savingReport}
+        error={reportError}
+        onSave={() => void saveReport()}
+        saveLabel="保存报告设置"
+      >
+        <div className="between">
+          <div>
+            <div className="small soft">启用周报 / 月报</div>
+            <div className="tiny dim">关闭后隐藏复盘总结页签，过程记录仍会保留。</div>
+          </div>
+          <span style={{ flexShrink: 0 }}>
+            <Switch checked={report.enabled} onChange={(checked) => setReport((prev) => ({ ...prev, enabled: checked }))} label={report.enabled ? '已开启' : '已关闭'} />
+          </span>
+        </div>
+        <div className="grid grid-2">
+          <Field label="周报生成日" htmlFor="weekly-report-day">
+            <Select
+              id="weekly-report-day"
+              value={String(report.weeklyDay)}
+              options={[
+                { value: '1', label: '周一' }, { value: '2', label: '周二' }, { value: '3', label: '周三' },
+                { value: '4', label: '周四' }, { value: '5', label: '周五' }, { value: '6', label: '周六' }, { value: '7', label: '周日' },
+              ]}
+              disabled={!report.enabled}
+              onChange={(event) => setReport((prev) => ({ ...prev, weeklyDay: Number(event.target.value) }))}
+            />
+          </Field>
+          <Field label="周报生成时间" htmlFor="weekly-report-time">
+            <Input id="weekly-report-time" type="time" value={report.weeklyTime} disabled={!report.enabled} onChange={(event) => setReport((prev) => ({ ...prev, weeklyTime: event.target.value }))} />
+          </Field>
+          <Field label="月报生成日" htmlFor="monthly-report-day">
+            <Select
+              id="monthly-report-day"
+              value={String(report.monthlyDay)}
+              options={Array.from({ length: 28 }, (_, index) => ({ value: String(index + 1), label: `${index + 1} 日` }))}
+              disabled={!report.enabled}
+              onChange={(event) => setReport((prev) => ({ ...prev, monthlyDay: Number(event.target.value) }))}
+            />
+          </Field>
+          <Field label="月报生成时间" htmlFor="monthly-report-time">
+            <Input id="monthly-report-time" type="time" value={report.monthlyTime} disabled={!report.enabled} onChange={(event) => setReport((prev) => ({ ...prev, monthlyTime: event.target.value }))} />
+          </Field>
         </div>
       </SettingsSection>
 
