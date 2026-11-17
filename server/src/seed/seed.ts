@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { DEFAULT_PARTITION_SETTINGS } from '../../../shared/src/constants.ts';
+import { DEFAULT_PARTITION_SETTINGS, DEMO_ACCOUNTS, DEMO_PASSWORD } from '../../../shared/src/constants.ts';
 import type { MemoryCategory, MemoryService, PersonType } from '../../../shared/src/types.ts';
 import type { Env } from '../env.ts';
 import { writeAudit } from '../lib/audit.ts';
@@ -20,8 +20,6 @@ export interface SeedSummary {
   demoApiKey?: { partitionSlug: string; secret: string };
   orgKey?: { secret: string };
 }
-
-const DEMO_PASSWORD = 'Demo123456';
 
 const APP_USERS: Array<{ id: string; name: string; facts: Array<[MemoryCategory, string]> }> = [
   {
@@ -103,7 +101,6 @@ const SHARED_DEV: Array<[MemoryCategory, string]> = [
 function insertOrgAndUsers(db: DatabaseSync): { orgId: string; userId: string } {
   const at = nowIso();
   const orgId = newId('org');
-  const userId = newId('usr');
   db.prepare('INSERT INTO orgs (id, name, slug, plan, created_at) VALUES (?, ?, ?, ?, ?)').run(
     orgId,
     'Mnemos 演示组织',
@@ -111,12 +108,30 @@ function insertOrgAndUsers(db: DatabaseSync): { orgId: string; userId: string } 
     'enterprise',
     at,
   );
-  db.prepare(
-    `INSERT INTO users
-       (id, org_id, email, name, role, title, avatar_color, password_hash, status, password_changed_at, created_at)
-     VALUES (?, ?, ?, ?, 'owner', '平台管理员', 'violet', ?, 'active', ?, ?)`,
-  ).run(userId, orgId, 'admin@mnemos.dev', '演示管理员', hashPassword(DEMO_PASSWORD), at, at);
-  return { orgId, userId };
+  // 三个演示账号（owner / developer / viewer），密码统一 Demo123456，供登录页一键填充。
+  const colors = ['violet', 'cyan', 'slate'];
+  let adminUserId = '';
+  DEMO_ACCOUNTS.forEach((account, index) => {
+    const id = newId('usr');
+    if (account.role === 'owner') adminUserId = id;
+    db.prepare(
+      `INSERT INTO users
+         (id, org_id, email, name, role, title, avatar_color, password_hash, status, password_changed_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+    ).run(
+      id,
+      orgId,
+      account.email,
+      account.name,
+      account.role,
+      account.title ?? null,
+      colors[index % colors.length]!,
+      hashPassword(DEMO_PASSWORD),
+      at,
+      at,
+    );
+  });
+  return { orgId, userId: adminUserId };
 }
 
 export async function runSeed(input: {

@@ -1,11 +1,12 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { APP_NAME, APP_TAGLINE, APP_VERSION } from '@lib/constants.ts';
+import { DEMO_ACCOUNTS } from '@shared';
 import { ROLE_LABEL, toneForRole } from '@lib/tone.ts';
 import { api, ApiError } from '@lib/api.ts';
 import { useAuth } from '@lib/auth.tsx';
 import { useAsync, useDocumentTitle, useInterval } from '@lib/hooks.ts';
-import { Avatar, Badge, Button, Callout, Card, Field, Icon, IconButton, Input, useToast, type Tone } from '@ui';
+import { Avatar, Badge, Button, Callout, Card, Field, Icon, IconButton, Input, Modal, useToast, type Tone } from '@ui';
 
 const VALUE_POINTS = [
   {
@@ -53,7 +54,7 @@ function describeLoginError(error: unknown): LoginIssue {
 export function LoginPage() {
   useDocumentTitle('登录');
 
-  const { user, login } = useAuth();
+  const { user, login, loginWithToken } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
   const toast = useToast();
@@ -72,7 +73,11 @@ export function LoginPage() {
 
   // 演示账号来自 /api/auth/demo-accounts；v6 若未启用该端点则不展示（不伪造账号）。
   const demo = useAsync(() => api.auth.demoAccounts(), []);
-  const demoAccounts = demo.data ?? [];
+  const demoAccounts = demo.data && demo.data.length > 0 ? demo.data : DEMO_ACCOUNTS;
+  const wecom = useAsync(() => api.auth.wecomMock(), []);
+  const [wecomOpen, setWecomOpen] = useState(false);
+  const [wecomBusy, setWecomBusy] = useState(false);
+  const [wecomError, setWecomError] = useState<string | null>(null);
   const blocked = Boolean(issue?.blockedUntil && issue.blockedUntil > now);
 
   const locationState = location.state as { from?: unknown } | null;
@@ -98,6 +103,23 @@ export function LoginPage() {
       setIssue(describeLoginError(err));
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const loginWithWecomMock = async (): Promise<void> => {
+    if (wecomBusy) return;
+    setWecomBusy(true);
+    setWecomError(null);
+    try {
+      const result = await api.auth.wecomMockLogin();
+      await loginWithToken(result.token);
+      toast.success('企业微信 Mock 登录成功');
+      setWecomOpen(false);
+      navigate(from, { replace: true });
+    } catch (err) {
+      setWecomError(err instanceof Error ? err.message : '企业微信 Mock 登录失败');
+    } finally {
+      setWecomBusy(false);
     }
   };
 
@@ -233,6 +255,25 @@ export function LoginPage() {
               </Button>
             </form>
 
+            {wecom.data?.enabled ? (
+              <div className="mt-16">
+                <div className="auth-divider"><span>或</span></div>
+                <Button
+                  variant="outline"
+                  block
+                  icon="send"
+                  onClick={() => {
+                    setWecomError(null);
+                    setWecomOpen(true);
+                  }}
+                >
+                  企业微信 Mock 登录
+                  <Badge tone="amber" size="sm">Mock</Badge>
+                </Button>
+                <div className="tiny dim center mt-8">仅开发 / 测试环境 · 一键以演示管理员登录</div>
+              </div>
+            ) : null}
+
             {demoAccounts.length > 0 ? (
             <div className="auth-demo mt-16">
               <div className="between mb-8">
@@ -260,6 +301,7 @@ export function LoginPage() {
                   </button>
                 ))}
               </div>
+              <div className="tiny dim center mt-8">演示密码 Demo123456</div>
             </div>
             ) : null}
 
@@ -270,6 +312,47 @@ export function LoginPage() {
           </Card>
         </div>
       </section>
+
+      <Modal
+        open={wecomOpen}
+        onClose={() => {
+          if (!wecomBusy) setWecomOpen(false);
+        }}
+        title="企业微信 Mock 登录"
+        description="开发 / 测试环境：跳过真实扫码，直接以演示管理员登录。"
+        footer={
+          <>
+            <Button variant="ghost" disabled={wecomBusy} onClick={() => setWecomOpen(false)}>
+              取消
+            </Button>
+            <Button variant="primary" icon="check" loading={wecomBusy} onClick={() => void loginWithWecomMock()}>
+              Mock 扫码登录
+            </Button>
+          </>
+        }
+      >
+        <div className="wecom-mock">
+          <div className="wecom-mock-qr" aria-hidden="true">
+            <span>企业微信</span>
+          </div>
+          <div className="vstack gap-8 grow">
+            <div className="hstack gap-6">
+              <Badge tone="amber" size="sm">Mock</Badge>
+              <span className="small strong">企业微信扫码登录（模拟）</span>
+            </div>
+            <div className="tiny dim">
+              CorpID：{wecom.data?.appid ?? 'ww-mock-appid'} · AgentID：{wecom.data?.agentid ?? '1000001'}
+            </div>
+            <div className="tiny dim">登录账号：{wecom.data?.account.email ?? 'admin@mnemos.dev'}</div>
+            <div className="tiny dim">{wecom.data?.hint ?? '开发 / 测试环境专用。'}</div>
+            {wecomError ? (
+              <Callout tone="red" icon="alert">
+                {wecomError}
+              </Callout>
+            ) : null}
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

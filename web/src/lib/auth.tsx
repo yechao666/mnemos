@@ -13,6 +13,8 @@ export interface AuthState {
 
 export interface AuthApi extends AuthState {
   login: (email: string, password: string) => Promise<void>;
+  /** 用既有 token 接管会话（企业微信 Mock / SSO 回跳） */
+  loginWithToken: (token: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
 }
@@ -64,6 +66,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setState({ user: me.user, org: me.org, partitions: me.partitions, loading: false, error: null });
   }, []);
 
+  const loginWithToken = useCallback(async (token: string) => {
+    setToken(token);
+    const me = await api.auth.me();
+    setState({ user: me.user, org: me.org, partitions: me.partitions, loading: false, error: null });
+  }, []);
+
   const logout = useCallback(async () => {
     try {
       await api.auth.logout();
@@ -74,7 +82,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setState(EMPTY);
   }, []);
 
-  const value = useMemo<AuthApi>(() => ({ ...state, login, logout, refresh }), [state, login, logout, refresh]);
+  const value = useMemo<AuthApi>(
+    () => ({ ...state, login, loginWithToken, logout, refresh }),
+    [state, login, loginWithToken, logout, refresh],
+  );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

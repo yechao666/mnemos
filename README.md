@@ -211,7 +211,10 @@ pnpm seed       # 在 data-v6/ 写入演示数据（2 个分区、8 个人、26 
 pnpm dev        # 启动 http://127.0.0.1:4380（node --watch）
 ```
 
-- 控制台地址：<http://127.0.0.1:4380>；演示账号：**admin@mnemos.dev / Demo123456**。
+- 控制台地址：<http://127.0.0.1:4380>；登录页提供 **3 个演示账号一键填充**（密码统一 `Demo123456`）：
+  - `admin@mnemos.dev`（所有者）、`dev@mnemos.dev`（开发者）、`viewer@mnemos.dev`（只读）。
+- 登录页还有 **企业微信 Mock 登录**（仅开发/测试）：点击 → Mock 扫码 → 直接以演示管理员登录。
+  由 `MNEMOS_WECOM_MOCK=0/1` 控制（默认跟随 `MNEMOS_DEMO`，生产务必关闭）。
 - 演示分区：
   - `app-zhiwu`「知物感恩 App」：4 个 `human`，默认 `scope=person`（消费类 App）；
   - `mnemos-dev`「Mnemos 研发」：3 个 `agent` + 1 个 `service`，记忆 `scope=partition`（研发协作）。

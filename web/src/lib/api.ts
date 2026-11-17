@@ -15,6 +15,7 @@ import type {
   AuthResponse,
   CursorPage,
   DemoAccount,
+  WecomMockConfig,
   DreamResult,
   DreamRun,
   DreamStatus,
@@ -590,6 +591,11 @@ export const api = {
       return { user: payload.user, org: payload.org, partitions };
     },
     demoAccounts: () => request<DemoAccount[]>('/api/auth/demo-accounts'),
+    /** 企业微信 Mock 配置（仅开发/演示环境；未启用时 404） */
+    wecomMock: () => request<WecomMockConfig>('/api/auth/wecom/mock'),
+    /** 企业微信 Mock 一键登录（仅开发/演示环境） */
+    wecomMockLogin: () =>
+      request<AuthResponse>('/api/auth/wecom/mock/login', { method: 'POST' }),
   },
 
   authPassword: {

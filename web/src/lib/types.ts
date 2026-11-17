@@ -49,6 +49,15 @@ export interface OrgUser {
   lastSeenAt?: string;
 }
 
+export interface WecomMockConfig {
+  enabled: boolean;
+  provider: { slug: 'wecom'; name: string };
+  appid: string;
+  agentid: string;
+  account: { email: string; name: string };
+  hint: string;
+}
+
 export interface DemoAccount {
   email: string;
   name: string;

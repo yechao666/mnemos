@@ -1746,6 +1746,52 @@
 
 .demo-account:hover { background: var(--surface-hover); }
 
+/* 登录页：企业微信 Mock 与分隔线 */
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-dim);
+  font-size: 11px;
+  margin: 4px 0 12px;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-faint);
+}
+
+.wecom-mock {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+.wecom-mock-qr {
+  width: 116px;
+  height: 116px;
+  flex: 0 0 116px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background:
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.06) 0 6px, transparent 6px 12px),
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.06) 0 6px, transparent 6px 12px),
+    var(--surface-sunken);
+  display: grid;
+  place-items: center;
+  color: var(--text-soft);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+.wecom-mock-qr span {
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-faint);
+}
+
 /* ------------------------------ 详情 / 指标网格 ------------------------------ */
 
 .metric-grid {

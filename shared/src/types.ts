@@ -56,6 +56,26 @@ export interface Actor {
   userAgent?: string;
 }
 
+/** 开发/演示环境的快捷登录账号（仅 MNEMOS_DEMO=1 时由后端返回）。 */
+export interface DemoAccount {
+  email: string;
+  name: string;
+  role: Role;
+  password: string;
+  title?: string;
+}
+
+/** 企业微信 Mock 登录配置（仅开发/演示环境提供）。 */
+export interface WecomMockConfig {
+  enabled: boolean;
+  provider: { slug: 'wecom'; name: string };
+  appid: string;
+  agentid: string;
+  /** 登录使用的演示账号（省去扫码） */
+  account: { email: string; name: string };
+  hint: string;
+}
+
 /* ------------------------------------------------------------------ */
 /* 组织 / 控制台账号                                                   */
 /* ------------------------------------------------------------------ */

@@ -9,6 +9,7 @@ import type {
   PersonStatus,
   PersonType,
   Role,
+  DemoAccount,
 } from './types.ts';
 
 export const APP_NAME = 'Mnemos';
@@ -28,6 +29,42 @@ export const ROLES: { value: Role; label: string; desc: string }[] = [
 ];
 
 export const ROLE_RANK: Record<Role, number> = { viewer: 1, developer: 2, admin: 3, owner: 4 };
+
+/** 演示账号（仅 MNEMOS_DEMO=1；密码与 seed 保持一致，便于开发测试一键登录）。 */
+export const DEMO_PASSWORD = 'Demo123456';
+
+export const DEMO_ACCOUNTS: DemoAccount[] = [
+  {
+    email: 'admin@mnemos.dev',
+    name: '演示管理员',
+    role: 'owner',
+    password: DEMO_PASSWORD,
+    title: '平台管理员',
+  },
+  {
+    email: 'dev@mnemos.dev',
+    name: '演示开发者',
+    role: 'developer',
+    password: DEMO_PASSWORD,
+    title: '应用开发者',
+  },
+  {
+    email: 'viewer@mnemos.dev',
+    name: '演示查看者',
+    role: 'viewer',
+    password: DEMO_PASSWORD,
+    title: '数据审计',
+  },
+];
+
+/** 企业微信 Mock 登录：仅开发/演示环境启用（MNEMOS_WECOM_MOCK=1 或 DEMO）。 */
+export const WECOM_MOCK_CONFIG = {
+  provider: { slug: 'wecom' as const, name: '企业微信（Mock）' },
+  appid: 'ww-mock-appid',
+  agentid: '1000001',
+  account: { email: 'admin@mnemos.dev', name: '演示管理员' },
+  hint: '开发/测试环境专用：跳过真实扫码，直接以演示管理员登录。',
+};
 
 export const SCOPES: { value: ApiScope; label: string; desc: string }[] = [
   { value: 'memories:read', label: '记忆读取', desc: '搜索、列表、详情、简报与上下文' },

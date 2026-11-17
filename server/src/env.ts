@@ -26,6 +26,8 @@ export interface Env {
   webDist: string;
   authDisabled: boolean;
   demoMode: boolean;
+  /** 企业微信 Mock 登录：默认跟随 demoMode，可用 MNEMOS_WECOM_MOCK=0/1 覆盖 */
+  wecomMock: boolean;
   sessionTtlHours: number;
   llm: LlmConfig | null;
   /* --- 生产运行参数 --- */
@@ -103,6 +105,10 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     webDist: process.env.MNEMOS_WEB_DIST ?? join(APP_ROOT, 'web', 'dist'),
     authDisabled: process.env.MNEMOS_AUTH_DISABLED === '1',
     demoMode: process.env.MNEMOS_DEMO !== '0',
+    wecomMock:
+      process.env.MNEMOS_WECOM_MOCK === undefined
+        ? process.env.MNEMOS_DEMO !== '0'
+        : flag(process.env.MNEMOS_WECOM_MOCK, false),
     sessionTtlHours: num(process.env.MNEMOS_SESSION_TTL_HOURS, 72),
     llm:
       llmKey && llmBase

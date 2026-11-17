@@ -554,6 +554,9 @@ owner 管理组织与组织级 Key。
 | `PATCH` | `/api/auth/password` | `{currentPassword,newPassword}`；新密码 ≥10 位且含字母+数字 |
 | `POST` | `/api/auth/logout` | 删除当前会话 |
 | `GET` | `/api/auth/me` | `{user, org, partitions}` |
+| `GET` | `/api/auth/demo-accounts` | 演示账号列表（仅 `MNEMOS_DEMO=1`，否则 `[]`；含明文密码，供登录页一键填充） |
+| `GET` | `/api/auth/wecom/mock` | 企业微信 Mock 配置（仅开发/测试；未启用返回 404） |
+| `POST` | `/api/auth/wecom/mock/login` | 企业微信 Mock 一键登录 → `{token,user,org}`（以 `admin@mnemos.dev` 演示管理员身份，写审计 `auth.login.wecom_mock`） |
 
 登录失败/锁定：
 

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { AuthResponse } from '../../../../shared/src/types.ts';
+import { DEMO_ACCOUNTS, WECOM_MOCK_CONFIG } from '../../../../shared/src/constants.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { writeAudit } from '../../lib/audit.ts';
 import { nowIso, randomToken, sha256 } from '../../lib/ids.ts';
@@ -172,6 +173,30 @@ function recordAuthSuccess(rc: RequestContext): void {
   rc.app.metrics.counter('mnemos_auth_logins_total', { result: 'success' });
 }
 
+
+/** 为用户签发控制台会话（登录 / 企业微信 Mock 共用）。 */
+function issueSession(rc: RequestContext, row: UserRow, orgRow: OrgRow): AuthResponse {
+  const token = randomToken(32);
+  const createdAt = nowIso();
+  const expiresAt = new Date(Date.now() + Math.max(1, rc.app.env.sessionTtlHours) * 3_600_000).toISOString();
+  rc.app.db
+    .prepare(
+      `INSERT INTO user_sessions (token_hash, user_id, created_at, expires_at, ip, user_agent, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(sha256(token), row.id, createdAt, expiresAt, rc.ip || null, rc.userAgent || null, createdAt);
+  resetLoginState(rc.app.db, row.id, createdAt);
+  const user = toUser({
+    ...row,
+    last_seen_at: createdAt,
+    last_login_at: createdAt,
+    failed_login_attempts: 0,
+    locked_until: null,
+  });
+  recordAuthSuccess(rc);
+  return { token, user, org: toOrg(orgRow) };
+}
+
 export function registerAuthRoutes(router: Router): void {
   router.add({
     method: 'POST',
@@ -239,34 +264,66 @@ export function registerAuthRoutes(router: Router): void {
         | undefined;
       if (!orgRow) throw errors.unauthorized('账号所属组织不存在');
 
-      const token = randomToken(32);
-      const createdAt = nowIso();
-      const expiresAt = new Date(Date.now() + Math.max(1, rc.app.env.sessionTtlHours) * 3_600_000).toISOString();
-
-      rc.app.db
-        .prepare(
-          `INSERT INTO user_sessions (token_hash, user_id, created_at, expires_at, ip, user_agent, last_seen_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(sha256(token), row.id, createdAt, expiresAt, rc.ip || null, rc.userAgent || null, createdAt);
-      resetLoginState(rc.app.db, row.id, createdAt);
-
-      const user = toUser({ ...row, last_seen_at: createdAt, last_login_at: createdAt, failed_login_attempts: 0, locked_until: null });
-      recordAuthSuccess(rc);
+      const response = issueSession(rc, row, orgRow);
       writeAudit(rc.app.db, {
         orgId: orgRow.id,
-        actor: actorForUser(rc, user),
+        actor: actorForUser(rc, response.user),
         action: 'auth.login',
         resourceType: 'session',
-        resourceId: user.id,
-        detail: { email: user.email, ip: rc.ip, userAgent: rc.userAgent },
+        resourceId: response.user.id,
+        detail: { email: response.user.email, ip: rc.ip, userAgent: rc.userAgent },
       });
+      rc.json(response);
+    },
+  });
 
-      const response: AuthResponse = {
-        token,
-        user,
-        org: toOrg(orgRow),
-      };
+
+  // ------------------------------------------------------------------
+  // 开发/演示环境：快捷登录账号 + 企业微信 Mock
+  // ------------------------------------------------------------------
+  router.add({
+    method: 'GET',
+    path: '/api/auth/demo-accounts',
+    auth: 'none',
+    handler: (rc: RequestContext) => {
+      rc.json(rc.app.env.demoMode ? DEMO_ACCOUNTS : []);
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/api/auth/wecom/mock',
+    auth: 'none',
+    handler: (rc: RequestContext) => {
+      if (!rc.app.env.wecomMock) throw errors.notFound('企业微信 Mock 登录未启用');
+      rc.json({ enabled: true, ...WECOM_MOCK_CONFIG });
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/auth/wecom/mock/login',
+    auth: 'none',
+    handler: (rc: RequestContext) => {
+      if (!rc.app.env.wecomMock) throw errors.notFound('企业微信 Mock 登录未启用');
+      const email = WECOM_MOCK_CONFIG.account.email.toLowerCase();
+      const row = rc.app.db.prepare('SELECT * FROM users WHERE lower(email) = ?').get(email) as unknown as
+        | UserRow
+        | undefined;
+      if (!row) throw errors.notFound('演示账号不存在，请先运行 pnpm seed 初始化演示数据');
+      const orgRow = rc.app.db.prepare('SELECT * FROM orgs WHERE id = ?').get(row.org_id) as unknown as
+        | OrgRow
+        | undefined;
+      if (!orgRow) throw errors.unauthorized('账号所属组织不存在');
+      const response = issueSession(rc, row, orgRow);
+      writeAudit(rc.app.db, {
+        orgId: orgRow.id,
+        actor: actorForUser(rc, response.user),
+        action: 'auth.login.wecom_mock',
+        resourceType: 'session',
+        resourceId: response.user.id,
+        detail: { provider: 'wecom', mock: true, ip: rc.ip, userAgent: rc.userAgent },
+      });
       rc.json(response);
     },
   });
