@@ -241,6 +241,13 @@ async function dispatch(
       rc.auth = auth;
       rc.project = auth.project;
       tracker.setActor(`API Key · ${auth.key.name}`);
+      // org key 只能走自身声明了 allowOrgKey 的端点（/v1/partitions/*），
+      // 否则会隐式落到创建时的锚点分区，语义不清。
+      if (auth.key.kind === 'org' && meta.allowOrgKey !== true) {
+        throw errors.forbidden(
+          '组织级 API Key（kind=org）不能调用分区级旧端点，请使用 /v1/partitions/:partition/... 形式指定分区',
+        );
+      }
       if (meta.scopes && meta.scopes.length > 0) assertScopes(auth, meta.scopes);
     }
 

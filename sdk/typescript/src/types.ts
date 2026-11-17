@@ -26,9 +26,59 @@ export type MemoryCategory =
   | 'skill'
   | 'constraint'
   | 'context'
-  | 'insight';
-/** 可见性：项目共享 / 仅 Agent 私有 / 仅任务可见。 */
+  | 'insight'
+  | 'decision'
+  | 'progress'
+  | 'lesson'
+  | 'risk'
+  | 'change'
+  | 'acceptance'
+  | 'assumption'
+  | 'dependency';
+/** 可见性（旧 v4 语义）：项目共享 / 仅 Agent 私有 / 仅任务可见。 */
 export type MemoryVisibility = 'project' | 'agent' | 'task';
+/**
+ * 可见范围（v5 中立语义）：
+ * - `person`：仅该人可见（兼容旧 `visibility=agent`）；
+ * - `partition`：分区内共享（兼容旧 `visibility=project`）；
+ * - `session`：仅当前会话可见（兼容旧 `visibility=task`，必须带 `session_id`）。
+ */
+export type MemoryScope = 'person' | 'partition' | 'session';
+/** API Key 类型：`project` 只能访问所属分区；`org` 可访问/创建本组织任意分区。 */
+export type ApiKeyKind = 'project' | 'org';
+/** API Key 作用域。 */
+export type ApiKeyScope = 'memories:read' | 'memories:write' | 'graph:read' | 'admin';
+/**
+ * API Key 摘要（snake_case 视图）。
+ *
+ * SDK 不提供密钥管理方法（org key 仅组织 owner 可在控制台创建）；本类型用于读取
+ * 控制台/运维响应或自定义调用时的类型标注。`secret` 仅在创建响应中出现一次。
+ */
+export interface ApiKey {
+  id: string;
+  /** project = 绑定的分区；org = 创建时的锚点分区（仅审计/用量兜底）。 */
+  project_id: string;
+  partition_id?: string | null;
+  kind: ApiKeyKind;
+  /** org key 所属组织；project key 为 null。 */
+  org_id: string | null;
+  name: string;
+  prefix: string;
+  scopes: ApiKeyScope[];
+  created_by: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  expires_at: string | null;
+  allowed_ips: string[];
+  rate_limit_per_min: number;
+  /** 仅创建 / 轮换响应返回。 */
+  secret?: string;
+}
+/** 人的类型：真人 / 智能体 / 服务 / 其他。 */
+export type PersonType = 'human' | 'agent' | 'service' | 'other';
+/** 人的状态。 */
+export type PersonStatus = 'active' | 'archived' | 'deleted';
 /** 记忆状态。 */
 export type MemoryStatus = 'active' | 'archived' | 'deleted';
 /** 记忆来源。 */
@@ -62,6 +112,18 @@ export interface Memory {
   /** 正文别名：`/v1` 列表与检索接口的字段名是 `memory`，与 `content` 相同。 */
   memory: string;
   project_id: string | null;
+  /** 分区 ID（v5 字段，与 `project_id` 同值；分区 = 原项目/应用/租户）。 */
+  partition_id: string | null;
+  /** 记忆主体「人」的内部 ID；`null` = 分区共享知识。 */
+  person_id: string | null;
+  /** 记忆主体的外部 ID（App 的 `user_id`、Agent 的 id 等）。 */
+  person_external_id: string | null;
+  /** 写入者（可与人不同）。 */
+  actor_person_id: string | null;
+  /** v5 可见范围：`person` / `partition` / `session`。 */
+  scope: MemoryScope;
+  /** 会话 ID（旧 `task_id` / `run_id` 的泛化）。 */
+  session_id: string | null;
   user_id: string | null;
   agent_id: string | null;
   run_id: string | null;
@@ -249,11 +311,19 @@ export interface MemoryBriefItem {
   updated_at: string;
   task_id?: string;
   agent_id?: string;
+  /** v5：记忆主体（人）与可见范围。 */
+  person_id?: string;
+  person_external_id?: string;
+  scope?: MemoryScope;
 }
 
 /** 记忆简报：最近的活跃记忆/洞见压缩成有字符上限、可直接注入提示词的文本。 */
 export interface MemoryBrief {
   project_id: string;
+  /** 分区 ID（v5 字段，与 `project_id` 同值）。 */
+  partition_id?: string;
+  /** v5：人级简报的人 ID；分区级简报为 `null`/缺省。 */
+  person_id?: string | null;
   /** 简报正文；暂无可用记忆时为空串。 */
   text: string;
   max_chars: number;
@@ -291,6 +361,9 @@ export type MemoryDreamTrigger = 'schedule' | 'manual';
 export interface MemoryDreamRun {
   id: string;
   project_id: string;
+  partition_id?: string;
+  /** v5：人级做梦的人 ID；分区级为 `null`/缺省。 */
+  person_id?: string | null;
   trigger: MemoryDreamTrigger;
   status: MemoryDreamRunStatus;
   input_count: number;
@@ -311,6 +384,8 @@ export interface MemoryDreamSettings {
 
 /** 做梦状态：设置 + 待整理数 + 最近运行记录。 */
 export interface MemoryDreamStatus {
+  /** v5：人级做梦的人 ID；分区级为 `null`/缺省。 */
+  person_id?: string | null;
   settings: MemoryDreamSettings;
   /** 尚未做梦的活跃记忆数。 */
   pending_count: number;
@@ -504,6 +579,180 @@ export interface ImportResult {
 }
 
 /* ------------------------------------------------------------------ */
+/* 中立记忆服务 v5：分区（Partition）与人（Person）                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 分区（Partition）：隔离边界，可以是项目 / 应用 / 租户 / 工作区。
+ *
+ * 存储上沿用旧 `projects` 表，因此响应同时带 `partition_id` 与 `project_id`（同值）。
+ */
+export interface Partition {
+  id: string;
+  partition_id?: string;
+  project_id?: string;
+  org_id: string;
+  slug: string;
+  name: string;
+  description: string;
+  status: string;
+  region: string;
+  env: string;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+}
+
+/** 创建分区入参（按 `slug` 幂等 upsert：已存在时只补全显式提供的展示字段）。 */
+export interface PartitionCreateInput {
+  slug: string;
+  name?: string;
+  description?: string;
+  region?: string;
+  env?: string;
+}
+
+/** 创建分区的响应；`created=false` 表示命中已有分区。 */
+export interface PartitionCreateResponse {
+  partition: Partition;
+  created: boolean;
+}
+
+/** 人（Person）的记忆统计。 */
+export interface PersonStats {
+  /** 该人的记忆数（`person_id` 命中、status=active）。 */
+  memories: number;
+  /** 其中 `scope=partition` 的分区共享记忆数。 */
+  shared_memories: number;
+  /** 该人参与过的会话数（distinct `session_id`）。 */
+  sessions: number;
+  last_memory_at: string | null;
+}
+
+/**
+ * 记忆的主体「人」：真人（App 用户 / 员工）或智能体。
+ *
+ * 与登录账号无关；`external_id` 由调用方定义（App 的 `user_id`、Agent 的 id/name）。
+ */
+export interface Person {
+  id: string;
+  /** 所属分区 ID。 */
+  partition_id: string;
+  /** 分区 ID 的旧字段别名（与 `partition_id` 同值）。 */
+  project_id: string;
+  /** 调用方定义的外部 ID（App user_id / Agent id）。 */
+  external_id: string;
+  type: PersonType;
+  display_name: string;
+  attributes: Record<string, unknown>;
+  status: PersonStatus;
+  first_seen_at: string;
+  last_seen_at: string;
+  created_at: string;
+  updated_at: string;
+  stats?: PersonStats;
+}
+
+/** 建档 / 更新人（`PUT /v1/partitions/:p/persons/:externalId`）。 */
+export interface PersonUpsertInput {
+  type?: PersonType;
+  displayName?: string;
+  display_name?: string;
+  attributes?: Record<string, unknown>;
+  status?: PersonStatus;
+}
+
+/** 局部更新人（`PATCH .../persons/:person`）：只发送提供的字段。 */
+export interface PersonUpdateInput {
+  displayName?: string;
+  display_name?: string;
+  attributes?: Record<string, unknown>;
+  status?: PersonStatus;
+}
+
+/** 建档 / 更新人入参的兼容别名（等价于 {@link PersonUpsertInput}）。 */
+export type PersonInput = PersonUpsertInput;
+
+/** 人列表入参。 */
+export interface PersonListInput {
+  type?: PersonType;
+  status?: PersonStatus;
+  /** 按显示名 / external_id 模糊搜索。 */
+  q?: string;
+  page?: number;
+  pageSize?: number;
+  page_size?: number;
+  sort?: 'recent' | 'name' | 'memories';
+}
+
+/** 人列表响应（`results` 与 `items` 同内容，便于通用分页器）。 */
+export interface PersonListResponse {
+  results: Person[];
+  items: Person[];
+  count: number;
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+/** 人的简报入参。 */
+export interface PersonBriefInput {
+  /** 忽略缓存、重新生成。 */
+  force?: boolean;
+  maxChars?: number;
+  max_chars?: number;
+}
+
+/** 人的上下文入参：资料 + 简报 + 相关记忆 +（可选）分区共享知识。 */
+export interface PersonContextInput {
+  query?: string;
+  budgetTokens?: number;
+  budget_tokens?: number;
+  /** 是否带上分区共享知识（默认为服务端设置），字段名 `include_partition`。 */
+  includePartition?: boolean;
+  include_partition?: boolean;
+}
+
+/** 人的上下文：可直接注入提示词的资料 + 简报 + 记忆 + prompt。 */
+export interface PersonContext {
+  person: Person;
+  brief: MemoryBrief;
+  /** 与 query 最相关、且属于该人的记忆。 */
+  memories: Memory[];
+  /** 分区共享知识（scope=partition，person_id 可有可无）。 */
+  shared: Memory[];
+  prompt: string;
+  token_estimate: number;
+  citations: string[];
+  built_at: string;
+}
+
+/** 手动触发人级做梦的入参。 */
+export interface PersonDreamRunInput {
+  batchSize?: number;
+  batch_size?: number;
+}
+
+/**
+ * 人维度的记忆过滤范围（列表 / 检索用）。
+ *
+ * 其中 `partition` 决定是否走中立分区端点（`/v1/partitions/:p/memories`）：
+ * `person` key 可省略（沿用 key 绑定分区），`org` key 必须显式提供。
+ */
+export interface PersonScope {
+  /** 分区（id 或 slug）。 */
+  partition?: string;
+  personId?: string;
+  person_id?: string;
+  personExternalId?: string;
+  person_external_id?: string;
+  scope?: MemoryScope;
+  sessionId?: string;
+  session_id?: string;
+}
+
+/* ------------------------------------------------------------------ */
 /* 请求入参                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -511,6 +760,28 @@ export interface ImportResult {
 export interface MemoryAddInput {
   messages?: ChatMessage[];
   text?: string;
+  /**
+   * 中立分区（id 或 slug）。提供时走 `/v1/partitions/:p/memories`
+   * （支持 `person` / `scope` / `session` 语义；`org` key 必须提供）。
+   */
+  partition?: string;
+  /** 记忆主体「人」：内部 id 或 external id（中立端点）。 */
+  personId?: string;
+  person_id?: string;
+  /** 记忆主体的外部 ID（与 `personId` 二选一，中立端点）。 */
+  personExternalId?: string;
+  person_external_id?: string;
+  /** 写入者（默认为该人，中立端点）。 */
+  actorPersonId?: string;
+  actor_person_id?: string;
+  /** 可见范围：person / partition / session；缺省取分区设置 `defaultScope`（中立端点）。 */
+  scope?: MemoryScope;
+  /** 会话 ID；`scope=session` 时必填（中立端点）。 */
+  sessionId?: string;
+  session_id?: string;
+  /** 记忆分类（中立端点写入时默认原文入库）。 */
+  category?: MemoryCategory;
+  tags?: string[];
   userId?: string;
   user_id?: string;
   agentId?: string;
@@ -539,6 +810,13 @@ export interface SearchFilters {
   userId?: string;
   agentId?: string;
   runId?: string;
+  /** v5：按记忆主体（人）过滤（中立端点）。 */
+  personId?: string;
+  personExternalId?: string;
+  /** v5：按可见范围过滤（中立端点）。 */
+  scope?: MemoryScope;
+  /** v5：按会话过滤（中立端点）。 */
+  sessionId?: string;
   /** snake_case 别名。 */
   created_after?: string;
   created_before?: string;
@@ -546,11 +824,28 @@ export interface SearchFilters {
   user_id?: string;
   agent_id?: string;
   run_id?: string;
+  person_id?: string;
+  person_external_id?: string;
+  session_id?: string;
 }
 
 /** 检索入参。 */
 export interface MemorySearchInput {
   query: string;
+  /** 中立分区（id 或 slug）；提供时走 `/v1/partitions/:p/memories/search`。 */
+  partition?: string;
+  /** v5：按记忆主体（人）过滤。 */
+  personId?: string;
+  person_id?: string;
+  personExternalId?: string;
+  person_external_id?: string;
+  /** v5：按可见范围过滤。 */
+  scope?: MemoryScope;
+  /** v5：按会话过滤。 */
+  sessionId?: string;
+  session_id?: string;
+  /** v5：按分类过滤（中立端点顶层字段）。 */
+  category?: MemoryCategory;
   userId?: string;
   user_id?: string;
   agentId?: string;
@@ -575,6 +870,25 @@ export interface MemorySearchInput {
 
 /** 列表入参。 */
 export interface MemoryListInput {
+  /** 中立分区（id 或 slug）；提供时走 `/v1/partitions/:p/memories`。 */
+  partition?: string;
+  /** v5：按记忆主体（人）过滤。 */
+  personId?: string;
+  person_id?: string;
+  personExternalId?: string;
+  person_external_id?: string;
+  /** v5：按可见范围过滤。 */
+  scope?: MemoryScope;
+  /** v5：按会话过滤。 */
+  sessionId?: string;
+  session_id?: string;
+  /** v5：关键词（中立端点走服务端混合检索）。 */
+  q?: string;
+  status?: MemoryStatus;
+  sort?: 'recent' | 'importance' | 'accessed';
+  /** 默认 false（中立端点）：调用方视角只看分区共享 + 本人私有；审计可设 true。 */
+  includePrivate?: boolean;
+  include_private?: boolean;
   userId?: string;
   user_id?: string;
   agentId?: string;
@@ -598,6 +912,10 @@ export interface MemoryUpdateInput {
   content?: string;
   category?: MemoryCategory;
   importance?: number;
+  /** 中立端点支持显式状态与标签/元数据更新。 */
+  status?: MemoryStatus;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
 }
 
 /** 反馈入参。 */
@@ -724,6 +1042,9 @@ export interface MemoryListResponse {
   count: number;
   page: number;
   page_size: number;
+  /** 总数（中立分区端点提供，等于 `count`）。 */
+  total?: number;
+  total_pages?: number;
 }
 
 /** 记忆详情响应。 */
@@ -781,6 +1102,12 @@ export interface MutationResponse {
   affected?: number;
 }
 
+/** 记忆更新/删除响应；中立分区端点的更新会返回更新后的记忆本体。 */
+export interface MemoryMutationResponse extends MutationResponse {
+  /** 更新后的记忆（仅中立分区端点返回）。 */
+  memory?: Memory;
+}
+
 /** 单个请求的可选参数。 */
 export interface RequestOptions {
   /**
@@ -788,6 +1115,13 @@ export interface RequestOptions {
    * 服务端 24h 内回放首次结果。
    */
   idempotencyKey?: string;
+  /**
+   * 中立分区（id 或 slug）：按分区路径访问记忆详情 / 更新 / 删除。
+   *
+   * 提供时改走 `/v1/partitions/:partition/memories/:id`；`org` key 必须提供，
+   * `project` key 可省略（沿用 key 绑定分区）。
+   */
+  partition?: string;
   /** 外部取消信号（与超时信号自动合并）。 */
   signal?: AbortSignal;
   /** 覆盖客户端默认超时（毫秒，按单次尝试计算）。 */

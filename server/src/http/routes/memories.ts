@@ -100,6 +100,8 @@ export function registerMemoryRoutes(router: Router): void {
           rc.app.engine.search({
             projectId: project.id,
             query: keyword,
+            personId: query.personId,
+            scope: query.scope,
             userId: query.userId,
             writtenByAgentId: query.writtenByAgentId ?? query.agentId,
             runId: query.runId,
@@ -132,6 +134,8 @@ export function registerMemoryRoutes(router: Router): void {
       const result = await engineCall(rc, () =>
         rc.app.engine.list({
           projectId: project.id,
+          personId: query.personId,
+          scope: query.scope,
           userId: query.userId,
           writtenByAgentId: query.writtenByAgentId ?? query.agentId,
           runId: query.runId,

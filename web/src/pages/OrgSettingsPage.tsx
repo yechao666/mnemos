@@ -6,6 +6,7 @@ import { useAsync } from '@lib/hooks.ts';
 import { useAuth } from '@lib/auth.tsx';
 import { fmtDate } from '@lib/format.ts';
 import { ROLE_LABEL } from '@lib/tone.ts';
+import { OrgKeysSection } from '../components/project-ops/keys/OrgKeysSection.tsx';
 
 function fmtUptime(ms: number | null | undefined): string {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return '—';
@@ -28,8 +29,10 @@ function Metric({ label, value, mono }: { label: ReactNode; value: ReactNode; mo
 }
 
 export function OrgSettingsPage() {
-  const { org, user } = useAuth();
+  const { org, user, projects } = useAuth();
   const health = useAsync(() => api.health(), []);
+  // 组织密钥仅组织所有者可创建/查看/吊销。
+  const isOwner = user?.role === 'owner';
 
   const healthTone: Tone = health.error ? 'red' : health.data ? (health.data.ok ? 'green' : 'amber') : 'slate';
   const healthLabel = health.loading
@@ -47,7 +50,11 @@ export function OrgSettingsPage() {
       <PageHead
         eyebrow="组织"
         title="组织设置"
-        desc={org ? `${org.name} 的基础资料、平台诊断与安全策略（当前为只读视图）` : '组织资料、平台诊断与安全策略'}
+        desc={
+          org
+            ? `${org.name} 的基础资料、平台诊断与组织级密钥（组织密钥仅所有者可管理）`
+            : '组织资料、平台诊断与组织级密钥'
+        }
         actions={
           <Button icon="refresh" loading={health.loading} onClick={() => void health.refresh()}>
             刷新诊断
@@ -122,6 +129,8 @@ export function OrgSettingsPage() {
             </Card>
           </div>
 
+          {isOwner ? <OrgKeysSection projects={projects} /> : null}
+
           <div className="grid grid-2">
             <Card>
               <div className="card-head">
@@ -135,7 +144,7 @@ export function OrgSettingsPage() {
                 <div className="metric-grid">
                   <Metric label="多项目隔离" value="记忆、密钥与用量按项目强制隔离" />
                   <Metric label="审计日志" value="写操作全量留痕，可按项目检索与回放" />
-                  <Metric label="密钥作用域" value="读 / 写 / 图谱 / 管理四级作用域" />
+                  <Metric label="密钥作用域" value="读 / 写 / 图谱 / 管理四级作用域；组织密钥仅所有者可创建" />
                   <Metric
                     label="数据保留策略"
                     value={`默认 ${DEFAULT_PROJECT_SETTINGS.retentionDays} 天，可按项目覆写`}
@@ -143,7 +152,8 @@ export function OrgSettingsPage() {
                 </div>
                 <div className="mt-16">
                   <Callout tone="slate" icon="lock">
-                    组织级设置当前只读；进入具体项目的「设置」可调整抽取模式、检索权重、保留天数与配额。
+                    组织资料与平台诊断为只读；组织密钥仅所有者可在上方「组织密钥」区块管理。
+                    进入具体项目的「设置」可调整抽取模式、检索权重、保留天数与配额。
                   </Callout>
                 </div>
               </div>

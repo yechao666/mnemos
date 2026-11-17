@@ -15,7 +15,14 @@
 
 import type { DatabaseSync } from 'node:sqlite';
 import { DEFAULT_PROJECT_SETTINGS } from '../../../shared/src/constants.ts';
-import type { MemoryVisibility, RetrievalWeights, SearchFilters, SearchHit, SignalScores } from '../../../shared/src/types.ts';
+import type {
+  MemoryScope,
+  MemoryVisibility,
+  RetrievalWeights,
+  SearchFilters,
+  SearchHit,
+  SignalScores,
+} from '../../../shared/src/types.ts';
 import { blobToVector, cosine, embedText } from './embed.ts';
 import { extractEntities, normalizeEntityName } from './extract.ts';
 import { tokenize } from './tokenize.ts';
@@ -34,6 +41,12 @@ const DAY_MS = 86_400_000;
 export interface RetrieveInput {
   projectId: string;
   query: string;
+  /** 已解析的 person 内部 id（按人筛选） */
+  personFilterId?: string;
+  /** 调用方本人（person 内部 id） */
+  callerPersonId?: string | null;
+  /** 调用方会话（taskId 的泛化） */
+  sessionId?: string | null;
   userId?: string;
   agentId?: string;
   writtenByAgentId?: string;
@@ -41,8 +54,10 @@ export interface RetrieveInput {
   appId?: string;
   /** 仅返回该任务写入的记忆 */
   taskId?: string;
-  /** 仅返回指定可见性 */
+  /** 仅返回指定可见性（旧参数，映射为 scope） */
   visibility?: MemoryVisibility;
+  /** 仅返回指定可见范围（新参数） */
+  scope?: MemoryScope;
   /** 控制台 / 审计视角：包含所有 Agent 私有与任务记忆 */
   includePrivate?: boolean;
   filters?: SearchFilters;
@@ -130,6 +145,10 @@ export function retrieve(db: DatabaseSync, input: RetrieveInput): RetrieveResult
   // 1) SQL 预筛：scope + status + 时间/分类/重要度
   const where: string[] = ['m.project_id = ?', 'm.status = ?'];
   const params: (string | number)[] = [input.projectId, status];
+  if (input.personFilterId !== undefined) {
+    where.push('m.person_id = ?');
+    params.push(input.personFilterId);
+  }
   if (input.userId !== undefined) {
     where.push('m.user_id = ?');
     params.push(input.userId);
@@ -154,8 +173,11 @@ export function retrieve(db: DatabaseSync, input: RetrieveInput): RetrieveResult
     params.push(input.taskId);
   }
   const visible = visibilityClause({
+    callerPersonId: input.callerPersonId,
+    callerSessionId: input.sessionId,
     agentId: input.agentId,
     taskId: input.taskId,
+    scope: input.scope,
     visibility: input.visibility,
     includePrivate: input.includePrivate,
   });
@@ -181,10 +203,11 @@ export function retrieve(db: DatabaseSync, input: RetrieveInput): RetrieveResult
   }
   const rawCandidates = db
     .prepare(
-      `SELECT * FROM memories m
-       WHERE ${where.join(' AND ')}
-       ORDER BY m.created_at DESC, m.id DESC
-       LIMIT ${MAX_CANDIDATES}`,
+      `SELECT m.*, p.external_id AS person_external_id
+         FROM memories m LEFT JOIN persons p ON p.id = m.person_id
+        WHERE ${where.join(' AND ')}
+        ORDER BY m.created_at DESC, m.id DESC
+        LIMIT ${MAX_CANDIDATES}`,
     )
     .all(...params) as unknown as MemoryRow[];
 

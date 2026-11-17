@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import type { MemoryDreamStatus } from '@shared';
 import { Badge, Button, Callout, Card, Skeleton } from '@ui';
 import { fmtInt, fmtRelative } from '@lib/format.ts';
@@ -19,6 +20,10 @@ export interface DreamStatusCardProps {
   onOpenSettings: () => void;
   onOpenRuns: () => void;
   onRetry: () => void;
+  /** 是否显示「设置」入口；人级做梦复用分区级设置，人详情页可隐藏 */
+  allowSettings?: boolean;
+  /** 状态徽标旁的额外徽标（例如「人级」） */
+  extraBadges?: ReactNode;
 }
 
 /**
@@ -36,6 +41,8 @@ export function DreamStatusCard({
   onOpenSettings,
   onOpenRuns,
   onRetry,
+  allowSettings = true,
+  extraBadges,
 }: DreamStatusCardProps) {
   const settings = status?.settings;
   const enabled = settings?.enabled ?? false;
@@ -69,11 +76,12 @@ export function DreamStatusCard({
           <Badge tone={enabled ? 'green' : 'slate'} dot>
             {enabled ? '复盘总结已启用' : '复盘总结已停用'}
           </Badge>
+          {extraBadges}
           <span className="tiny dim">
             每 {enabled ? intervalLabel(settings?.intervalMinutes) : '—'} · 上次{' '}
             {lastAt ? fmtRelative(lastAt) : '尚未'}
           </span>
-          {canManage ? (
+          {canManage && allowSettings ? (
             <Button size="sm" variant="ghost" icon="settings" onClick={onOpenSettings}>
               设置
             </Button>

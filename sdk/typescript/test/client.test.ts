@@ -1050,3 +1050,413 @@ test('做梦：状态 / 设置 / 手动运行 / 409 正在做梦', async () => {
     await server.close();
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* 17. 中立记忆服务 v5：分区 / 人 / 人级简报与做梦 / 人级记忆           */
+/* ------------------------------------------------------------------ */
+
+const partitionFixture = {
+  id: 'prj_ws_demo',
+  partition_id: 'prj_ws_demo',
+  project_id: 'prj_ws_demo',
+  org_id: 'org_yunshu',
+  slug: 'ws-demo',
+  name: '演示工作区',
+  description: 'DSH 工作区',
+  status: 'active',
+  region: 'cn-shanghai',
+  env: 'production',
+  created_at: '2026-11-05T10:00:00.000Z',
+  updated_at: '2026-11-05T10:00:00.000Z',
+  archived_at: null,
+};
+
+const personFixture = {
+  id: 'prs_alice',
+  partition_id: 'prj_ws_demo',
+  project_id: 'prj_ws_demo',
+  external_id: 'alice',
+  type: 'human',
+  display_name: 'Alice',
+  attributes: { tier: 'pro' },
+  status: 'active',
+  first_seen_at: '2026-10-01T08:00:00.000Z',
+  last_seen_at: '2026-11-05T09:00:00.000Z',
+  created_at: '2026-10-01T08:00:00.000Z',
+  updated_at: '2026-11-05T09:00:00.000Z',
+  stats: {
+    memories: 3,
+    shared_memories: 1,
+    sessions: 2,
+    last_memory_at: '2026-11-04T12:00:00.000Z',
+  },
+};
+
+test('分区：create 按 slug 幂等 upsert、get 支持 id/slug（snake_case 请求与归一化）', async () => {
+  const server = await startMock((req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/partitions') {
+      sendJson(res, 201, { partition: partitionFixture, created: true });
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo') {
+      sendJson(res, 200, { partition: partitionFixture });
+      return;
+    }
+    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+  });
+  try {
+    const client = clientFor(server);
+    const created = await client.partitions.create({ slug: 'ws-demo', name: '演示工作区', env: 'production' });
+    assert.deepEqual(JSON.parse(server.requests[0]?.body ?? '{}'), {
+      slug: 'ws-demo',
+      name: '演示工作区',
+      env: 'production',
+    });
+    assert.equal(created.created, true);
+    assert.equal(created.partition.id, 'prj_ws_demo');
+    assert.equal(created.partition.partition_id, 'prj_ws_demo');
+    assert.equal(created.partition.org_id, 'org_yunshu');
+    assert.equal(created.partition.slug, 'ws-demo');
+    assert.equal(created.partition.archived_at, null);
+
+    const partition = await client.partitions.get('ws-demo');
+    assert.equal(server.requests[1]?.url, '/v1/partitions/ws-demo');
+    assert.equal(partition.name, '演示工作区');
+    assert.equal(partition.project_id, 'prj_ws_demo');
+  } finally {
+    await server.close();
+  }
+});
+
+test('人：upsert/list/get/update 走分区路径并归一化 stats', async () => {
+  const server = await startMock((req, res) => {
+    if (req.method === 'PUT' && req.url === '/v1/partitions/ws-demo/persons/alice') {
+      sendJson(res, 200, { person: personFixture });
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/persons?type=human&q=ali&page_size=10&sort=recent') {
+      sendJson(res, 200, {
+        results: [personFixture],
+        items: [personFixture],
+        count: 1,
+        total: 1,
+        page: 1,
+        page_size: 10,
+        total_pages: 1,
+      });
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/persons/alice') {
+      sendJson(res, 200, { person: personFixture });
+      return;
+    }
+    if (req.method === 'PATCH' && req.url === '/v1/partitions/ws-demo/persons/alice') {
+      sendJson(res, 200, { person: { ...personFixture, display_name: 'Alice Chen' } });
+      return;
+    }
+    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+  });
+  try {
+    const client = clientFor(server);
+
+    const upserted = await client.persons.upsert('ws-demo', 'alice', {
+      type: 'human',
+      displayName: 'Alice',
+      attributes: { tier: 'pro' },
+    });
+    assert.deepEqual(JSON.parse(server.requests[0]?.body ?? '{}'), {
+      type: 'human',
+      display_name: 'Alice',
+      attributes: { tier: 'pro' },
+    });
+    assert.equal(upserted.external_id, 'alice');
+    assert.equal(upserted.partition_id, 'prj_ws_demo');
+    assert.equal(upserted.stats?.memories, 3);
+    assert.equal(upserted.stats?.shared_memories, 1);
+    assert.equal(upserted.stats?.sessions, 2);
+    assert.equal(upserted.stats?.last_memory_at, '2026-11-04T12:00:00.000Z');
+
+    const page = await client.persons.list('ws-demo', { type: 'human', q: 'ali', pageSize: 10, sort: 'recent' });
+    assert.equal(page.count, 1);
+    assert.equal(page.items[0]?.external_id, 'alice');
+    assert.equal(page.total_pages, 1);
+
+    const person = await client.persons.get('ws-demo', 'alice');
+    assert.equal(person.display_name, 'Alice');
+
+    const updated = await client.persons.update('ws-demo', 'alice', { displayName: 'Alice Chen' });
+    assert.deepEqual(JSON.parse(server.requests[3]?.body ?? '{}'), { display_name: 'Alice Chen' });
+    assert.equal(updated.display_name, 'Alice Chen');
+  } finally {
+    await server.close();
+  }
+});
+
+test('人级简报 / 上下文 / 做梦：snake_case 字段与 409 回读', async () => {
+  const server = await startMock((req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/persons/alice/brief?force=true&max_chars=800') {
+      sendJson(res, 200, {
+        project_id: 'prj_ws_demo',
+        partition_id: 'prj_ws_demo',
+        person_id: 'prs_alice',
+        text: '# 人的简报\n- [偏好] Alice 偏好中文',
+        max_chars: 800,
+        count: 1,
+        model: 'mnemos-condense',
+        cached: false,
+        generated_at: '2026-11-05T10:00:00.000Z',
+        recent: [
+          {
+            id: 'mem_1',
+            content: 'Alice 偏好中文',
+            category: 'preference',
+            importance: 0.7,
+            updated_at: '2026-11-05T09:00:00.000Z',
+            person_id: 'prs_alice',
+            person_external_id: 'alice',
+            scope: 'person',
+          },
+        ],
+      });
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/v1/partitions/ws-demo/persons/alice/context') {
+      sendJson(res, 200, {
+        person: personFixture,
+        brief: {
+          project_id: 'prj_ws_demo',
+          person_id: 'prs_alice',
+          text: '# 人的简报',
+          max_chars: 500,
+          count: 1,
+          model: 'mnemos-condense',
+          cached: false,
+          generated_at: '2026-11-05T10:00:00.000Z',
+          recent: [],
+        },
+        memories: [memoryFixture],
+        shared: [],
+        prompt: '# 人的上下文\n- Alice',
+        token_estimate: 128,
+        citations: ['mem_1'],
+        built_at: '2026-11-05T10:00:00.000Z',
+      });
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/persons/alice/dream') {
+      sendJson(res, 200, {
+        person_id: 'prs_alice',
+        settings: { enabled: true, interval_minutes: 1440 },
+        pending_count: 2,
+        runs: [
+          {
+            id: 'dream_1',
+            project_id: 'prj_ws_demo',
+            partition_id: 'prj_ws_demo',
+            person_id: 'prs_alice',
+            trigger: 'manual',
+            status: 'completed',
+            input_count: 2,
+            insight_count: 1,
+            started_at: '2026-11-05T08:00:00.000Z',
+            finished_at: '2026-11-05T08:00:01.000Z',
+          },
+        ],
+      });
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/v1/partitions/ws-demo/persons/alice/dream/run') {
+      sendJson(res, 409, { error: { code: 'CONFLICT', message: '该人正在复盘总结，请稍后再试' } });
+      return;
+    }
+    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+  });
+  try {
+    const client = clientFor(server);
+
+    const brief = await client.personBrief('ws-demo', 'alice', { force: true, maxChars: 800 });
+    assert.equal(brief.person_id, 'prs_alice');
+    assert.equal(brief.max_chars, 800);
+    assert.equal(brief.recent[0]?.person_id, 'prs_alice');
+    assert.equal(brief.recent[0]?.person_external_id, 'alice');
+    assert.equal(brief.recent[0]?.scope, 'person');
+
+    const context = await client.personContext('ws-demo', 'alice', { query: '偏好', budgetTokens: 800 });
+    assert.equal(server.requests[1]?.url, '/v1/partitions/ws-demo/persons/alice/context');
+    assert.deepEqual(JSON.parse(server.requests[1]?.body ?? '{}'), { query: '偏好', budget_tokens: 800 });
+    assert.equal(context.person.external_id, 'alice');
+    assert.equal(context.memories[0]?.content, memoryFixture.content);
+    assert.equal(context.token_estimate, 128);
+    assert.equal(context.built_at, '2026-11-05T10:00:00.000Z');
+
+    const status = await client.personDream('ws-demo', 'alice');
+    assert.equal(status.person_id, 'prs_alice');
+    assert.equal(status.pending_count, 2);
+    assert.equal(status.runs[0]?.person_id, 'prs_alice');
+
+    // 正在做梦 → 409，SDK 回读状态并返回 { run: null, status }。
+    const busy = await client.personDreamRun('ws-demo', 'alice');
+    assert.equal(busy.run, null);
+    assert.equal(busy.status.pending_count, 2);
+    assert.equal(server.requests.at(-1)?.method, 'GET');
+    assert.equal(server.requests.at(-1)?.url, '/v1/partitions/ws-demo/persons/alice/dream');
+  } finally {
+    await server.close();
+  }
+});
+
+test('人级记忆：personId/scope/sessionId 序列化、分区路径与详情/更新/删除路由', async () => {
+  const server = await startMock((req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/partitions/ws-demo/memories') {
+      sendJson(res, 200, {
+        results: [memoryFixture],
+        events: [{ type: 'ADD', memory_id: 'mem_1', content: memoryFixture.content, at: '2026-11-05T10:00:00.000Z' }],
+        extracted: 1,
+        merged: 0,
+        skipped: 0,
+        took_ms: 4,
+      });
+      return;
+    }
+    if (
+      req.method === 'GET' &&
+      req.url ===
+        '/v1/partitions/ws-demo/memories?person_id=alice&scope=person&status=active&q=%E7%89%9B%E5%A5%B6&sort=recent&include_private=true&page=1&page_size=5'
+    ) {
+      sendJson(res, 200, {
+        results: [memoryFixture],
+        items: [memoryFixture],
+        count: 1,
+        total: 1,
+        page: 1,
+        page_size: 5,
+        total_pages: 1,
+      });
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/v1/partitions/ws-demo/memories/search') {
+      sendJson(res, 200, {
+        results: [{ ...memoryFixture, score: 0.8, signals: {}, matched_on: ['semantic'] }],
+        count: 1,
+        total: 1,
+        took_ms: 5,
+        signals: { strategy: 'hybrid' },
+      });
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/memories/mem_1') {
+      sendJson(res, 200, { ...memoryFixture, history: [], entities: [], relations: [], neighbors: [] });
+      return;
+    }
+    if (req.method === 'PATCH' && req.url === '/v1/partitions/ws-demo/memories/mem_1') {
+      sendJson(res, 200, { ...memoryFixture, content: '更新后的正文' });
+      return;
+    }
+    if (req.method === 'DELETE' && req.url === '/v1/partitions/ws-demo/memories/mem_1') {
+      sendJson(res, 200, { message: 'deleted', ok: true });
+      return;
+    }
+    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+  });
+  try {
+    const client = clientFor(server);
+
+    const added = await client.memories.add({
+      partition: 'ws-demo',
+      text: 'Alice 对牛奶过敏',
+      personId: 'alice',
+      scope: 'person',
+      sessionId: 'sess_1',
+      category: 'constraint',
+      tags: ['过敏'],
+    });
+    assert.equal(server.requests[0]?.url, '/v1/partitions/ws-demo/memories');
+    assert.deepEqual(JSON.parse(server.requests[0]?.body ?? '{}'), {
+      text: 'Alice 对牛奶过敏',
+      person_id: 'alice',
+      scope: 'person',
+      session_id: 'sess_1',
+      category: 'constraint',
+      tags: ['过敏'],
+    });
+    assert.equal(added.took_ms, 4);
+    assert.equal(added.results[0]?.id, 'mem_1');
+
+    const list = await client.memories.list({
+      partition: 'ws-demo',
+      personId: 'alice',
+      scope: 'person',
+      status: 'active',
+      q: '牛奶',
+      sort: 'recent',
+      includePrivate: true,
+      page: 1,
+      pageSize: 5,
+    });
+    assert.equal(list.count, 1);
+    assert.equal(list.total_pages, 1);
+    assert.equal(list.results[0]?.id, 'mem_1');
+
+    const search = await client.memories.search({
+      partition: 'ws-demo',
+      query: '牛奶',
+      personExternalId: 'alice',
+      scope: 'person',
+      category: 'constraint',
+      topK: 5,
+    });
+    assert.deepEqual(JSON.parse(server.requests[2]?.body ?? '{}'), {
+      query: '牛奶',
+      person_id: 'alice',
+      scope: 'person',
+      category: 'constraint',
+      top_k: 5,
+    });
+    assert.equal(search.results[0]?.score, 0.8);
+
+    const detail = await client.memories.get('mem_1', { partition: 'ws-demo' });
+    assert.equal(server.requests[3]?.url, '/v1/partitions/ws-demo/memories/mem_1');
+    assert.equal(detail.id, 'mem_1');
+
+    const updated = await client.memories.update(
+      'mem_1',
+      { text: '更新后的正文', category: 'fact', importance: 0.5 },
+      { partition: 'ws-demo' },
+    );
+    assert.equal(server.requests[4]?.method, 'PATCH');
+    assert.deepEqual(JSON.parse(server.requests[4]?.body ?? '{}'), {
+      text: '更新后的正文',
+      content: '更新后的正文',
+      category: 'fact',
+      importance: 0.5,
+    });
+    assert.equal(updated.memory?.content, '更新后的正文');
+
+    const removed = await client.memories.delete('mem_1', { partition: 'ws-demo' });
+    assert.equal(server.requests[5]?.method, 'DELETE');
+    assert.equal(removed.ok, true);
+  } finally {
+    await server.close();
+  }
+});
+
+test('人级字段缺少 partition 时抛 TypeError（避免旧端点静默忽略）', async () => {
+  const server = await startMock((req, res) => {
+    sendJson(res, 200, { results: [], count: 0, page: 1, page_size: 20 });
+  });
+  try {
+    const client = clientFor(server);
+    await assert.rejects(() => client.memories.add({ text: 'x', personId: 'alice' }), /partition/);
+    await assert.rejects(() => client.memories.add({ text: 'x', category: 'fact' }), /partition/);
+    await assert.rejects(() => client.memories.search({ query: 'x', scope: 'person' }), /partition/);
+    await assert.rejects(() => client.memories.list({ scope: 'person' }), /partition/);
+    assert.equal(server.requests.length, 0, '非中立端点参数不应发出请求');
+
+    // 旧端点仍按原路径工作。
+    const legacy = await client.memories.list({ userId: 'u-1' });
+    assert.equal(legacy.count, 0);
+    assert.equal(server.requests[0]?.url, '/v1/memories?user_id=u-1');
+  } finally {
+    await server.close();
+  }
+});

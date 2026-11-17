@@ -15,6 +15,11 @@ export interface RouteMeta {
   project?: { param?: string; minRole?: Role };
   /** apikey 路由所需 scope（全部满足） */
   scopes?: ApiScope[];
+  /**
+   * 允许组织级 API Key（kind=org）访问。默认 false：org key 只能走 `/v1/partitions/*`
+   * 这类自身带分区参数、由 handler 解析分区的端点，避免隐式落到 key 的锚点分区。
+   */
+  allowOrgKey?: boolean;
   /** 用量记录：业务操作名 */
   operation?: string;
   /** 用量记录：渠道 */

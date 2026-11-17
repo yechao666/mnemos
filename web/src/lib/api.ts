@@ -43,9 +43,17 @@ import type {
   MemoryDreamStatus,
   MemoryReport,
   MemoryHistoryEntry,
+  MemoryScope,
   MemoryStatus,
   Org,
   Paginated,
+  PartitionInput,
+  Person,
+  PersonContext,
+  PersonContextInput,
+  PersonInput,
+  PersonStatus,
+  PersonType,
   Project,
   ProjectMember,
   ProjectOverview,
@@ -146,6 +154,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export interface MemoryListParams {
   q?: string;
+  /** 按人筛选：人的内部 id 或 external id（后端 v5 支持后生效） */
+  personId?: string;
+  /** 可见范围过滤：person / partition / session */
+  scope?: MemoryScope | '';
   userId?: string;
   agentId?: string;
   runId?: string;
@@ -166,9 +178,72 @@ export interface MemoryListParams {
 
 export type MemoryListResponse = Paginated<Memory> & { hits?: SearchHit[]; tookMs?: number };
 
+/** 人列表查询参数（projectId 由调用参数提供，其余对应 shared PersonListInput）。 */
+export interface PersonListParams {
+  type?: PersonType | '';
+  status?: PersonStatus | '';
+  q?: string;
+  page?: number;
+  pageSize?: number;
+  sort?: 'recent' | 'name' | 'memories';
+}
+
+/** 人级简报查询参数。 */
+export interface PersonBriefParams {
+  /** 忽略缓存重新生成 */
+  force?: boolean;
+  /** 覆盖分区设置里的简报字数上限 */
+  maxChars?: number;
+}
+
+/** 人级上下文生成参数（projectId / personRef 由调用参数提供）。 */
+export type PersonContextParams = Omit<PersonContextInput, 'projectId' | 'personRef'>;
+
+/** 组织级 API Key 创建参数（缺省锚定组织最早的分区，仅 owner 可用）。 */
+export interface OrgKeyCreateInput {
+  name: string;
+  scopes: ApiKey['scopes'];
+  /** 锚点分区 id；缺省由后端取组织最早创建的分区 */
+  partitionId?: string;
+  rateLimitPerMin?: number;
+  expiresAt?: string;
+  allowedIps?: string[];
+}
+
+const personsPath = (projectId: string, personRef: string): string =>
+  `/api/projects/${encodeURIComponent(projectId)}/persons/${encodeURIComponent(personRef)}`;
+
+/** 人的简报（人级）：聚合该人 scope=person 记忆 + 与其相关的分区共享记忆。 */
+export function personBrief(
+  projectId: string,
+  personRef: string,
+  params: PersonBriefParams = {},
+): Promise<MemoryBrief> {
+  return request<MemoryBrief>(`${personsPath(projectId, personRef)}/brief${qs({ ...params })}`);
+}
+
+/** 人的上下文：人资料 + 人级简报 + 高相关记忆 +（可选）分区共享知识。 */
+export function personContext(
+  projectId: string,
+  personRef: string,
+  input: PersonContextParams = {},
+): Promise<PersonContext> {
+  return request<PersonContext>(`${personsPath(projectId, personRef)}/context`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
 export interface PlaygroundAddInput {
   messages?: ChatMessage[];
   text?: string;
+  /** 记忆主体（内部 id 或 external id，二选一） */
+  personId?: string;
+  personExternalId?: string;
+  /** 可见范围；缺省取分区设置 defaultScope */
+  scope?: MemoryScope;
+  /** 会话（scope=session 时必须） */
+  sessionId?: string;
   userId?: string;
   agentId?: string;
   runId?: string;
@@ -296,6 +371,50 @@ export const api = {
       body: '{}',
     }),
 
+  /**
+   * 人（Person）维度：记忆主体，与登录账号无关。
+   * ref 支持人的内部 id（prs_xxx）或 external id；后端 v5 端点上线前可能返回 404。
+   */
+  persons: {
+    list: (projectId: string, params: PersonListParams = {}) =>
+      request<Paginated<Person>>(`/api/projects/${projectId}/persons${qs({ ...params })}`),
+    get: (projectId: string, personRef: string) => request<Person>(personsPath(projectId, personRef)),
+    /** 建人 / 更新人（按 external id lazy upsert）。 */
+    upsert: (projectId: string, input: PersonInput) =>
+      request<Person>(`/api/projects/${projectId}/persons/${encodeURIComponent(input.externalId)}`, {
+        method: 'PUT',
+        body: JSON.stringify(input),
+      }),
+    /** 更新显示名 / attributes / status。 */
+    update: (projectId: string, personRef: string, input: Partial<PersonInput>) =>
+      request<Person>(personsPath(projectId, personRef), {
+        method: 'PATCH',
+        body: JSON.stringify(input),
+      }),
+    brief: personBrief,
+    context: personContext,
+    /** 该人的做梦状态（人级：只巩固该人 scope=person 的新记忆）。 */
+    dream: (projectId: string, personRef: string) =>
+      request<MemoryDreamStatus>(`${personsPath(projectId, personRef)}/dream`),
+    /** 立即为该人执行一次做梦（需 admin）。 */
+    runDream: (projectId: string, personRef: string) =>
+      request<MemoryDreamResult>(`${personsPath(projectId, personRef)}/dream/run`, {
+        method: 'POST',
+        body: '{}',
+      }),
+  },
+
+  /** 人的简报（人级）：顶层方法，便于页面无需经 api.persons 调用。 */
+  personBrief,
+  /** 人的上下文（人级）：顶层方法。 */
+  personContext,
+
+  /** 分区（对外叫分区，存储上仍是 projects）：目前仅需要控制台快捷创建。 */
+  partitions: {
+    create: (input: PartitionInput) =>
+      request<ProjectSummary>('/api/partitions', { method: 'POST', body: JSON.stringify(input) }),
+  },
+
   agents: {
     list: (projectId: string) => request<Agent[]>(`/api/projects/${projectId}/agents`),
     create: (projectId: string, input: AgentInput) =>
@@ -354,6 +473,17 @@ export const api = {
         request<OrgUser>(`/api/org/users/${userId}`, { method: 'PATCH', body: JSON.stringify(input) }),
       resetPassword: (userId: string) =>
         request<ResetPasswordResult>(`/api/org/users/${userId}/reset-password`, { method: 'POST' }),
+    },
+    /** 组织级 API Key（仅 owner）：可访问/创建本组织任意分区。 */
+    keys: {
+      list: () => request<ApiKey[]>('/api/org/keys'),
+      create: (input: OrgKeyCreateInput) =>
+        request<ApiKeyWithSecret>('/api/org/keys', {
+          method: 'POST',
+          body: JSON.stringify(input),
+        }),
+      revoke: (keyId: string) =>
+        request<{ ok: boolean }>(`/api/org/keys/${encodeURIComponent(keyId)}`, { method: 'DELETE' }),
     },
   },
 

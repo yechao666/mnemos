@@ -12,6 +12,10 @@ export const scopeSchema = z.enum(['memories:read', 'memories:write', 'graph:rea
 export const projectStatusSchema = z.enum(['active', 'paused', 'archived']);
 export const memoryStatusSchema = z.enum(['active', 'archived', 'deleted']);
 export const memoryVisibilitySchema = z.enum(['project', 'agent', 'task']);
+/** 中立服务的可见范围：person=仅该人；partition=分区共享；session=仅当前会话。 */
+export const memoryScopeSchema = z.enum(['person', 'partition', 'session']);
+export const personTypeSchema = z.enum(['human', 'agent', 'service', 'other']);
+export const personStatusSchema = z.enum(['active', 'archived', 'deleted']);
 export const taskStatusSchema = z.enum(['open', 'active', 'done', 'abandoned']);
 export const agentStatusSchema = z.enum(['active', 'idle', 'retired']);
 export const memoryCategorySchema = z.enum([
@@ -106,6 +110,10 @@ export const memoryListQuerySchema = paginationSchema.extend({
   runId: z.string().trim().max(128).optional(),
   taskId: z.string().trim().max(128).optional(),
   visibility: memoryVisibilitySchema.optional(),
+  /** 按人筛选：内部 id 或 external id（控制台人详情/记忆页用） */
+  personId: z.string().trim().max(128).optional(),
+  /** 按可见范围筛选：person / partition / session */
+  scope: memoryScopeSchema.optional(),
   includePrivate: booleanQuerySchema.optional(),
   category: memoryCategorySchema.optional(),
   status: memoryStatusSchema.optional(),
@@ -127,6 +135,13 @@ export const addMemorySchema = z
   .object({
     messages: z.array(chatMessageSchema).min(1).max(50).optional(),
     text: z.string().min(1).max(20_000).optional(),
+    /** 记忆主体：内部 id 或 external id（与 personExternalId 二选一） */
+    personId: z.string().trim().max(128).optional(),
+    personExternalId: z.string().trim().max(128).optional(),
+    /** 可见范围；缺省取分区设置 defaultScope */
+    scope: memoryScopeSchema.optional(),
+    /** 会话（scope=session 时必须） */
+    sessionId: z.string().trim().max(128).optional(),
     userId: z.string().trim().max(128).optional(),
     agentId: z.string().trim().max(128).optional(),
     runId: z.string().trim().max(128).optional(),
@@ -145,6 +160,8 @@ export const addMemorySchema = z
 
 export const searchMemorySchema = z.object({
   query: z.string().trim().min(1).max(2000),
+  personId: z.string().trim().max(128).optional(),
+  scope: memoryScopeSchema.optional(),
   userId: z.string().trim().max(128).optional(),
   agentId: z.string().trim().max(128).optional(),
   runId: z.string().trim().max(128).optional(),
@@ -244,6 +261,48 @@ export const finishTaskSchema = z.object({
 export const reportQuerySchema = z.object({
   period: z.enum(['week', 'month']).optional().default('week'),
   anchor: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+});
+
+/* ------------------------------------------------------------------ */
+/* 人（Person）：记忆主体，与登录账号无关                              */
+/* ------------------------------------------------------------------ */
+
+/** PUT /persons/:externalId 的请求体；路径上的 externalId 优先。 */
+export const personUpsertSchema = z.object({
+  externalId: z.string().trim().min(1).max(128).optional(),
+  type: personTypeSchema.optional(),
+  displayName: z.string().trim().max(120).optional(),
+  attributes: z.record(z.unknown()).optional(),
+  status: personStatusSchema.optional(),
+});
+
+/** PATCH 人：type 与 externalId 不可改，只能更新展示名 / attributes / status。 */
+export const personUpdateSchema = z
+  .object({
+    displayName: z.string().trim().max(120).optional(),
+    attributes: z.record(z.unknown()).optional(),
+    status: personStatusSchema.optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
+
+export const personListQuerySchema = paginationSchema.extend({
+  type: personTypeSchema.optional(),
+  status: personStatusSchema.optional(),
+  q: z.string().trim().max(200).optional(),
+  sort: z.enum(['recent', 'name', 'memories']).optional(),
+});
+
+/** 人级简报查询：force 强制重算，maxChars 覆盖分区设置（不落库）。 */
+export const personBriefQuerySchema = z.object({
+  force: booleanQuerySchema.optional(),
+  maxChars: z.coerce.number().int().min(100).max(5000).optional(),
+});
+
+/** 人的上下文生成入参。 */
+export const personContextSchema = z.object({
+  query: z.string().trim().max(2000).optional(),
+  budgetTokens: z.coerce.number().int().min(60).max(32_000).optional(),
+  includePartition: z.boolean().optional(),
 });
 
 export const briefingQuerySchema = z.object({

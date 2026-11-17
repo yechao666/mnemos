@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import type { AddMemoryResult, ExtractionMode, SearchResponse } from '@shared';
+import type { AddMemoryResult, ExtractionMode, MemoryScope, SearchResponse } from '@shared';
 import { CATEGORY_LABEL } from '@shared';
 import {
   Badge,
@@ -33,6 +33,7 @@ import {
   SignalBreakdown,
   toneForEvent,
 } from '../../components/project/shared.tsx';
+import { SCOPE_WRITE_OPTIONS } from '../../components/project/person/shared.tsx';
 
 type DraftRole = 'user' | 'assistant' | 'system';
 type AddMode = 'conversation' | 'text';
@@ -74,6 +75,9 @@ export function PlaygroundPage() {
   const [textValue, setTextValue] = useState('');
   const [userId, setUserId] = useState('');
   const [agentId, setAgentId] = useState('');
+  const [personExternalId, setPersonExternalId] = useState('');
+  const [scope, setScope] = useState<MemoryScope>(project?.settings.defaultScope ?? 'partition');
+  const [sessionId, setSessionId] = useState('');
   const [runId, setRunId] = useState('');
   const [infer, setInfer] = useState(true);
   const [extractionMode, setExtractionMode] = useState<ExtractionMode>(
@@ -96,6 +100,7 @@ export function PlaygroundPage() {
     setExtractionMode(project.settings.extractionMode);
     setTopK(project.settings.topK);
     setThreshold(project.settings.threshold);
+    setScope(project.settings.defaultScope);
     // 仅在切换项目时同步默认设置，避免覆盖用户正在调整的值。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.id]);
@@ -123,7 +128,15 @@ export function PlaygroundPage() {
 
   const submitAdd = async () => {
     if (!projectId || addBusy) return;
-    const payload: PlaygroundAddInput = { infer, mode: extractionMode };
+    if (scope === 'person' && !personExternalId.trim()) {
+      toast.warning('「仅本人」需要填写归属人的 external ID');
+      return;
+    }
+    if (scope === 'session' && !sessionId.trim()) {
+      toast.warning('「仅会话」需要填写会话 ID');
+      return;
+    }
+    const payload: PlaygroundAddInput = { infer, mode: extractionMode, scope };
     if (addMode === 'conversation') {
       const trimmed = messages
         .map((message) => ({ role: message.role, content: message.content.trim() }))
@@ -140,6 +153,8 @@ export function PlaygroundPage() {
       }
       payload.text = textValue.trim();
     }
+    if (personExternalId.trim()) payload.personExternalId = personExternalId.trim();
+    if (scope === 'session' && sessionId.trim()) payload.sessionId = sessionId.trim();
     if (userId.trim()) payload.userId = userId.trim();
     if (agentId.trim()) payload.agentId = agentId.trim();
     if (runId.trim()) payload.runId = runId.trim();
@@ -209,8 +224,8 @@ export function PlaygroundPage() {
           <SectionHead title="写入记忆" desc="模拟一次从消息到记忆的完整写入" />
           <div className="mt-12">
             <Callout tone="violet" icon="info">
-              写入管线：消息 → 抽取 → 去重 → 嵌入 → 入库。开启 infer 时由模型抽取独立事实；
-              consolidate 模式会合并相似记忆。
+              写入管线：消息 → 抽取 → 去重 → 嵌入 → 入库。归属人决定记忆主体，scope
+              决定谁能看到（仅本人 / 分区共享 / 仅会话）；开启 infer 时由模型抽取独立事实。
             </Callout>
           </div>
 
@@ -305,6 +320,31 @@ export function PlaygroundPage() {
                   value={runId}
                   placeholder="run_2026"
                   onChange={(event) => setRunId(event.target.value)}
+                />
+              </Field>
+            </div>
+
+            <div className="grid grid-3">
+              <Field label="归属人 external ID" hint="留空 = 分区共享知识；仅本人范围必填">
+                <Input
+                  value={personExternalId}
+                  placeholder="user-123 / agent-a"
+                  onChange={(event) => setPersonExternalId(event.target.value)}
+                />
+              </Field>
+              <Field label="可见范围">
+                <Select
+                  options={SCOPE_WRITE_OPTIONS}
+                  value={scope}
+                  aria-label="可见范围"
+                  onChange={(event) => setScope(event.target.value as MemoryScope)}
+                />
+              </Field>
+              <Field label="会话 ID" hint="scope=仅会话时必填">
+                <Input
+                  value={sessionId}
+                  placeholder="session_2026_..."
+                  onChange={(event) => setSessionId(event.target.value)}
                 />
               </Field>
             </div>

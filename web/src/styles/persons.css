@@ -1,0 +1,103 @@
+/* ==========================================================================
+   人（Person）维度 — 人列表 / 人详情资料、属性与记忆时间线
+   仅消费 tokens.css 中的变量，复用 components.css 的通用布局类。
+   ========================================================================== */
+
+/* ------------------------------ 人详情资料卡 ------------------------------ */
+
+.person-profile {
+  border-color: rgba(56, 212, 240, 0.2);
+  background:
+    radial-gradient(520px 180px at 0% 0%, rgba(56, 212, 240, 0.08), transparent 70%),
+    var(--gradient-card);
+}
+
+.person-profile-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.person-profile-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.person-profile-name {
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--text);
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+.person-attr-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.person-attr {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.person-attr-key {
+  flex: 0 0 auto;
+  max-width: 46%;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.person-attr-value {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-soft);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------ 记忆时间线 ------------------------------ */
+
+.person-tl-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.person-tl-head > :first-child {
+  min-width: 0;
+  flex: 1;
+}
+
+.person-tl-item .tl-body {
+  min-width: 0;
+}
+
+/* ------------------------------ 响应式 ------------------------------ */
+
+@media (max-width: 760px) {
+  .person-profile-head {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .person-attr-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .person-tl-head {
+    flex-direction: column;
+    gap: 6px;
+  }
+}

@@ -1,7 +1,8 @@
 import { useState, type ReactNode } from 'react';
-import { useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import type { ApiKey, ApiKeyWithSecret } from '@shared';
 import { useAsync } from '@lib/hooks.ts';
+import { useAuth } from '@lib/auth.tsx';
 import { fmtDateTime, fmtFullDateTime, fmtInt, fmtRelative, maskKey } from '@lib/format.ts';
 import { useProjectContext } from '@lib/project-context.tsx';
 import { api, ApiError } from '@lib/api.ts';
@@ -35,6 +36,9 @@ export function KeysPage() {
   const projectId = project?.id ?? routeProjectId ?? '';
 
   const toast = useToast();
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const isOwner = user?.role === 'owner';
   const [createOpen, setCreateOpen] = useState(false);
   const [created, setCreated] = useState<ApiKeyWithSecret | null>(null);
   const [secretMode, setSecretMode] = useState<'create' | 'rotate'>('create');
@@ -105,7 +109,12 @@ export function KeysPage() {
         dimmed(
           Boolean(key.revokedAt),
           <div className="vstack gap-4">
-            <span className="strong small">{key.name}</span>
+            <div className="hstack gap-6 wrap">
+              <span className="strong small">{key.name}</span>
+              <Badge tone={key.kind === 'org' ? 'amber' : 'cyan'} size="sm">
+                {key.kind === 'org' ? '组织密钥' : '分区密钥'}
+              </Badge>
+            </div>
             <span className="tiny dim">限流 {fmtInt(key.rateLimitPerMin)} 次 / 分钟</span>
           </div>,
         ),
@@ -244,7 +253,7 @@ export function KeysPage() {
       <PageHead
         eyebrow="项目 · 安全"
         title="API 密钥"
-        desc="用于服务端调用 Mnemos 公开 API。密钥按项目隔离，可设置有效期与 IP 白名单，并支持轮换。"
+        desc="管理当前分区的 API 密钥（分区密钥）。分区密钥只能访问本分区；组织级密钥请在「组织设置」管理。"
         actions={
           <Button variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>
             创建密钥
@@ -266,6 +275,23 @@ export function KeysPage() {
           </div>
         </div>
       </Callout>
+
+      {isOwner ? (
+        <Callout tone="cyan" icon="globe">
+          <div className="between gap-12 wrap">
+            <div className="vstack gap-4">
+              <span>
+                <strong>组织级密钥在「组织设置」统一管理。</strong>
+                组织密钥可访问/创建本组织任意分区，通常用于按工作区自动建分区的客户端（如 DSH
+                插件）；本页只管理当前分区的密钥。
+              </span>
+            </div>
+            <Button size="sm" variant="outline" icon="arrowRight" onClick={() => navigate('/org')}>
+              前往组织设置
+            </Button>
+          </div>
+        </Callout>
+      ) : null}
 
       {error && !data ? (
         <Card pad>

@@ -21,10 +21,13 @@ import type {
   MemoryBriefInput,
   MemoryBriefItem,
   MemoryCategory,
+  MemoryScope,
 } from '../../../shared/src/types.ts';
 import type { LlmConfig } from '../env.ts';
 import { nowIso, sha256 } from '../lib/ids.ts';
+import { notFound } from './errors.ts';
 import { llmText } from './llm.ts';
+import { resolvePerson } from './persons.ts';
 import { loadSettings } from './store.ts';
 
 /** 确定性压缩使用的模型标识（不是真实 LLM 模型名）。 */
@@ -44,6 +47,10 @@ export interface BuildBriefOptions {
   /** true=控制台/审计视角（不过滤可见性）；false=按 agentId 可见性过滤 */
   includePrivate?: boolean;
   limit?: number;
+  /** 人级简报：只取该人 scope=person 记忆 + 与其相关的 scope=partition 记忆 */
+  subjectPersonId?: string;
+  /** 调用方本人（person 内部 id），用于可见性：可见自己的 person 记忆 */
+  callerPersonId?: string | null;
 }
 
 export interface BuiltBrief {
@@ -60,11 +67,15 @@ interface BriefMemoryRow {
   updated_at: string;
   task_id: string | null;
   agent_id: string | null;
+  person_id: string | null;
+  scope: string;
+  person_external_id?: string | null;
 }
 
 interface BriefCacheRow {
   project_id: string;
   scope: string;
+  person_id: string | null;
   text: string;
   max_chars: number;
   model: string;
@@ -91,12 +102,68 @@ function clipLine(line: string, room: number): string {
 }
 
 /** 可见性过滤：控制台不过滤；Agent 视角只看项目共享 + 自己的私有记忆。 */
-function visibilitySql(options: { includePrivate: boolean; agentId?: string }): { sql: string; params: string[] } {
+function visibilitySql(options: { includePrivate: boolean; agentId?: string; callerPersonId?: string | null }): {
+  sql: string;
+  params: string[];
+} {
   if (options.includePrivate) return { sql: '', params: [] };
+  const params: string[] = [];
+  const own: string[] = [];
   if (options.agentId) {
-    return { sql: " AND (visibility = 'project' OR (visibility = 'agent' AND agent_id = ?))", params: [options.agentId] };
+    own.push('agent_id = ?');
+    params.push(options.agentId);
   }
-  return { sql: " AND visibility = 'project'", params: [] };
+  if (options.callerPersonId) {
+    own.push('person_id = ?');
+    params.push(options.callerPersonId);
+  }
+  const clauses = ["visibility = 'project'"];
+  if (own.length > 0) clauses.push(`(visibility = 'agent' AND (${own.join(' OR ')}))`);
+  return { sql: ` AND (${clauses.join(' OR ')})`, params };
+}
+
+const BRIEF_SELECT = `SELECT m.id, m.content, m.category, m.importance, m.updated_at, m.task_id, m.agent_id,
+          m.person_id, m.scope, p.external_id AS person_external_id
+     FROM memories m LEFT JOIN persons p ON p.id = m.person_id`;
+
+function toBriefItem(row: BriefMemoryRow): MemoryBriefItem {
+  const category = row.category as MemoryCategory;
+  const item: MemoryBriefItem = {
+    id: row.id,
+    content: row.content,
+    category,
+    importance: Number(row.importance),
+    updatedAt: row.updated_at,
+  };
+  if (row.task_id) item.taskId = row.task_id;
+  if (row.agent_id) item.agentId = row.agent_id;
+  if (row.person_id) item.personId = row.person_id;
+  if (row.person_external_id) item.personExternalId = row.person_external_id;
+  item.scope = (row.scope as MemoryScope | undefined) ?? 'partition';
+  return item;
+}
+
+/** 人级简报取数：该人 scope=person 记忆 + 与其相关的分区共享记忆（person_id 相同或为空）。 */
+function selectPersonBriefRows(
+  db: DatabaseSync,
+  projectId: string,
+  subjectPersonId: string,
+  limit: number,
+): BriefMemoryRow[] {
+  return db
+    .prepare(
+      `${BRIEF_SELECT}
+        WHERE m.project_id = ?
+          AND m.status = 'active'
+          AND (m.expires_at IS NULL OR m.expires_at > ?)
+          AND (
+            (m.scope = 'person' AND m.person_id = ?)
+            OR (m.scope = 'partition' AND (m.person_id IS ? OR m.person_id IS NULL))
+          )
+        ORDER BY m.updated_at DESC, m.created_at DESC
+        LIMIT ?`,
+    )
+    .all(projectId, nowIso(), subjectPersonId, subjectPersonId, limit) as unknown as BriefMemoryRow[];
 }
 
 /**
@@ -106,18 +173,26 @@ function visibilitySql(options: { includePrivate: boolean; agentId?: string }): 
 export function buildBriefText(db: DatabaseSync, projectId: string, options: BuildBriefOptions): BuiltBrief {
   const maxChars = clampBriefChars(options.maxChars);
   const limit = Math.max(1, Math.min(BRIEF_RECENT_LIMIT, Math.floor(options.limit ?? BRIEF_RECENT_LIMIT)));
-  const visibility = visibilitySql({ includePrivate: options.includePrivate === true, agentId: options.agentId });
-  const rows = db
-    .prepare(
-      `SELECT id, content, category, importance, updated_at, task_id, agent_id
-         FROM memories
-        WHERE project_id = ?
-          AND status = 'active'
-          AND (expires_at IS NULL OR expires_at > ?)${visibility.sql}
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT ?`,
-    )
-    .all(projectId, nowIso(), ...visibility.params, limit) as unknown as BriefMemoryRow[];
+  let rows: BriefMemoryRow[];
+  if (options.subjectPersonId) {
+    rows = selectPersonBriefRows(db, projectId, options.subjectPersonId, limit);
+  } else {
+    const visibility = visibilitySql({
+      includePrivate: options.includePrivate === true,
+      agentId: options.agentId,
+      callerPersonId: options.callerPersonId,
+    });
+    rows = db
+      .prepare(
+        `${BRIEF_SELECT}
+          WHERE m.project_id = ?
+            AND m.status = 'active'
+            AND (m.expires_at IS NULL OR m.expires_at > ?)${visibility.sql}
+          ORDER BY m.updated_at DESC, m.created_at DESC
+          LIMIT ?`,
+      )
+      .all(projectId, nowIso(), ...visibility.params, limit) as unknown as BriefMemoryRow[];
+  }
 
   let text = '';
   let count = 0;
@@ -149,16 +224,7 @@ export function buildBriefText(db: DatabaseSync, projectId: string, options: Bui
     if (!accepted) break;
 
     count += 1;
-    const item: MemoryBriefItem = {
-      id: row.id,
-      content: row.content,
-      category,
-      importance: Number(row.importance),
-      updatedAt: row.updated_at,
-    };
-    if (row.task_id) item.taskId = row.task_id;
-    if (row.agent_id) item.agentId = row.agent_id;
-    items.push(item);
+    items.push(toBriefItem(row));
 
     // 已截断（candidate 放不下）→ 停止，保持预算内。
     if (text.length >= maxChars || candidate.length > maxChars) break;
@@ -167,7 +233,9 @@ export function buildBriefText(db: DatabaseSync, projectId: string, options: Bui
   return { text: count > 0 ? text : '', count, items };
 }
 
-function scopeOf(input: MemoryBriefInput): string {
+/** 缓存键：人级简报用 person:<personId>，其余沿用旧分区/Agent scope。 */
+function scopeOf(input: MemoryBriefInput, subjectPersonId?: string): string {
+  if (subjectPersonId) return `person:${subjectPersonId}`;
   return input.includePrivate === true ? 'project' : `agent:${input.agentId ?? '-'}`;
 }
 
@@ -190,6 +258,7 @@ function saveCache(
   db: DatabaseSync,
   projectId: string,
   scope: string,
+  personId: string | null,
   text: string,
   maxChars: number,
   model: string,
@@ -197,15 +266,16 @@ function saveCache(
   generatedAt: string,
 ): void {
   db.prepare(
-    `INSERT INTO memory_briefs (project_id, scope, text, max_chars, model, source_hash, generated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO memory_briefs (project_id, scope, person_id, text, max_chars, model, source_hash, generated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(project_id, scope) DO UPDATE SET
+       person_id = excluded.person_id,
        text = excluded.text,
        max_chars = excluded.max_chars,
        model = excluded.model,
        source_hash = excluded.source_hash,
        generated_at = excluded.generated_at`,
-  ).run(projectId, scope, text, maxChars, model, sourceHash, generatedAt);
+  ).run(projectId, scope, personId, text, maxChars, model, sourceHash, generatedAt);
 }
 
 function clipGenerated(text: string, maxChars: number): string {
@@ -227,7 +297,24 @@ function polishPrompt(text: string, maxChars: number): string {
   ].join('\n');
 }
 
-async function generateBrief(deps: BriefDeps, input: MemoryBriefInput, scope: string): Promise<MemoryBrief> {
+interface BriefContext {
+  /** 人级简报的主体（内部 id） */
+  subjectPersonId?: string;
+  /** 调用方本人（内部 id，用于可见性） */
+  callerPersonId?: string | null;
+}
+
+function withPerson(result: MemoryBrief, personId?: string): MemoryBrief {
+  if (personId) result.personId = personId;
+  return result;
+}
+
+async function generateBrief(
+  deps: BriefDeps,
+  input: MemoryBriefInput,
+  scope: string,
+  context: BriefContext,
+): Promise<MemoryBrief> {
   const includePrivate = input.includePrivate === true;
   const settings = loadSettings(deps.db, input.projectId);
   const maxChars = clampBriefChars(input.maxChars ?? settings.briefMaxChars);
@@ -235,36 +322,44 @@ async function generateBrief(deps: BriefDeps, input: MemoryBriefInput, scope: st
     maxChars,
     agentId: input.agentId,
     includePrivate,
+    subjectPersonId: context.subjectPersonId,
+    callerPersonId: context.callerPersonId ?? null,
   });
   const sourceHash = sourceHashOf(maxChars, built.items);
   const cacheRow = readCache(deps.db, input.projectId, scope);
 
   if (!input.force && cacheRow && cacheRow.max_chars === maxChars && cacheRow.source_hash === sourceHash) {
-    return {
-      projectId: input.projectId,
-      text: cacheRow.text,
-      maxChars,
-      count: built.count,
-      model: cacheRow.model,
-      cached: true,
-      generatedAt: cacheRow.generated_at,
-      recent: built.items,
-    };
+    return withPerson(
+      {
+        projectId: input.projectId,
+        text: cacheRow.text,
+        maxChars,
+        count: built.count,
+        model: cacheRow.model,
+        cached: true,
+        generatedAt: cacheRow.generated_at,
+        recent: built.items,
+      },
+      context.subjectPersonId,
+    );
   }
 
   const generatedAt = nowIso();
   if (built.count === 0) {
-    saveCache(deps.db, input.projectId, scope, '', maxChars, CONDENSE_MODEL, sourceHash, generatedAt);
-    return {
-      projectId: input.projectId,
-      text: '',
-      maxChars,
-      count: 0,
-      model: CONDENSE_MODEL,
-      cached: false,
-      generatedAt,
-      recent: [],
-    };
+    saveCache(deps.db, input.projectId, scope, context.subjectPersonId ?? null, '', maxChars, CONDENSE_MODEL, sourceHash, generatedAt);
+    return withPerson(
+      {
+        projectId: input.projectId,
+        text: '',
+        maxChars,
+        count: 0,
+        model: CONDENSE_MODEL,
+        cached: false,
+        generatedAt,
+        recent: [],
+      },
+      context.subjectPersonId,
+    );
   }
 
   let text = built.text;
@@ -283,27 +378,49 @@ async function generateBrief(deps: BriefDeps, input: MemoryBriefInput, scope: st
     }
   }
 
-  saveCache(deps.db, input.projectId, scope, text, maxChars, model, sourceHash, generatedAt);
-  return {
-    projectId: input.projectId,
+  saveCache(
+    deps.db,
+    input.projectId,
+    scope,
+    context.subjectPersonId ?? null,
     text,
     maxChars,
-    count: built.count,
     model,
-    cached: false,
+    sourceHash,
     generatedAt,
-    recent: built.items,
-  };
+  );
+  return withPerson(
+    {
+      projectId: input.projectId,
+      text,
+      maxChars,
+      count: built.count,
+      model,
+      cached: false,
+      generatedAt,
+      recent: built.items,
+    },
+    context.subjectPersonId,
+  );
 }
 
 /** 读取（必要时重新生成）记忆简报；同 scope 并发去重。 */
 export async function ensureBrief(deps: BriefDeps, input: MemoryBriefInput): Promise<MemoryBrief> {
-  const scope = scopeOf(input);
+  const personRef = typeof input.personId === 'string' ? input.personId.trim() : '';
+  const subject = personRef ? resolvePerson(deps.db, input.projectId, personRef) : null;
+  if (personRef && !subject) throw notFound('人不存在');
+  const caller = input.agentId ? resolvePerson(deps.db, input.projectId, input.agentId, { type: 'agent' }) : null;
+
+  const context: BriefContext = {
+    subjectPersonId: subject?.id,
+    callerPersonId: caller?.id ?? null,
+  };
+  const scope = scopeOf(input, subject?.id);
   const key = `${input.projectId}:${scope}`;
   const pending = inFlight.get(key);
   if (pending) return pending;
 
-  const task = generateBrief(deps, input, scope);
+  const task = generateBrief(deps, input, scope, context);
   inFlight.set(key, task);
   try {
     return await task;

@@ -20,6 +20,7 @@ console.log('');
 console.log(`  项目        ${summary.projects}`);
 console.log(`  成员关系    ${summary.members}`);
 console.log(`  Agent       ${summary.agents}`);
+console.log(`  人          ${summary.persons}`);
 console.log(`  任务会话    ${summary.tasks}`);
 console.log(`  记忆        ${summary.memories}`);
 console.log(`  用量事件    ${summary.usageEvents}`);

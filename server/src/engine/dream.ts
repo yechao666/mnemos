@@ -38,6 +38,7 @@ import type { LlmConfig } from '../env.ts';
 import { newId, nowIso } from '../lib/ids.ts';
 import { notFound, unprocessable } from './errors.ts';
 import { llmText } from './llm.ts';
+import { ensureSystemPerson } from './persons.ts';
 import { contentHash, mergeSettings } from './store.ts';
 
 /** 做梦调度器/手动触发时写入记忆的 actor。 */
@@ -65,6 +66,7 @@ interface DreamRunRow {
   error: string | null;
   started_at: string;
   finished_at: string | null;
+  person_id: string | null;
 }
 
 interface DreamMemoryRow {
@@ -114,11 +116,28 @@ function mapRun(row: DreamRunRow): MemoryDreamRun {
   if (row.summary) run.summary = row.summary;
   if (row.error) run.error = row.error;
   if (row.finished_at) run.finishedAt = row.finished_at;
+  if (row.person_id) run.personId = row.person_id;
   return run;
 }
 
 function readRun(db: DatabaseSync, runId: string): MemoryDreamRun | undefined {
   const row = db.prepare('SELECT * FROM memory_dream_runs WHERE id = ?').get(runId) as unknown as DreamRunRow | undefined;
+  return row ? mapRun(row) : undefined;
+}
+
+/** 最近一次运行（personId 缺省 = 分区级），供服务层审计失败的运行。 */
+export function latestDreamRun(db: DatabaseSync, projectId: string, personId?: string): MemoryDreamRun | undefined {
+  const row = personId
+    ? (db
+        .prepare(
+          'SELECT * FROM memory_dream_runs WHERE project_id = ? AND person_id = ? ORDER BY started_at DESC LIMIT 1',
+        )
+        .get(projectId, personId) as unknown as DreamRunRow | undefined)
+    : (db
+        .prepare(
+          'SELECT * FROM memory_dream_runs WHERE project_id = ? AND person_id IS NULL ORDER BY started_at DESC LIMIT 1',
+        )
+        .get(projectId) as unknown as DreamRunRow | undefined);
   return row ? mapRun(row) : undefined;
 }
 
@@ -135,25 +154,38 @@ function parseSettingsJson(raw: string | null | undefined): Record<string, unkno
 /**
  * 尚未做梦、且满足做梦批次条件的活跃记忆数（洞见本身不参与）。
  * 条件必须与 runDream 的批次查询一致：
- * - 只巩固 `visibility='project'` 的项目共享记忆（私有/任务记忆不参与，避免外泄）；
+ * - 分区级（personId 缺省）：只统计 `scope='partition'` 的分区共享记忆；
+ * - 人级（personId 指定）：只统计该人 `scope='person'` 的记忆；
  * - 正文去空白后至少 10 个字符，否则 <10 字的记忆会让 pendingCount 永远 >0、
  *   调度器反复产生 skipped run。
  */
-export function pendingDreamCount(db: DatabaseSync, projectId: string): number {
-  const row = db
-    .prepare(
-      `SELECT COUNT(*) AS c FROM memories
-        WHERE project_id = ? AND status = 'active' AND dreamed_at IS NULL AND category != 'insight'
-          AND visibility = 'project' AND length(trim(content)) >= 10`,
-    )
-    .get(projectId) as unknown as { c?: number } | undefined;
+export function pendingDreamCount(db: DatabaseSync, projectId: string, personId?: string): number {
+  const row = personId
+    ? (db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM memories
+            WHERE project_id = ? AND status = 'active' AND dreamed_at IS NULL AND category != 'insight'
+              AND scope = 'person' AND person_id = ? AND length(trim(content)) >= 10`,
+        )
+        .get(projectId, personId) as unknown as { c?: number } | undefined)
+    : (db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM memories
+            WHERE project_id = ? AND status = 'active' AND dreamed_at IS NULL AND category != 'insight'
+              AND scope = 'partition' AND length(trim(content)) >= 10`,
+        )
+        .get(projectId) as unknown as { c?: number } | undefined);
   return Number(row?.c ?? 0);
 }
 
-/** 最近 10 次运行（新 → 旧）。 */
+/** 最近 10 次分区级运行（新 → 旧）；人级运行不进入分区状态面板。 */
 function recentRuns(db: DatabaseSync, projectId: string): MemoryDreamRun[] {
   const rows = db
-    .prepare('SELECT * FROM memory_dream_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT 10')
+    .prepare(
+      `SELECT * FROM memory_dream_runs
+        WHERE project_id = ? AND person_id IS NULL
+        ORDER BY started_at DESC LIMIT 10`,
+    )
     .all(projectId) as unknown as DreamRunRow[];
   return rows.map(mapRun);
 }
@@ -170,6 +202,33 @@ export function getDreamStatus(db: DatabaseSync, projectId: string): MemoryDream
   const status: MemoryDreamStatus = {
     settings: dreamSettings,
     pendingCount: pendingDreamCount(db, projectId),
+    runs,
+  };
+  if (runs[0]) status.lastRun = runs[0];
+  return status;
+}
+
+/** 人级做梦状态：只统计该人 scope=person 的待整理记忆与该人的运行记录。 */
+export function getPersonDreamStatus(db: DatabaseSync, projectId: string, personId: string): MemoryDreamStatus {
+  const settings = mergeSettings(parseSettingsJson(readProjectSettings(db, projectId)));
+  const rows = db
+    .prepare(
+      `SELECT * FROM memory_dream_runs
+        WHERE project_id = ? AND person_id = ?
+        ORDER BY started_at DESC LIMIT 10`,
+    )
+    .all(projectId, personId) as unknown as DreamRunRow[];
+  const runs = rows.map(mapRun);
+  const dreamSettings: MemoryDreamSettings = {
+    enabled: settings.dreamEnabled,
+    intervalMinutes: clampInterval(settings.dreamIntervalMinutes),
+  };
+  if (runs[0]) dreamSettings.lastAt = runs[0].startedAt;
+
+  const status: MemoryDreamStatus = {
+    settings: dreamSettings,
+    personId,
+    pendingCount: pendingDreamCount(db, projectId, personId),
     runs,
   };
   if (runs[0]) status.lastRun = runs[0];
@@ -305,12 +364,24 @@ async function synthesize(deps: DreamDeps, rows: DreamMemoryRow[]): Promise<Synt
   }
 }
 
-/** 相同内容（归一化后）的活动记忆是否已存在 → 跳过重复洞见。 */
-function duplicateInsight(db: DatabaseSync, projectId: string, content: string): boolean {
+/** 相同内容（归一化后）的活动记忆是否已存在 → 跳过重复洞见（按人隔离）。 */
+function duplicateInsight(db: DatabaseSync, projectId: string, content: string, personId?: string): boolean {
   const hash = contentHash(content);
-  const row = db
-    .prepare("SELECT 1 AS x FROM memories WHERE project_id = ? AND status = 'active' AND normalized_hash = ? LIMIT 1")
-    .get(projectId, hash) as unknown as { x?: number } | undefined;
+  const row = personId
+    ? (db
+        .prepare(
+          `SELECT 1 AS x FROM memories
+            WHERE project_id = ? AND status = 'active' AND normalized_hash = ?
+              AND scope = 'person' AND person_id = ? LIMIT 1`,
+        )
+        .get(projectId, hash, personId) as unknown as { x?: number } | undefined)
+    : (db
+        .prepare(
+          `SELECT 1 AS x FROM memories
+            WHERE project_id = ? AND status = 'active' AND normalized_hash = ?
+              AND scope = 'partition' LIMIT 1`,
+        )
+        .get(projectId, hash) as unknown as { x?: number } | undefined);
   return Boolean(row);
 }
 
@@ -325,6 +396,11 @@ function markDreamed(db: DatabaseSync, projectId: string, ids: string[], at: str
   );
 }
 
+export interface DreamRunOptions {
+  /** 人级做梦：只巩固该人 scope=person 的新记忆，洞见归属该人；缺省为分区级 */
+  personId?: string;
+}
+
 /**
  * 执行一次增量做梦。同项目并发时返回 null（路由层转 409）。
  * trigger='manual' 失败会 rethrow；'schedule' 只记录 failed run，不抛。
@@ -334,30 +410,43 @@ export async function runDream(
   projectId: string,
   trigger: MemoryDreamTrigger = 'manual',
   batchSize?: number,
+  options: DreamRunOptions = {},
 ): Promise<MemoryDreamRun | null> {
   if (runningProjects.has(projectId)) return null;
   runningProjects.add(projectId);
 
   const runId = newId('dream');
   const startedAt = nowIso();
+  const personId = options.personId;
   try {
     deps.db
       .prepare(
-        `INSERT INTO memory_dream_runs (id, project_id, trigger, status, input_count, insight_count, started_at)
-         VALUES (?, ?, ?, 'running', 0, 0, ?)`,
+        `INSERT INTO memory_dream_runs (id, project_id, trigger, status, input_count, insight_count, started_at, person_id)
+         VALUES (?, ?, ?, 'running', 0, 0, ?, ?)`,
       )
-      .run(runId, projectId, trigger, startedAt);
+      .run(runId, projectId, trigger, startedAt, personId ?? null);
 
-    // 只巩固项目共享记忆：agent/task 可见性的私有内容不得被归纳成项目共享洞见。
-    const rows = deps.db
-      .prepare(
-        `SELECT id, content, category, created_at FROM memories
-          WHERE project_id = ? AND status = 'active' AND dreamed_at IS NULL AND category != 'insight'
-            AND visibility = 'project' AND length(trim(content)) >= 10
-          ORDER BY created_at ASC
-          LIMIT ?`,
-      )
-      .all(projectId, clampBatch(batchSize)) as unknown as DreamMemoryRow[];
+    // 分区级只巩固 scope=partition 的共享记忆；人级只巩固该人 scope=person 的记忆
+    // （私有内容不会被归纳成别人可见的洞见）。
+    const rows = personId
+      ? (deps.db
+          .prepare(
+            `SELECT id, content, category, created_at FROM memories
+              WHERE project_id = ? AND status = 'active' AND dreamed_at IS NULL AND category != 'insight'
+                AND scope = 'person' AND person_id = ? AND length(trim(content)) >= 10
+              ORDER BY created_at ASC
+              LIMIT ?`,
+          )
+          .all(projectId, personId, clampBatch(batchSize)) as unknown as DreamMemoryRow[])
+      : (deps.db
+          .prepare(
+            `SELECT id, content, category, created_at FROM memories
+              WHERE project_id = ? AND status = 'active' AND dreamed_at IS NULL AND category != 'insight'
+                AND scope = 'partition' AND length(trim(content)) >= 10
+              ORDER BY created_at ASC
+              LIMIT ?`,
+          )
+          .all(projectId, clampBatch(batchSize)) as unknown as DreamMemoryRow[]);
 
     if (rows.length === 0) {
       const finishedAt = nowIso();
@@ -371,18 +460,23 @@ export async function runDream(
     const now = nowIso();
     const insightMemoryIds: string[] = [];
     let insightCount = 0;
+    // 洞见的 actor_person_id = 做梦系统 actor；懒创建，避免 skipped 运行污染人表。
+    let systemPersonId: string | null = null;
     for (const insight of synthesis.insights) {
       const content = insight.content.trim();
       if (content.length < DREAM_MIN_INSIGHT_CHARS) continue;
       if (BOILERPLATE_RE.test(content)) continue;
-      if (duplicateInsight(deps.db, projectId, content)) continue;
+      if (duplicateInsight(deps.db, projectId, content, personId)) continue;
+      systemPersonId ??= ensureSystemPerson(deps.db, projectId).id;
       const result = await deps.addMemory({
         projectId,
         actor: DREAM_ACTOR,
         text: content,
         infer: false,
         source: 'dream',
-        visibility: 'project',
+        scope: personId ? 'person' : 'partition',
+        personId: personId ?? undefined,
+        actorPersonId: systemPersonId,
         metadata: {
           category: 'insight',
           importance: 0.78,
@@ -438,11 +532,13 @@ export function dueDreamProjects(db: DatabaseSync, now: Date = new Date()): stri
   const pendingStmt = db.prepare(
     `SELECT 1 AS x FROM memories
       WHERE project_id = ? AND status = 'active' AND dreamed_at IS NULL AND category != 'insight'
-        AND visibility = 'project' AND length(trim(content)) >= 10
+        AND scope = 'partition' AND length(trim(content)) >= 10
       LIMIT 1`,
   );
   const lastStmt = db.prepare(
-    'SELECT started_at FROM memory_dream_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT 1',
+    `SELECT started_at FROM memory_dream_runs
+      WHERE project_id = ? AND person_id IS NULL
+      ORDER BY started_at DESC LIMIT 1`,
   );
 
   const due: string[] = [];

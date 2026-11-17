@@ -94,6 +94,8 @@ export interface ApiKeyRow {
   rotated_from?: string | null;
   rotated_at?: string | null;
   rate_limit_per_min: number;
+  kind?: string | null;
+  org_id?: string | null;
 }
 
 export interface MemoryRow {
@@ -105,6 +107,10 @@ export interface MemoryRow {
   app_id: string | null;
   task_id: string | null;
   visibility: string;
+  person_id?: string | null;
+  actor_person_id?: string | null;
+  scope?: string | null;
+  session_id?: string | null;
   content: string;
   category: string;
   importance: number;
@@ -262,6 +268,14 @@ export function parseSettings(raw: string | null | undefined): ProjectSettings {
       typeof parsed.monthlyReportTime === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(parsed.monthlyReportTime)
         ? parsed.monthlyReportTime
         : DEFAULT_PROJECT_SETTINGS.monthlyReportTime,
+    defaultScope:
+      parsed.defaultScope === 'person' || parsed.defaultScope === 'session'
+        ? parsed.defaultScope
+        : DEFAULT_PROJECT_SETTINGS.defaultScope,
+    personAutoCreate:
+      typeof parsed.personAutoCreate === 'boolean'
+        ? parsed.personAutoCreate
+        : DEFAULT_PROJECT_SETTINGS.personAutoCreate,
   };
 }
 
@@ -297,6 +311,8 @@ export function toApiKey(row: ApiKeyRow): ApiKey {
   return {
     id: row.id,
     projectId: row.project_id,
+    kind: row.kind === 'org' ? 'org' : 'project',
+    orgId: row.org_id ?? undefined,
     name: row.name,
     prefix: row.prefix,
     scopes: parseJsonArray<ApiScope>(row.scopes),
@@ -313,15 +329,29 @@ export function toApiKey(row: ApiKeyRow): ApiKey {
 }
 
 export function toMemory(row: MemoryRow): Memory {
+  const visibility: Memory['visibility'] =
+    row.visibility === 'agent' || row.visibility === 'task' ? row.visibility : 'project';
+  const scope: Memory['scope'] =
+    row.scope === 'person' || row.scope === 'session' || row.scope === 'partition'
+      ? row.scope
+      : visibility === 'agent'
+        ? 'person'
+        : visibility === 'task'
+          ? 'session'
+          : 'partition';
   return {
     id: row.id,
     projectId: row.project_id,
+    personId: row.person_id ?? undefined,
+    actorPersonId: row.actor_person_id ?? undefined,
+    scope,
+    sessionId: row.session_id ?? undefined,
     userId: row.user_id ?? undefined,
     agentId: row.agent_id ?? undefined,
     runId: row.run_id ?? undefined,
     appId: row.app_id ?? undefined,
     taskId: row.task_id ?? undefined,
-    visibility: row.visibility === 'agent' || row.visibility === 'task' ? row.visibility : 'project',
+    visibility,
     content: row.content,
     category: row.category as MemoryCategory,
     importance: row.importance,

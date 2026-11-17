@@ -1,8 +1,12 @@
 import type {
+  ApiKeyKind,
   ApiScope,
   MemoryCategory,
+  MemoryScope,
   MemorySource,
   MemoryStatus,
+  PersonStatus,
+  PersonType,
   ProjectStatus,
   Role,
   DemoAccount,
@@ -140,6 +144,10 @@ export const DEFAULT_PROJECT_SETTINGS = {
   weights: { semantic: 0.45, keyword: 0.3, entity: 0.15, recency: 0.1 },
   monthlyQuota: 5_000_000,
   locale: 'zh-CN',
+  /** 新记忆缺省可见范围：消费类 App 用 person，协作项目用 partition */
+  defaultScope: 'partition' as MemoryScope,
+  /** 写入不存在的 person 时自动建档 */
+  personAutoCreate: true,
   briefMaxChars: 500,
   briefEnabled: true,
   dreamEnabled: true,
@@ -150,6 +158,35 @@ export const DEFAULT_PROJECT_SETTINGS = {
   monthlyReportDay: 1,
   monthlyReportTime: '09:00',
 };
+
+/* ------------------------------------------------------------------ */
+/* 人（Person）/ 分区（Partition）/ 可见范围                            */
+/* ------------------------------------------------------------------ */
+
+export const PERSON_TYPES: { value: PersonType; label: string; desc: string }[] = [
+  { value: 'human', label: '真人', desc: 'App 用户、员工、客户等自然人' },
+  { value: 'agent', label: '智能体', desc: 'AI Agent / 数字员工' },
+  { value: 'service', label: '服务', desc: '后台服务或系统身份' },
+  { value: 'other', label: '其他', desc: '无法归类的主体' },
+];
+
+export const PERSON_STATUSES: { value: PersonStatus; label: string }[] = [
+  { value: 'active', label: '生效中' },
+  { value: 'archived', label: '已归档' },
+  { value: 'deleted', label: '已删除' },
+];
+
+export const MEMORY_SCOPES: { value: MemoryScope; label: string; desc: string }[] = [
+  { value: 'person', label: '仅本人', desc: '只有该人可见（旧 agent 私有）' },
+  { value: 'partition', label: '分区共享', desc: '分区内所有人可见（旧 project 共享）' },
+  { value: 'session', label: '仅会话', desc: '只在当前会话内可见（旧 task 私密）' },
+];
+
+export const API_KEY_KINDS: { value: ApiKeyKind; label: string; desc: string }[] = [
+  { value: 'project', label: '分区密钥', desc: '只能访问所属分区' },
+  { value: 'org', label: '组织密钥', desc: '可访问/创建本组织任意分区（插件按工作区建分区用）' },
+];
+
 
 /* ------------------------------------------------------------------ */
 /* 记忆简报 / 做梦                                                     */

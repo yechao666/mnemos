@@ -18,6 +18,7 @@ import type {
   MemoryCategory,
   MemoryEventType,
   MemoryHistoryEntry,
+  MemoryScope,
   MemorySource,
   MemoryStatus,
   MemoryVisibility,
@@ -57,6 +58,13 @@ export interface MemoryRow {
   embedding: Uint8Array | null;
   embedding_model: string | null;
   dim: number | null;
+  /* --- schema v5：中立服务（人 / 可见范围 / 会话） --- */
+  person_id: string | null;
+  actor_person_id: string | null;
+  scope: string;
+  session_id: string | null;
+  /** 查询时通过 LEFT JOIN persons 附带的外部 id（不是 memories 列） */
+  person_external_id?: string | null;
 }
 
 export interface HistoryRow {
@@ -106,6 +114,9 @@ export function mergeSettings(raw: unknown): ProjectSettings {
     weights,
     monthlyQuota: Math.max(1, Math.round(asNumber(source.monthlyQuota, defaults.monthlyQuota))),
     locale: asString(source.locale, defaults.locale),
+    defaultScope: isMemoryScope(source.defaultScope) ? source.defaultScope : defaults.defaultScope,
+    personAutoCreate:
+      typeof source.personAutoCreate === 'boolean' ? source.personAutoCreate : defaults.personAutoCreate,
     briefMaxChars: Math.max(
       BRIEF_MIN_CHARS,
       Math.min(BRIEF_MAX_CHARS, Math.round(asNumber(source.briefMaxChars, defaults.briefMaxChars))),
@@ -174,11 +185,38 @@ export function asVisibility(value: unknown): MemoryVisibility {
   return value === 'agent' || value === 'task' ? value : 'project';
 }
 
+const MEMORY_SCOPES: MemoryScope[] = ['person', 'partition', 'session'];
+
+export function isMemoryScope(value: unknown): value is MemoryScope {
+  return typeof value === 'string' && (MEMORY_SCOPES as string[]).includes(value);
+}
+
+/** v5 可见范围归一化；存量行只带 visibility 时按旧映射回退。 */
+export function asScope(value: unknown, visibility?: unknown): MemoryScope {
+  if (isMemoryScope(value)) return value;
+  const legacy = asVisibility(visibility);
+  return legacy === 'agent' ? 'person' : legacy === 'task' ? 'session' : 'partition';
+}
+
+/** 旧 visibility → v5 scope：project↔partition、agent↔person、task↔session。 */
+export function scopeFromVisibility(visibility: MemoryVisibility): MemoryScope {
+  return visibility === 'agent' ? 'person' : visibility === 'task' ? 'session' : 'partition';
+}
+
+/** v5 scope → 旧 visibility（双写兼容列）。 */
+export function visibilityFromScope(scope: MemoryScope): MemoryVisibility {
+  return scope === 'person' ? 'agent' : scope === 'session' ? 'task' : 'project';
+}
+
 /** 行 → 领域对象（schema 未定义的字段一律不出现）。 */
 export function mapMemory(row: MemoryRow): Memory {
-  return {
+  const memory: Memory = {
     id: row.id,
     projectId: row.project_id,
+    personId: row.person_id ?? undefined,
+    actorPersonId: row.actor_person_id ?? undefined,
+    sessionId: row.session_id ?? undefined,
+    scope: asScope(row.scope, row.visibility),
     userId: row.user_id ?? undefined,
     agentId: row.agent_id ?? undefined,
     runId: row.run_id ?? undefined,
@@ -199,6 +237,8 @@ export function mapMemory(row: MemoryRow): Memory {
     accessCount: Number(row.access_count),
     expiresAt: row.expires_at ?? undefined,
   };
+  if (row.person_external_id) memory.personExternalId = row.person_external_id;
+  return memory;
 }
 
 export function mapHistory(row: HistoryRow): MemoryHistoryEntry {
@@ -220,7 +260,13 @@ export function mapHistory(row: HistoryRow): MemoryHistoryEntry {
 /* ------------------------------------------------------------------ */
 
 export function getMemoryRow(db: DatabaseSync, projectId: string, id: string): MemoryRow | undefined {
-  return db.prepare('SELECT * FROM memories WHERE project_id = ? AND id = ?').get(projectId, id) as unknown as MemoryRow | undefined;
+  return db
+    .prepare(
+      `SELECT m.*, p.external_id AS person_external_id
+         FROM memories m LEFT JOIN persons p ON p.id = m.person_id
+        WHERE m.project_id = ? AND m.id = ?`,
+    )
+    .get(projectId, id) as unknown as MemoryRow | undefined;
 }
 
 export function requireMemoryRow(db: DatabaseSync, projectId: string, id: string): MemoryRow {
@@ -229,22 +275,22 @@ export function requireMemoryRow(db: DatabaseSync, projectId: string, id: string
   return row;
 }
 
-/** 作用域相等（null 安全，SQLite 的 IS 支持绑定参数）。 */
-export interface MemoryScope {
+/** 旧作用域列（user/agent/run/app）：v5 之前的去重与隔离键，保留用于兼容。 */
+export interface LegacyScopeFields {
   userId?: string | null;
   agentId?: string | null;
   runId?: string | null;
   appId?: string | null;
 }
 
-export const SCOPE_COLUMNS: { key: keyof MemoryScope; column: string }[] = [
+export const SCOPE_COLUMNS: { key: keyof LegacyScopeFields; column: string }[] = [
   { key: 'userId', column: 'user_id' },
   { key: 'agentId', column: 'agent_id' },
   { key: 'runId', column: 'run_id' },
   { key: 'appId', column: 'app_id' },
 ];
 
-export function scopeClause(scope: MemoryScope, alias = 'm'): { sql: string; params: (string | null)[] } {
+export function scopeClause(scope: LegacyScopeFields, alias = 'm'): { sql: string; params: (string | null)[] } {
   const parts: string[] = [];
   const params: (string | null)[] = [];
   for (const { key, column } of SCOPE_COLUMNS) {
@@ -259,41 +305,58 @@ export function scopeClause(scope: MemoryScope, alias = 'm'): { sql: string; par
 /* ------------------------------------------------------------------ */
 
 export interface VisibilityScope {
-  /** 调用方 Agent：可见自己的私有记忆 */
+  /** 调用方本人（person 内部 id）：可见自己的 scope=person 记忆 */
+  callerPersonId?: string | null;
+  /** 调用方会话：可见本会话的 scope=session 记忆 */
+  callerSessionId?: string | null;
+  /** 旧调用方 Agent 身份：兼容只按 agent_id 判定的存量数据 */
   agentId?: string | null;
-  /** 调用方任务：可见本任务写入的记忆 */
+  /** 旧调用方任务：兼容只按 task_id 判定的存量数据 */
   taskId?: string | null;
-  /** 显式过滤到某一种可见性 */
+  /** 显式 scope 过滤（新契约） */
+  scope?: MemoryScope;
+  /** 旧 visibility 过滤；未给 scope 时映射为 scope 过滤 */
   visibility?: MemoryVisibility;
   /** 控制台 / 审计视角：不过滤可见性 */
   includePrivate?: boolean;
 }
 
 /**
- * Agent 原生可见性规则（SQL 片段）：
+ * Agent / 调用方可见性规则（SQL 片段，v5）：
  *  - includePrivate=true：不过滤（控制台 / 审计）；
- *  - 否则只保留 `visibility='project'`，以及 `agent_id = 调用方 agentId`、
- *    `task_id = 调用方 taskId` 的记忆；
- *  - 显式 visibility 过滤叠加在最外层。
+ *  - 否则可见集合 = `scope=partition` ∪ 调用方本人的 `scope=person` ∪ 调用方本会话的 `scope=session`；
+ *    旧 `agent_id` / `task_id` 仍参与匹配，兼容迁移前的写入；
+ *  - 显式 scope / 旧 visibility 过滤叠加在最外层（visibility 映射为 scope）。
  */
 export function visibilityClause(scope: VisibilityScope, alias = 'm'): { sql: string; params: string[] } {
   const parts: string[] = [];
   const params: string[] = [];
-  if (scope.visibility) {
-    parts.push(`${alias}.visibility = ?`);
-    params.push(scope.visibility);
+  const filterScope = scope.scope ?? (scope.visibility ? scopeFromVisibility(scope.visibility) : undefined);
+  if (filterScope) {
+    parts.push(`${alias}.scope = ?`);
+    params.push(filterScope);
   }
   if (!scope.includePrivate) {
-    const visible: string[] = [`${alias}.visibility = 'project'`];
+    const visible: string[] = [`${alias}.scope = 'partition'`];
+    const visibleParams: string[] = [];
+    if (scope.callerPersonId) {
+      visible.push(`(${alias}.scope = 'person' AND ${alias}.person_id = ?)`);
+      visibleParams.push(scope.callerPersonId);
+    }
     if (scope.agentId) {
-      visible.push(`${alias}.agent_id = ?`);
-      params.push(scope.agentId);
+      visible.push(`(${alias}.scope = 'person' AND ${alias}.agent_id = ?)`);
+      visibleParams.push(scope.agentId);
+    }
+    if (scope.callerSessionId) {
+      visible.push(`(${alias}.scope = 'session' AND ${alias}.session_id = ?)`);
+      visibleParams.push(scope.callerSessionId);
     }
     if (scope.taskId) {
-      visible.push(`${alias}.task_id = ?`);
-      params.push(scope.taskId);
+      visible.push(`(${alias}.scope = 'session' AND ${alias}.task_id = ?)`);
+      visibleParams.push(scope.taskId);
     }
     parts.push(`(${visible.join(' OR ')})`);
+    params.push(...visibleParams);
   }
   return { sql: parts.join(' AND '), params };
 }
@@ -424,6 +487,14 @@ export interface PersistMemoryInput {
   source: MemorySource;
   tags?: string[];
   metadata?: Record<string, unknown>;
+  /** 记忆主体（person 内部 id）；NULL = 分区共享知识 */
+  personId?: string | null;
+  /** 写入者（person 内部 id）；缺省由 service 决定 */
+  actorPersonId?: string | null;
+  /** 可见范围；缺省按旧 visibility 映射，最终回退 partition */
+  scope?: MemoryScope;
+  /** 会话（task_id / run_id 的泛化） */
+  sessionId?: string | null;
   userId?: string;
   agentId?: string;
   runId?: string;
@@ -445,12 +516,15 @@ export function insertMemory(db: DatabaseSync, input: PersistMemoryInput): Memor
   const at = input.at ?? nowIso();
   const id = newId('mem');
   const embedding = input.embedding ?? embedText(input.content);
+  const visibility = input.visibility ?? visibilityFromScope(input.scope ?? 'partition');
+  const scope = input.scope ?? scopeFromVisibility(visibility);
   db.prepare(
     `INSERT INTO memories (
        id, project_id, user_id, agent_id, run_id, app_id, task_id, visibility, content, normalized_hash, category,
        importance, confidence, source, status, tags, metadata, created_at, updated_at,
-       last_accessed_at, access_count, expires_at, embedding, embedding_model, dim
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       last_accessed_at, access_count, expires_at, embedding, embedding_model, dim,
+       person_id, actor_person_id, scope, session_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     input.projectId,
@@ -459,7 +533,7 @@ export function insertMemory(db: DatabaseSync, input: PersistMemoryInput): Memor
     input.runId ?? null,
     input.appId ?? null,
     input.taskId ?? null,
-    input.visibility ?? 'project',
+    visibility,
     input.content,
     contentHash(input.content),
     input.category,
@@ -477,6 +551,10 @@ export function insertMemory(db: DatabaseSync, input: PersistMemoryInput): Memor
     vectorToBlob(embedding),
     input.embeddingModel ?? DEFAULT_PROJECT_SETTINGS.embeddingModel,
     DIM,
+    input.personId ?? null,
+    input.actorPersonId ?? null,
+    scope,
+    input.sessionId ?? null,
   );
   replaceTerms(db, input.projectId, id, input.content);
   const attached = attachEntities(db, input.projectId, id, input.entities ?? [], at);
@@ -517,30 +595,59 @@ export interface SimilarMemory {
   exact: boolean;
 }
 
+export interface SimilarMemoryOptions {
+  /** 新契约：按 scope 隔离；缺省沿用旧 visibility 兼容逻辑 */
+  scope?: MemoryScope;
+  /** scope=person 时必须按 person_id 隔离，避免把不同人的相同内容合并 */
+  personId?: string | null;
+  /** scope=session 时按会话隔离 */
+  sessionId?: string | null;
+  /** 旧参数：按可见性过滤（与 scope 二选一） */
+  visibility?: MemoryVisibility;
+}
+
 /**
  * 查找同作用域内的高相似记忆：
  * 1) 归一化哈希完全一致 → 直接命中；
  * 2) 共享词项取候选（最多 80 条），再按余弦相似度筛选。
+ *
+ * v5 隔离规则：
+ *  - scope=person：按 `scope='person' AND person_id = ?` 匹配（不再叠加旧 user/agent 元组，
+ *    同一人的记忆无论经由 person_id 还是旧 user_id/agent_id 写入都应去重）；
+ *  - scope=partition / session：维持旧「分区内（user/agent/run/app 元组）+ scope」去重语义；
+ *  - 未指定 scope 时退回旧 visibility 过滤。
  */
 export function findSimilarMemory(
   db: DatabaseSync,
   projectId: string,
-  scope: MemoryScope,
+  scope: LegacyScopeFields,
   content: string,
   embedding: Float32Array,
   threshold: number,
-  options: { taskId?: string | null; visibility?: MemoryVisibility } = {},
+  options: SimilarMemoryOptions = {},
 ): SimilarMemory | null {
-  const scoped = scopeClause(scope);
   const extra: string[] = [];
   const extraParams: (string | null)[] = [];
-  if (options.visibility) {
-    extra.push('m.visibility = ?');
-    extraParams.push(options.visibility);
-  }
-  if (options.taskId !== undefined) {
-    extra.push('m.task_id IS ?');
-    extraParams.push(options.taskId ?? null);
+  let scoped: { sql: string; params: (string | null)[] } = { sql: '1 = 1', params: [] };
+  if (options.scope === 'person') {
+    // 人级记忆只看 person_id；不同人即使内容相同也各自成条。
+    extra.push("m.scope = 'person'");
+    extra.push('m.person_id IS ?');
+    extraParams.push(options.personId ?? null);
+  } else {
+    scoped = scopeClause(scope);
+    if (options.scope) {
+      extra.push('m.scope = ?');
+      extraParams.push(options.scope);
+    }
+    if (options.scope === 'session') {
+      extra.push('m.session_id IS ?');
+      extraParams.push(options.sessionId ?? null);
+    }
+    if (!options.scope && options.visibility) {
+      extra.push('m.visibility = ?');
+      extraParams.push(options.visibility);
+    }
   }
   const extraSql = extra.length > 0 ? ` AND ${extra.join(' AND ')}` : '';
 

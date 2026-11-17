@@ -10,6 +10,7 @@ import {
   DEMO_KEYS,
   DEMO_PASSWORD,
   DEMO_WEBHOOKS,
+  NEUTRAL_DEMO,
   ORG,
   PROJECTS,
   USERS,
@@ -34,6 +35,7 @@ export interface SeedSummary {
   projects: number;
   members: number;
   agents: number;
+  persons: number;
   tasks: number;
   memories: number;
   usageEvents: number;
@@ -100,6 +102,7 @@ function wipe(db: DatabaseSync): void {
     'api_keys',
     'tasks',
     'agents',
+    'persons',
     'project_members',
     'projects',
     'users',
@@ -577,6 +580,155 @@ export async function runSeed(options: SeedOptions): Promise<SeedSummary> {
     }
   }
 
+  /* ------------------------------------------------------------------ */
+  /* 中立记忆服务 v5 演示：人（Person）+ 人级 / 分区共享记忆             */
+  /* ------------------------------------------------------------------ */
+  log?.('写入人维度演示数据（分区 + 人）…');
+  let persons = 0;
+  const personIdByExternal = new Map<string, string>();
+  const personDreamMark = db.prepare('UPDATE memories SET dreamed_at = ? WHERE id = ?');
+
+  for (const [slug, demo] of Object.entries(NEUTRAL_DEMO)) {
+    const project = projectMeta.find((entry) => entry.slug === slug);
+    if (!project) continue;
+    const projectId = project.id;
+
+    // 1) 建档：显式 upsertPerson（human / agent），幂等键为 (partition, type, external_id)
+    for (const spec of demo.persons) {
+      const person = await engine.upsertPerson(
+        projectId,
+        {
+          externalId: spec.externalId,
+          type: spec.type,
+          displayName: spec.displayName,
+          attributes: spec.attributes,
+          status: spec.status,
+        },
+        { type: 'system', id: 'seed', label: '演示数据导入' },
+      );
+      personIdByExternal.set(`${projectId}:${spec.externalId}`, person.id);
+      persons += 1;
+    }
+
+    // 2) 人级私有记忆（scope=person）——走 engine.add，索引/词项/实体/历史完整
+    for (const spec of demo.persons) {
+      for (const memory of spec.memories) {
+        const result = await engine.add({
+          projectId,
+          text: memory.text,
+          infer: false,
+          personExternalId: spec.externalId,
+          scope: 'person',
+          sessionId: memory.sessionId,
+          tags: memory.tags ?? [],
+          metadata: {
+            category: memory.category,
+            importance: memory.importance ?? 0.7,
+            confidence: 0.88,
+            channel: 'seed',
+            agentScope: 'person',
+          },
+          source: 'conversation',
+          actor: { type: 'system', id: 'seed', label: '演示数据导入' },
+        });
+        for (const row of result.results) {
+          const createdAt = isoDaysAgo(memory.daysAgo, -randInt(1, 6));
+          const updatedAt = addDays(createdAt, rng() > 0.8 ? Math.min(randInt(1, 3), memory.daysAgo) : 0);
+          memoryPatch.run(createdAt, updatedAt, isoDaysAgo(Math.max(0, memory.daysAgo - randInt(0, 4))), randInt(0, 12), row.id);
+          historyPatch.run(createdAt, row.id);
+          project.memoryIds.push(row.id);
+          memories += 1;
+        }
+      }
+    }
+
+    // 3) 分区共享记忆（scope=partition），可带归属人或写入者（actor ≠ person）
+    for (const memory of demo.shared) {
+      const result = await engine.add({
+        projectId,
+        text: memory.text,
+        infer: false,
+        personExternalId: memory.personExternalId,
+        actorPersonId: memory.actorExternalId,
+        scope: 'partition',
+        sessionId: memory.sessionId,
+        tags: memory.tags ?? [],
+        metadata: {
+          category: memory.category,
+          importance: memory.importance ?? 0.75,
+          confidence: 0.9,
+          channel: 'seed',
+          agentScope: 'partition',
+        },
+        source: 'conversation',
+        actor: { type: 'system', id: 'seed', label: '演示数据导入' },
+      });
+      for (const row of result.results) {
+        const createdAt = isoDaysAgo(memory.daysAgo, -randInt(0, 8));
+        memoryPatch.run(createdAt, createdAt, isoDaysAgo(Math.max(0, memory.daysAgo - randInt(0, 5))), randInt(1, 24), row.id);
+        historyPatch.run(createdAt, row.id);
+        project.memoryIds.push(row.id);
+        memories += 1;
+      }
+    }
+
+    // 4) 人级做梦演示：一次已完成运行 + 一条 scope=person 的洞见（人级 brief 会带上）
+    const personDream = demo.personDream;
+    if (personDream) {
+      const personId = personIdByExternal.get(`${projectId}:${personDream.personExternalId}`);
+      if (personId) {
+        const startedAt = isoDaysAgo(personDream.daysAgo, 3);
+        const finishedAt = addDays(startedAt, 2 / 1_440);
+        db.prepare(
+          `INSERT INTO memory_dream_runs
+             (id, project_id, person_id, trigger, status, input_count, insight_count, summary, error, started_at, finished_at)
+           VALUES (?, ?, ?, 'schedule', 'running', 0, 0, NULL, NULL, ?, NULL)`,
+        ).run(personDream.id, projectId, personId, startedAt);
+
+        // 把参与本次人级做梦的源记忆标记为已整理
+        for (const sourceText of personDream.insight.sourceTexts) {
+          const rows = db
+            .prepare('SELECT id FROM memories WHERE project_id = ? AND content = ?')
+            .all(projectId, sourceText) as unknown as Array<{ id: string }>;
+          for (const row of rows) personDreamMark.run(finishedAt, row.id);
+        }
+
+        const result = await engine.add({
+          projectId,
+          text: personDream.insight.text,
+          infer: false,
+          personExternalId: personDream.personExternalId,
+          scope: 'person',
+          source: 'dream',
+          tags: ['洞见', '复盘总结'],
+          metadata: {
+            category: 'insight',
+            importance: 0.78,
+            confidence: 0.8,
+            channel: 'seed',
+            dreamRunId: personDream.id,
+            dreamTitle: personDream.insight.title,
+          },
+          actor: { type: 'system', id: 'mnemos-dream', label: '做梦系统' },
+        });
+        let insightCount = 0;
+        for (const row of result.results) {
+          memoryPatch.run(finishedAt, finishedAt, null, 0, row.id);
+          historyPatch.run(finishedAt, row.id);
+          personDreamMark.run(finishedAt, row.id);
+          project.memoryIds.push(row.id);
+          memories += 1;
+          insightCount += 1;
+        }
+        db.prepare(
+          `UPDATE memory_dream_runs
+              SET status = 'completed', input_count = ?, insight_count = ?, summary = ?, finished_at = ?
+            WHERE id = ?`,
+        ).run(personDream.inputCount, insightCount, personDream.summary, finishedAt, personDream.id);
+      }
+    }
+  }
+
   log?.('生成用量事件（近 30 天）…');
   const usageStmt = db.prepare(
     `INSERT INTO usage_events
@@ -736,6 +888,9 @@ export async function runSeed(options: SeedOptions): Promise<SeedSummary> {
     }
   }
 
+  // 人建档（engine.upsertPerson）也会写审计，以表内实际条数为准。
+  auditEvents = Number((db.prepare('SELECT COUNT(*) AS c FROM audit_logs').get() as { c: number }).c);
+
   // 让控制台「实时事件」在首屏就有内容
   const liveEvents: LiveEvent[] = projectMeta
     .filter((p) => p.memoryIds.length > 0)
@@ -755,12 +910,13 @@ export async function runSeed(options: SeedOptions): Promise<SeedSummary> {
     }));
   for (const event of liveEvents) bus.publish(event);
 
-  log?.(`完成：${memories} 条记忆 / ${usageEvents} 条用量 / ${auditEvents} 条审计`);
+  log?.(`完成：${persons} 个人 / ${memories} 条记忆 / ${usageEvents} 条用量 / ${auditEvents} 条审计`);
 
   return {
     projects: PROJECTS.length,
     members,
     agents: agentCount,
+    persons,
     tasks: taskCount,
     memories,
     usageEvents,

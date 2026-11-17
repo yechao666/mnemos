@@ -149,9 +149,33 @@ CREATE TABLE IF NOT EXISTS api_keys (
   expires_at          TEXT,
   allowed_ips         TEXT NOT NULL DEFAULT '[]',
   rotated_from        TEXT,
-  rotated_at          TEXT
+  rotated_at          TEXT,
+  kind                TEXT NOT NULL DEFAULT 'project',
+  org_id              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_keys_project ON api_keys(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_keys_org ON api_keys(org_id, created_at DESC);
+
+/* ------------------------------------------------------------------ */
+/* 人（Person）：记忆的主体，分区内一等实体                            */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS persons (
+  id            TEXT PRIMARY KEY,
+  project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  external_id   TEXT NOT NULL,
+  type          TEXT NOT NULL DEFAULT 'human',
+  display_name  TEXT NOT NULL DEFAULT '',
+  attributes    TEXT NOT NULL DEFAULT '{}',
+  status        TEXT NOT NULL DEFAULT 'active',
+  first_seen_at TEXT NOT NULL,
+  last_seen_at  TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  UNIQUE (project_id, type, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_persons_partition ON persons(project_id, status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_persons_external ON persons(project_id, external_id);
 
 CREATE TABLE IF NOT EXISTS memories (
   id              TEXT PRIMARY KEY,
@@ -179,7 +203,11 @@ CREATE TABLE IF NOT EXISTS memories (
   embedding       BLOB,
   embedding_model TEXT,
   dim             INTEGER,
-  dreamed_at      TEXT
+  dreamed_at      TEXT,
+  person_id       TEXT,
+  actor_person_id TEXT,
+  scope           TEXT NOT NULL DEFAULT 'partition',
+  session_id      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(project_id, user_id, agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_memories_recent ON memories(project_id, created_at DESC);
@@ -187,6 +215,8 @@ CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(project_id, normalized_
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(project_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_task ON memories(project_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_memories_visibility ON memories(project_id, visibility, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_person ON memories(project_id, person_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_scope2 ON memories(project_id, scope, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS memory_history (
   id          TEXT PRIMARY KEY,
@@ -324,6 +354,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_org ON usage_events(org_id, created_at DESC
 CREATE TABLE IF NOT EXISTS memory_briefs (
   project_id   TEXT NOT NULL,
   scope        TEXT NOT NULL,
+  person_id    TEXT,
   text         TEXT NOT NULL DEFAULT '',
   max_chars    INTEGER NOT NULL,
   model        TEXT NOT NULL,
@@ -342,8 +373,10 @@ CREATE TABLE IF NOT EXISTS memory_dream_runs (
   summary       TEXT,
   error         TEXT,
   started_at    TEXT NOT NULL,
-  finished_at   TEXT
+  finished_at   TEXT,
+  person_id     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dream_runs_project ON memory_dream_runs(project_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dream_runs_person ON memory_dream_runs(project_id, person_id, started_at DESC);
 
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '4');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '5');

@@ -1,14 +1,6 @@
 import { z } from 'zod';
 import { APP_VERSION } from '../../../../shared/src/constants.ts';
-import type {
-  Agent,
-  Briefing,
-  Memory,
-  MemoryHistoryEntry,
-  SearchFilters,
-  SearchHit,
-  Task,
-} from '../../../../shared/src/types.ts';
+import type { Agent, Briefing, SearchFilters, Task } from '../../../../shared/src/types.ts';
 import { writeAudit } from '../../lib/audit.ts';
 import { estimateTokens } from '../../lib/usage.ts';
 import { actorForApiKey, type RequestContext } from '../context.ts';
@@ -18,6 +10,7 @@ import { requireKeyAuth } from '../middleware/auth.ts';
 import { computeProjectStats } from '../queries/stats.ts';
 import { errors } from '../respond.ts';
 import type { Router } from '../router.ts';
+import { v1Hit, v1History, v1Memory } from '../v1-mappers.ts';
 
 /**
  * 公开 v1 API：mem0 风格 snake_case。
@@ -206,54 +199,6 @@ const v1ContextSchema = z.object({
 });
 
 const DELETE_CHUNK_SIZE = 200;
-
-function v1Memory(memory: Memory): Record<string, unknown> {
-  return {
-    id: memory.id,
-    memory: memory.content,
-    user_id: memory.userId ?? null,
-    agent_id: memory.agentId ?? null,
-    run_id: memory.runId ?? null,
-    app_id: memory.appId ?? null,
-    task_id: memory.taskId ?? null,
-    visibility: memory.visibility,
-    category: memory.category,
-    importance: memory.importance,
-    confidence: memory.confidence,
-    source: memory.source,
-    status: memory.status,
-    tags: memory.tags,
-    metadata: memory.metadata,
-    created_at: memory.createdAt,
-    updated_at: memory.updatedAt,
-    last_accessed_at: memory.lastAccessedAt ?? null,
-    access_count: memory.accessCount,
-    expires_at: memory.expiresAt ?? null,
-  };
-}
-
-function v1Hit(hit: SearchHit): Record<string, unknown> {
-  return {
-    ...v1Memory(hit),
-    score: hit.score,
-    signals: hit.signals,
-    matched_on: hit.matchedOn,
-  };
-}
-
-function v1History(entry: MemoryHistoryEntry): Record<string, unknown> {
-  return {
-    id: entry.id,
-    memory_id: entry.memoryId,
-    event: entry.event,
-    old_memory: entry.oldContent ?? null,
-    new_memory: entry.newContent ?? null,
-    actor: entry.actor,
-    reason: entry.reason ?? null,
-    created_at: entry.createdAt,
-    meta: entry.meta,
-  };
-}
 
 function v1Agent(agent: Agent): Record<string, unknown> {
   return {

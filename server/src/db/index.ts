@@ -2,12 +2,13 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
+import { newId, nowIso } from '../lib/ids.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /** 打开 SQLite（WAL）。:memory: 用于测试。 */
 export function openDatabase(dbPath: string): Db {
@@ -47,7 +48,13 @@ function ensureColumns(db: Db): void {
     task_id: 'TEXT',
     visibility: "TEXT NOT NULL DEFAULT 'project'",
     dreamed_at: 'TEXT',
+    person_id: 'TEXT',
+    actor_person_id: 'TEXT',
+    scope: "TEXT NOT NULL DEFAULT 'partition'",
+    session_id: 'TEXT',
   });
+  ensure('memory_briefs', { person_id: 'TEXT' });
+  ensure('memory_dream_runs', { person_id: 'TEXT' });
   ensure('users', {
     status: "TEXT NOT NULL DEFAULT 'active'",
     password_changed_at: 'TEXT',
@@ -61,6 +68,8 @@ function ensureColumns(db: Db): void {
     allowed_ips: "TEXT NOT NULL DEFAULT '[]'",
     rotated_from: 'TEXT',
     rotated_at: 'TEXT',
+    kind: "TEXT NOT NULL DEFAULT 'project'",
+    org_id: 'TEXT',
   });
   ensure('audit_logs', { request_id: 'TEXT' });
 }
@@ -93,6 +102,80 @@ interface Migration {
  * 列级变更写进 ensureColumns（幂等），数据回填/索引等写进 up()。
  */
 const MIGRATIONS: Migration[] = [
+  {
+    version: 5,
+    name: 'neutral-person-model',
+    up: (db) => {
+      // v5：记忆以人（Person）组织、以分区（Partition）隔离。
+      // 结构列/表已由 ensureColumns + schema.sql 完成，这里回填存量数据：
+      // 1) memories.agent_id → person(type=agent)；2) memories.user_id → person(type=human)；
+      // 3) person_id/actor_person_id 回填；4) visibility → scope；5) session_id；6) api_keys.org_id。
+      const now = nowIso();
+      const insertPerson = db.prepare(
+        `INSERT OR IGNORE INTO persons
+           (id, project_id, external_id, type, display_name, attributes, status, first_seen_at, last_seen_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, '{}', 'active', ?, ?, ?, ?)`,
+      );
+      const findPerson = db.prepare('SELECT id FROM persons WHERE project_id = ? AND type = ? AND external_id = ?');
+
+      const agentRows = db
+        .prepare(
+          `SELECT project_id, agent_id AS external_id, MAX(updated_at) AS last_at
+             FROM memories
+            WHERE agent_id IS NOT NULL AND agent_id <> ''
+            GROUP BY project_id, agent_id`,
+        )
+        .all() as unknown as { project_id: string; external_id: string; last_at: string | null }[];
+      for (const row of agentRows) {
+        const agent = db
+          .prepare('SELECT name FROM agents WHERE project_id = ? AND id = ?')
+          .get(row.project_id, row.external_id) as unknown as { name?: string } | undefined;
+        const lastAt = row.last_at || now;
+        const existing = findPerson.get(row.project_id, 'agent', row.external_id) as unknown as { id?: string } | undefined;
+        const id = existing?.id ?? newId('prs');
+        insertPerson.run(id, row.project_id, row.external_id, 'agent', agent?.name ?? '', lastAt, lastAt, now, now);
+        db.prepare(
+          `UPDATE memories
+              SET person_id = ?, actor_person_id = COALESCE(actor_person_id, ?)
+            WHERE project_id = ? AND agent_id = ?`,
+        ).run(id, id, row.project_id, row.external_id);
+      }
+
+      const userRows = db
+        .prepare(
+          `SELECT project_id, user_id AS external_id, MAX(updated_at) AS last_at
+             FROM memories
+            WHERE user_id IS NOT NULL AND user_id <> '' AND (agent_id IS NULL OR agent_id = '')
+            GROUP BY project_id, user_id`,
+        )
+        .all() as unknown as { project_id: string; external_id: string; last_at: string | null }[];
+      for (const row of userRows) {
+        const lastAt = row.last_at || now;
+        const existing = findPerson.get(row.project_id, 'human', row.external_id) as unknown as { id?: string } | undefined;
+        const id = existing?.id ?? newId('prs');
+        insertPerson.run(id, row.project_id, row.external_id, 'human', row.external_id, lastAt, lastAt, now, now);
+        db.prepare(
+          `UPDATE memories
+              SET person_id = ?, actor_person_id = COALESCE(actor_person_id, ?)
+            WHERE project_id = ? AND user_id = ? AND (agent_id IS NULL OR agent_id = '')`,
+        ).run(id, id, row.project_id, row.external_id);
+      }
+
+      // 可见性 → scope（存量行 scope 默认 partition）。
+      db.exec(
+        `UPDATE memories
+            SET scope = CASE visibility
+                          WHEN 'agent' THEN 'person'
+                          WHEN 'task' THEN 'session'
+                          ELSE 'partition'
+                        END`,
+      );
+      db.exec('UPDATE memories SET session_id = COALESCE(task_id, run_id) WHERE session_id IS NULL');
+      db.exec(
+        'UPDATE api_keys SET org_id = (SELECT p.org_id FROM projects p WHERE p.id = api_keys.project_id) WHERE org_id IS NULL',
+      );
+    },
+  },
   {
     version: 4,
     name: 'brief-and-dream',

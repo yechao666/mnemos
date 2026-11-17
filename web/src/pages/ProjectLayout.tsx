@@ -28,6 +28,8 @@ interface TabDefinition {
 const PROJECT_TABS: TabDefinition[] = [
   { to: '.', label: '概览', end: true },
   { to: 'memories', label: '记忆', end: true },
+  // 人不加 end：进入人详情 /persons/:ref 时页签仍保持高亮。
+  { to: 'persons', label: '人' },
   { to: 'records', label: '项目记录', end: true },
   { to: 'retrospective', label: '复盘总结', end: true },
   { to: 'members', label: '成员', end: true },
@@ -138,7 +140,7 @@ export function ProjectLayout() {
               {projectInitials(activeProject.name)}
             </span>
             <div style={{ minWidth: 0 }}>
-              <div className="page-eyebrow">项目工作区</div>
+              <div className="page-eyebrow">分区工作区 · 项目 / 应用 / 租户</div>
               <h1 className="page-title">{activeProject.name}</h1>
               <div className="hstack gap-8 wrap mt-8">
                 <span className="project-slug mono">{activeProject.slug}</span>

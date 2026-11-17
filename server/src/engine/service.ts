@@ -31,10 +31,17 @@ import type {
   MemoryDreamSettingsInput,
   MemoryDreamStatus,
   MemoryHistoryEntry,
+  MemoryScope,
   MemoryService,
   MemorySource,
   MemoryVisibility,
   Paginated,
+  Person,
+  PersonContext,
+  PersonContextInput,
+  PersonInput,
+  PersonListInput,
+  PersonType,
   ProjectStats,
   SearchMemoryInput,
   SearchResponse,
@@ -57,7 +64,19 @@ import { listHistory, listMemories, listMemoryEntities, listNeighborEntities, li
 import { embedText } from './embed.ts';
 import { conflict, notFound, unprocessable } from './errors.ts';
 import { extractEntities, extractFromMessages, extractFromText, extractRelations, type ExtractedFact } from './extract.ts';
-import { getDreamStatus, runDream, updateDreamSettings as updateDreamSettingsRecord } from './dream.ts';
+import { getDreamStatus, getPersonDreamStatus, latestDreamRun, runDream, updateDreamSettings as updateDreamSettingsRecord } from './dream.ts';
+import {
+  isPersonStatus,
+  isPersonType,
+  listPersons,
+  loadPersonStats,
+  mapPerson,
+  resolvePerson,
+  touchPerson as touchPersonRecord,
+  updatePerson as updatePersonRecord,
+  upsertPerson as upsertPersonRecord,
+  type PersonRow,
+} from './persons.ts';
 import { retrieve } from './retrieve.ts';
 import {
   attachEntities,
@@ -72,9 +91,11 @@ import {
   parseTagList,
   refreshContentIndex,
   requireMemoryRow,
+  scopeFromVisibility,
+  visibilityFromScope,
   writeHistory,
+  type LegacyScopeFields,
   type MemoryRow,
-  type MemoryScope,
 } from './store.ts';
 import { applyTaskPatch, createTask as createTaskRecord, findTaskRow, getTask, listTasks, updateTask as updateTaskRecord } from './tasks.ts';
 
@@ -89,6 +110,7 @@ export interface MemoryServiceOptions {
 
 const CATEGORIES: MemoryCategory[] = ['preference', 'identity', 'fact', 'plan', 'relationship', 'event', 'skill', 'constraint', 'context', 'insight', 'decision', 'progress', 'lesson', 'risk', 'change', 'acceptance', 'assumption', 'dependency'];
 const VISIBILITIES: MemoryVisibility[] = ['project', 'agent', 'task'];
+const SCOPES: MemoryScope[] = ['person', 'partition', 'session'];
 
 /** finishTask 的沉淀：决策、进展、经验分别成为结构化项目记录，备注仍为事件。 */
 const FINISH_BUCKETS: { key: 'decisions' | 'progress' | 'lessons' | 'risks' | 'changes' | 'acceptance' | 'assumptions' | 'dependencies' | 'notes'; category: MemoryCategory; importance: number }[] = [
@@ -131,7 +153,7 @@ function actorLabelOf(actor: Actor | undefined): string {
   return actor.label || actor.id || actor.type || 'system';
 }
 
-function scopeOf(input: { userId?: string; agentId?: string; runId?: string; appId?: string }): MemoryScope {
+function scopeOfLegacy(input: { userId?: string; agentId?: string; runId?: string; appId?: string }): LegacyScopeFields {
   return { userId: input.userId, agentId: input.agentId, runId: input.runId, appId: input.appId };
 }
 
@@ -251,18 +273,111 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
     });
   }
 
+  /* ------------------------------------------------------------------ */
+  /* 人（Person）解析辅助                                                 */
+  /* ------------------------------------------------------------------ */
+
+  /** 解析 person 引用（内部 id 或 external_id），找不到抛 404。 */
+  function requirePerson(projectId: string, ref: string, type?: PersonType): PersonRow {
+    const row = resolvePerson(db, projectId, ref, type ? { type } : {});
+    if (!row) throw notFound(`人不存在：${ref}`);
+    return row;
+  }
+
+  /** 调用方 Agent 身份 → person 内部 id（解析不到返回 null，交给旧 agent_id 兼容匹配）。 */
+  function callerPersonIdOf(projectId: string, agentId?: string): string | null {
+    const ref = typeof agentId === 'string' ? agentId.trim() : '';
+    if (!ref) return null;
+    return resolvePerson(db, projectId, ref, { type: 'agent' })?.id ?? null;
+  }
+
+  /**
+   * 写入时解析 person：显式 personId/personExternalId 优先，其次旧 user_id/agent_id 映射；
+   * personAutoCreate=true 时懒建档（新中立 API 首次写入即建人），否则显式引用缺失即 404。
+   */
+  function personForWrite(projectId: string, input: AddMemoryInput, autoCreate: boolean): PersonRow | null {
+    const direct = (input.personId ?? input.personExternalId ?? '').trim();
+    const typeHint: PersonType | undefined = input.agentId ? 'agent' : input.userId ? 'human' : undefined;
+    if (direct) {
+      const existing = resolvePerson(db, projectId, direct, typeHint ? { type: typeHint } : {});
+      if (existing) return existing;
+      if (!autoCreate || direct.startsWith('prs_')) throw notFound(`人不存在：${direct}`);
+      // external_id 同时命中多种类型（human + agent）时不能猜，要求调用方给出内部 id / 类型上下文。
+      const collisions = db
+        .prepare('SELECT COUNT(*) AS c FROM persons WHERE project_id = ? AND external_id = ?')
+        .get(projectId, direct) as unknown as { c?: number } | undefined;
+      if (Number(collisions?.c ?? 0) > 0) {
+        throw unprocessable(`人引用不唯一（external_id 命中多个类型）：${direct}，请使用内部 person id`);
+      }
+      return upsertPersonRecord(db, projectId, { externalId: direct, type: typeHint ?? 'human' });
+    }
+    const agentRef = input.agentId?.trim();
+    if (agentRef) {
+      const existing = resolvePerson(db, projectId, agentRef, { type: 'agent' });
+      if (existing) return existing;
+      if (!autoCreate) return null;
+      const agentRow = db.prepare('SELECT name FROM agents WHERE project_id = ? AND id = ?').get(projectId, agentRef) as
+        | { name?: string }
+        | undefined;
+      return upsertPersonRecord(db, projectId, {
+        externalId: agentRef,
+        type: 'agent',
+        displayName: agentRow?.name ?? agentRef,
+      });
+    }
+    const userRef = input.userId?.trim();
+    if (userRef) {
+      const existing = resolvePerson(db, projectId, userRef, { type: 'human' });
+      if (existing) return existing;
+      if (!autoCreate) return null;
+      return upsertPersonRecord(db, projectId, { externalId: userRef, type: 'human' });
+    }
+    return null;
+  }
+
+  /** 写入者：显式 actorPersonId 必须存在；缺省同 person（无 person 时为 NULL）。 */
+  function actorPersonForWrite(projectId: string, input: AddMemoryInput, person: PersonRow | null): string | null {
+    const ref = input.actorPersonId?.trim();
+    if (!ref) return person?.id ?? null;
+    const row = resolvePerson(db, projectId, ref);
+    if (!row) throw notFound(`写入者不存在：${ref}`);
+    return row.id;
+  }
+
   /**
    * 写入记忆的同步实现。`options.tx=false` 供 finishTask 在外层事务内复用，
    * 避免嵌套 BEGIN（SQLite 不支持）。
    */
   function executeAdd(input: AddMemoryInput, options: { tx?: boolean } = {}): AddMemoryResult {
     const started = performance.now();
-    const visibility = input.visibility ?? 'project';
-    if (!VISIBILITIES.includes(visibility)) throw unprocessable(`visibility 不合法：${String(visibility)}`);
-    const taskId = resolveTaskId(input);
-    if (visibility === 'task' && !taskId) throw unprocessable('visibility=task 时必须提供 taskId');
-
     const settings = loadSettings(db, input.projectId);
+
+    // 1) scope：显式 scope > 旧 visibility 映射 > 分区设置 defaultScope；visibility 双写。
+    if (input.visibility !== undefined && !VISIBILITIES.includes(input.visibility)) {
+      throw unprocessable(`visibility 不合法：${String(input.visibility)}`);
+    }
+    if (input.scope !== undefined && !SCOPES.includes(input.scope)) {
+      throw unprocessable(`scope 不合法：${String(input.scope)}`);
+    }
+    const scope: MemoryScope =
+      input.scope ?? (input.visibility ? scopeFromVisibility(input.visibility) : settings.defaultScope);
+    // 双写兼容列：显式 scope 优先，避免 scope 与 visibility 组合出不一致的存量语义。
+    const visibility: MemoryVisibility =
+      input.scope !== undefined ? visibilityFromScope(scope) : (input.visibility ?? visibilityFromScope(scope));
+    const taskId = resolveTaskId(input);
+    const sessionId = input.sessionId?.trim() || taskId || undefined;
+    if (scope === 'session' && !sessionId) {
+      throw unprocessable('scope=session（旧 visibility=task）时必须提供 sessionId 或 taskId');
+    }
+
+    // 2) person：显式引用优先；旧 user_id/agent_id 继续映射为 human/agent 人。
+    const person = personForWrite(input.projectId, input, settings.personAutoCreate);
+    if (scope === 'person' && !person) {
+      throw unprocessable('scope=person 时必须提供 personId / personExternalId（或旧 userId / agentId）');
+    }
+    const actorPersonId = actorPersonForWrite(input.projectId, input, person);
+
+    // 3) 事实抽取
     const mode = input.mode ?? settings.extractionMode;
     const actor = actorLabelOf(input.actor);
     const facts = collectFacts(input);
@@ -288,14 +403,15 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
         const embedding = embedText(fact.content);
 
         if (mode === 'consolidate') {
+          // scope=person 必须按 person_id 隔离，避免不同人的相同内容被合并。
           const similar = findSimilarMemory(
             db,
             input.projectId,
-            scopeOf(input),
+            scopeOfLegacy(input),
             fact.content,
             embedding,
             settings.dedupeThreshold,
-            { taskId: taskId ?? null, visibility },
+            { scope, personId: person?.id ?? null, sessionId: sessionId ?? null, visibility },
           );
           if (similar) {
             const event = similar.exact ? 'MERGE' : 'NOOP';
@@ -321,6 +437,10 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
           source,
           tags,
           metadata,
+          personId: person?.id ?? null,
+          actorPersonId,
+          scope,
+          sessionId: sessionId ?? null,
           userId: input.userId,
           agentId: input.agentId,
           runId: input.runId,
@@ -337,6 +457,7 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
         result.results.push(memory);
         result.events.push({ type: 'ADD', memoryId: memory.id, content: memory.content, at: memory.createdAt });
       }
+      if (person) touchPersonRecord(db, input.projectId, person.id, at);
       if (input.agentId) touchAgent(db, input.projectId, input.agentId, at);
     };
 
@@ -366,7 +487,17 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
   }
 
   async function search(input: SearchMemoryInput): Promise<SearchResponse> {
-    const result = retrieve(db, input);
+    const personFilterId = input.personId?.trim() ? requirePerson(input.projectId, input.personId).id : undefined;
+    // 调用方本人：旧 agentId 优先（Agent 身份），否则人级筛选的人。
+    const callerPersonId = input.agentId
+      ? callerPersonIdOf(input.projectId, input.agentId)
+      : (personFilterId ?? null);
+    const result = retrieve(db, {
+      ...input,
+      personFilterId,
+      callerPersonId,
+      sessionId: input.taskId ?? null,
+    });
     if (result.hits.length > 0) {
       const at = nowIso();
       const statement = db.prepare('UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ? AND project_id = ?');
@@ -397,7 +528,16 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
   }
 
   async function list(input: ListMemoriesInput): Promise<Paginated<Memory>> {
-    return listMemories(db, input);
+    const personFilterId = input.personId?.trim() ? requirePerson(input.projectId, input.personId).id : undefined;
+    const callerPersonId = input.agentId
+      ? callerPersonIdOf(input.projectId, input.agentId)
+      : (personFilterId ?? null);
+    return listMemories(db, {
+      ...input,
+      personFilterId,
+      callerPersonId,
+      sessionId: input.taskId ?? null,
+    });
   }
 
   async function get(projectId: string, id: string): Promise<MemoryDetail | null> {
@@ -602,7 +742,8 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
 
   /**
    * 结束任务：同一事务内更新任务状态，并把 decisions/lessons/notes 逐条沉淀为
-   * 项目共享记忆（visibility=project、taskId 归因、infer=false 保留原文）。
+   * 分区共享记忆（scope=partition、visibility=project、taskId 归因、infer=false 保留原文）；
+   * 有 agentId 时把决策等归属到该 Agent 对应的人（若已建档）。
    */
   async function finishTask(
     projectId: string,
@@ -619,6 +760,7 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
 
     const status: 'done' | 'abandoned' = input.status ?? 'done';
     const memories: Memory[] = [];
+    const agentPerson = input.agentId ? resolvePerson(db, projectId, input.agentId, { type: 'agent' }) : null;
 
     tx(db, () => {
       applyTaskPatch(db, projectId, taskId, { status, summary: input.summary });
@@ -631,6 +773,7 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
               projectId,
               text: content,
               agentId: input.agentId,
+              personId: agentPerson?.id,
               taskId,
               visibility: 'project',
               infer: false,
@@ -699,6 +842,12 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
     return getDreamStatus(db, projectId);
   }
 
+  async function personDreamStatus(projectId: string, personRef: string): Promise<MemoryDreamStatus> {
+    const person = resolvePerson(db, projectId, personRef);
+    if (!person) throw notFound('人不存在');
+    return getPersonDreamStatus(db, projectId, person.id);
+  }
+
   async function updateDreamSettings(
     projectId: string,
     input: MemoryDreamSettingsInput,
@@ -722,15 +871,22 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
 
   async function dream(input: MemoryDreamInput, actor: Actor): Promise<MemoryDreamResult> {
     const projectId = input.projectId;
+    const personId = input.personId?.trim() ? requirePerson(projectId, input.personId).id : undefined;
     let run: MemoryDreamRun | null = null;
     let failedRun: MemoryDreamRun | undefined;
     try {
       // addMemory 用本文件的 add 闭包：洞见走完整引擎路径（索引/实体/历史一致）。
-      run = await runDream({ db, llm, addMemory: add }, projectId, input.trigger ?? 'manual', input.batchSize);
+      run = await runDream(
+        { db, llm, addMemory: add },
+        projectId,
+        input.trigger ?? 'manual',
+        input.batchSize,
+        { personId },
+      );
       return { run, status: getDreamStatus(db, projectId) };
     } catch (error) {
       // 手动触发失败会 rethrow；仍要留下审计（failed run 已落库）。
-      const latest = getDreamStatus(db, projectId).runs[0];
+      const latest = latestDreamRun(db, projectId, personId);
       failedRun = latest?.status === 'failed' ? latest : undefined;
       throw error;
     } finally {
@@ -741,18 +897,175 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
           projectId,
           actor,
           action: 'memory.dream.run',
-          resourceType: 'project',
-          resourceId: projectId,
+          resourceType: personId ? 'person' : 'project',
+          resourceId: personId ?? projectId,
           detail: {
             runId: audited.id,
             trigger: audited.trigger,
             status: audited.status,
             inputCount: audited.inputCount,
             insightCount: audited.insightCount,
+            personId: personId ?? null,
           },
         });
       }
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 人（Person）与人的上下文                                             */
+  /* ------------------------------------------------------------------ */
+
+  async function persons(input: PersonListInput): Promise<Paginated<Person>> {
+    return listPersons(db, input);
+  }
+
+  async function person(projectId: string, personRef: string): Promise<Person | null> {
+    const row = resolvePerson(db, projectId, personRef);
+    if (!row) return null;
+    return mapPerson(row, loadPersonStats(db, projectId, row.id));
+  }
+
+  /** 校验人写入参数（HTTP 层之外再兜一层，保证引擎契约不被脏数据破坏）。 */
+  function validatePersonInput(input: Partial<PersonInput>): void {
+    if (input.externalId !== undefined && !input.externalId.trim()) {
+      throw unprocessable('person.externalId 不能为空');
+    }
+    if (input.type !== undefined && !isPersonType(input.type)) {
+      throw unprocessable(`person.type 不合法：${String(input.type)}`);
+    }
+    if (input.status !== undefined && !isPersonStatus(input.status)) {
+      throw unprocessable(`person.status 不合法：${String(input.status)}`);
+    }
+  }
+
+  async function upsertPerson(projectId: string, input: PersonInput, actor: Actor): Promise<Person> {
+    validatePersonInput(input);
+    const row = upsertPersonRecord(db, projectId, input, { actor });
+    return mapPerson(row, loadPersonStats(db, projectId, row.id));
+  }
+
+  async function updatePerson(
+    projectId: string,
+    personRef: string,
+    input: Partial<PersonInput>,
+    actor: Actor,
+  ): Promise<Person> {
+    validatePersonInput(input);
+    const row = updatePersonRecord(db, projectId, personRef, input, actor);
+    return mapPerson(row, loadPersonStats(db, projectId, row.id));
+  }
+
+  /**
+   * 人的上下文：人资料 + 人的简报 + 高相关记忆（约 8 条）+（可选）分区共享知识，
+   * 组装成可直接注入提示词的 prompt，并返回 token 估算与引用记忆 id。
+   */
+  async function personContext(input: PersonContextInput): Promise<PersonContext> {
+    const personRow = requirePerson(input.projectId, input.personRef);
+    const builtAt = nowIso();
+
+    const brief = await ensureBrief(
+      { db, llm },
+      { projectId: input.projectId, personId: personRow.id, includePrivate: true },
+    );
+
+    const query = input.query?.trim();
+    let memories: Memory[];
+    if (query) {
+      memories = (
+        await search({
+          projectId: input.projectId,
+          query,
+          personId: personRow.id,
+          includePrivate: true,
+          topK: 8,
+        })
+      ).results;
+    } else {
+      memories = (
+        await list({
+          projectId: input.projectId,
+          personId: personRow.id,
+          includePrivate: true,
+          sort: 'recent',
+          page: 1,
+          pageSize: 8,
+        })
+      ).items;
+    }
+
+    const shared: Memory[] = [];
+    if (input.includePartition !== false) {
+      const page = await list({
+        projectId: input.projectId,
+        scope: 'partition',
+        includePrivate: false,
+        sort: 'recent',
+        page: 1,
+        pageSize: 8,
+      });
+      shared.push(...page.items);
+    }
+
+    const person = mapPerson(personRow, loadPersonStats(db, input.projectId, personRow.id));
+    const lines: string[] = [];
+    const citations: string[] = [];
+    const pushCitation = (id: string) => {
+      if (citations.length < 20 && !citations.includes(id)) citations.push(id);
+    };
+
+    const displayName = person.displayName || person.externalId;
+    lines.push(`# 人的上下文：${displayName}`);
+    lines.push('');
+    lines.push(`- 人：${displayName}（${person.type} · ${person.externalId}）`);
+    lines.push(`- 分区：${input.projectId}`);
+    const attributes = Object.keys(person.attributes);
+    if (attributes.length > 0) lines.push(`- 资料：${JSON.stringify(person.attributes)}`);
+    lines.push(`- 生成时间：${builtAt}`);
+
+    if (brief.count > 0) {
+      lines.push('');
+      lines.push('## 人的简报');
+      const body = brief.text.split('\n');
+      if (body[0]?.startsWith('# 记忆简报')) body.shift();
+      for (const line of body) if (line.trim()) lines.push(line);
+    }
+
+    lines.push('');
+    lines.push('## 相关记忆');
+    if (memories.length === 0) {
+      lines.push('- （暂无）');
+    } else {
+      for (const memory of memories) {
+        lines.push(`- [${memory.id}] ${memory.content.replace(/\s+/g, ' ').trim()}`);
+        pushCitation(memory.id);
+      }
+    }
+
+    if (input.includePartition !== false) {
+      lines.push('');
+      lines.push('## 分区共享知识');
+      if (shared.length === 0) {
+        lines.push('- （暂无）');
+      } else {
+        for (const memory of shared) {
+          lines.push(`- [${memory.id}] ${memory.content.replace(/\s+/g, ' ').trim()}`);
+          pushCitation(memory.id);
+        }
+      }
+    }
+
+    const prompt = lines.join('\n');
+    return {
+      person,
+      brief,
+      memories,
+      shared,
+      prompt,
+      tokenEstimate: estimateTokens(prompt),
+      citations,
+      builtAt,
+    };
   }
 
   return {
@@ -780,7 +1093,13 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
     brief,
     updateBriefSettings,
     dreamStatus,
+    personDreamStatus,
     updateDreamSettings,
     dream,
+    persons,
+    person,
+    upsertPerson,
+    updatePerson,
+    personContext,
   };
 }

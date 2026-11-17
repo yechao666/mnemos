@@ -12,6 +12,8 @@ import { OpsPage } from '../pages/OpsPage.tsx';
 import { ProjectLayout } from '../pages/ProjectLayout.tsx';
 import { ProjectOverviewPage } from '../pages/project/ProjectOverviewPage.tsx';
 import { MemoriesPage } from '../pages/project/MemoriesPage.tsx';
+import { PersonsPage } from '../pages/project/PersonsPage.tsx';
+import { PersonDetailPage } from '../pages/project/PersonDetailPage.tsx';
 import { RecordsPage } from '../pages/project/RecordsPage.tsx';
 import { ProjectMembersPage } from '../pages/project/ProjectMembersPage.tsx';
 import { RetrospectivePage } from '../pages/project/RetrospectivePage.tsx';
@@ -64,6 +66,8 @@ export function AppRoutes() {
         <Route path="/projects/:projectId" element={<ProjectLayout />}>
           <Route index element={<ProjectOverviewPage />} />
           <Route path="memories" element={<MemoriesPage />} />
+          <Route path="persons" element={<PersonsPage />} />
+          <Route path="persons/:personRef" element={<PersonDetailPage />} />
           <Route path="records" element={<RecordsPage />} />
           <Route path="members" element={<ProjectMembersPage />} />
           <Route path="retrospective" element={<RetrospectivePage />} />

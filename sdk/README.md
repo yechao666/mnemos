@@ -89,6 +89,8 @@ python3 sdk/python/examples/basic.py
 | 能力 | TypeScript | Python |
 | --- | --- | --- |
 | 写入记忆 | `client.memories.add` | `client.memories.add` |
+| 分区 / 人（中立 v5） | `client.partitions.*` / `client.persons.*` / `client.personBrief/personContext/personDream/personDreamRun` | 暂未覆盖（走 HTTP） |
+| 人级记忆路由 | `client.memories.*({ partition, personId, scope, sessionId })` | 暂未覆盖 |
 | 混合检索 | `client.memories.search` | `client.memories.search` |
 | 列表 / 详情 | `list` / `get` | `list` / `get` |
 | 更新 / 删除 | `update` / `delete` | `update` / `delete` |
@@ -111,6 +113,33 @@ python3 sdk/python/examples/basic.py
 - **Python** 全部使用 snake_case 关键字参数；
 - **出参**统一归一化为 snake_case；服务端个别接口返回的 camelCase 字段（如写入接口的 `createdAt`）会被自动转换；
 - 记忆正文同时提供 `content` 与 `memory`（服务端列表/检索字段名为 `memory`）。
+
+---
+
+## 3.5 中立记忆服务：分区 + 人（v5，TypeScript 已覆盖）
+
+v5 的记忆模型是「分区（Partition）× 人（Person）」：
+
+- `client.partitions.create(input)`：按 `slug` 幂等建分区（**org key** + `admin` 作用域）；
+  `client.partitions.get(ref)` 按 id 或 slug 读取分区；
+- `client.persons.list/get/upsert/update`：人列表 / 详情 / 建档 / 更新（`partition` + `personRef`）；
+- `client.personBrief/personContext/personDream/personDreamRun`：人的简报 / 上下文（含 `prompt`）/
+  人级做梦状态与触发；
+- `client.memories.*` 传 `partition` 时走 `/v1/partitions/:p/memories*`，并支持
+  `personId` / `personExternalId` / `scope`（person / partition / session）/ `sessionId`；
+  不传 `partition` 则保持旧 `/v1/memories` 行为。
+
+```ts
+const client = new MnemosClient({ apiKey: process.env.MNEMOS_ORG_KEY! });
+const { partition } = await client.partitions.create({ slug: 'zhiwu-app', name: '知物感恩 App' });
+await client.persons.upsert(partition.slug, 'user-123', { type: 'human', displayName: '用户 123' });
+await client.memories.add({ partition: partition.slug, text: '用户 123 喜欢黑咖啡', personId: 'user-123', scope: 'person' });
+const brief = await client.personBrief(partition.slug, 'user-123');
+```
+
+详细示例与 `scope` / `visibility` 映射见 [`typescript/README.md`](typescript/README.md#分区--人中立记忆服务-v5)；
+接口契约见 [`docs/api.md`](../docs/api.md) 第 11 节，旧接口迁移见
+[`docs/migration-v4-v5.md`](../docs/migration-v4-v5.md)。
 
 ---
 
@@ -217,6 +246,8 @@ client.memories.add(text="要落库的事实", idempotency_key="add-u1-20261105-
 - 同一大版本内只做向后兼容增量：新增可选字段/方法，不移除已有字段，不改变既有语义；
 - 服务端新增字段时 SDK 忽略未知字段；字段缺失时提供默认值（空字符串/`0`/`null`）；
 - 响应模型经归一化层处理，服务端 camelCase/snake_case 混用不会破坏调用方代码；
+- v5 的「分区 + 人」能力是增量：旧方法/旧端点/旧字段不变，新字段（`person_id` / `scope` /
+  `session_id`）在响应中增量出现；
 - 标有 **beta** 的 Webhook API 不在兼容性承诺内，服务端就绪前调用可能返回 `404`；
 - 服务端 `/api/*`（控制台会话鉴权、camelCase）不在 SDK 范围内。
 

@@ -34,6 +34,22 @@ test('info / servers 使用运行环境信息', () => {
 test('paths 数量 ≥ 25，且覆盖关键端点', () => {
   const names = Object.keys(paths);
   assert.ok(names.length >= 25, `paths 只有 ${names.length} 个`);
+  // v5 中立面
+  assert.ok(names.includes('/v1/partitions'), '缺少 /v1/partitions');
+  assert.ok(names.includes('/v1/partitions/{partition}'), '缺少分区详情');
+  assert.ok(names.includes('/v1/partitions/{partition}/persons'), '缺少分区人列表');
+  assert.ok(names.includes('/v1/partitions/{partition}/persons/{person}'), '缺少分区人详情');
+  assert.ok(names.includes('/v1/partitions/{partition}/memories'), '缺少分区记忆写/列表');
+  assert.ok(names.includes('/v1/partitions/{partition}/memories/search'), '缺少分区记忆检索');
+  assert.ok(names.includes('/v1/partitions/{partition}/persons/{person}/brief'), '缺少人级简报');
+  assert.ok(names.includes('/v1/partitions/{partition}/persons/{person}/context'), '缺少人级上下文');
+  assert.ok(names.includes('/v1/partitions/{partition}/persons/{person}/dream'), '缺少人级做梦状态');
+  // 控制台人维度 / org key
+  assert.ok(names.includes('/api/projects/{id}/persons'), '缺少控制台人列表');
+  assert.ok(names.includes('/api/projects/{id}/persons/{personRef}'), '缺少控制台人详情');
+  assert.ok(names.includes('/api/projects/{id}/persons/{personRef}/dream/run'), '缺少人级做梦触发');
+  assert.ok(names.includes('/api/org/keys'), '缺少组织级密钥');
+  assert.ok(names.includes('/api/org/keys/{keyId}'), '缺少组织级密钥吊销');
   assert.ok(names.includes('/v1/context'), '缺少 /v1/context');
   assert.ok(names.includes('/v1/memories/search'), '缺少 /v1/memories/search');
   assert.ok(names.includes('/v1/memories'), '缺少 /v1/memories');
@@ -54,9 +70,36 @@ test('securitySchemes 同时声明 API Key 与会话', () => {
 });
 
 test('包含全部领域模型 schema', () => {
-  for (const name of ['Memory', 'Agent', 'Task', 'Briefing', 'Error', 'ApiKey', 'OrgUser']) {
+  for (const name of [
+    'Memory',
+    'Agent',
+    'Task',
+    'Briefing',
+    'Error',
+    'ApiKey',
+    'OrgUser',
+    'Person',
+    'PersonStats',
+    'PersonInput',
+    'PersonContext',
+    'Partition',
+    'MemoryScope',
+    'MemoryDreamStatus',
+  ]) {
     assert.ok(components.schemas[name], `缺少 schema：${name}`);
   }
+  const scope = components.schemas.MemoryScope as { enum?: string[] };
+  assert.deepEqual(scope.enum, ['person', 'partition', 'session']);
+});
+
+test('Memory schema 覆盖 person / scope / session 中立字段', () => {
+  const memory = components.schemas.Memory as { properties?: Record<string, unknown> };
+  for (const field of ['personId', 'actorPersonId', 'personExternalId', 'sessionId', 'scope']) {
+    assert.ok(memory.properties?.[field], `Memory 缺少字段：${field}`);
+  }
+  const apiKey = components.schemas.ApiKey as { properties?: Record<string, { enum?: string[] }> };
+  assert.deepEqual(apiKey.properties?.kind?.enum, ['project', 'org']);
+  assert.ok(apiKey.properties?.orgId, 'ApiKey 缺少 orgId');
 });
 
 test('每个操作都带 summary / security / 标准错误响应', () => {

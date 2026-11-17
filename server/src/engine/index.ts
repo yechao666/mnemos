@@ -16,7 +16,8 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
 
 export type { MemoryServiceOptions } from './service.ts';
 export type { EntityType, ExtractedEntity, ExtractedFact, ExtractedRelation, ExtractionContext } from './extract.ts';
-export type { MemoryScope, PersistMemoryInput } from './store.ts';
+export type { LegacyScopeFields, PersistMemoryInput } from './store.ts';
+export type { MemoryScope } from '../../../shared/src/types.ts';
 
 export { tokenize, termFrequencies, normalizeText, rankTerms } from './tokenize.ts';
 export { DIM, EMBEDDING_MODEL, embedText, vectorToBlob, blobToVector, cosine } from './embed.ts';

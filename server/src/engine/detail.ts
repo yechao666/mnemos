@@ -18,8 +18,21 @@ import { chunk, mapHistory, mapMemory, visibilityClause, type HistoryRow, type M
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;
 
+/**
+ * 列表查询的内部扩展：personId/scope 已在 service 层解析为内部 id，
+ * 并附带调用方视角（本人 person / 会话）用于可见性判定。
+ */
+export interface ListMemoriesQuery extends ListMemoriesInput {
+  /** 已解析的 person 内部 id（按人筛选） */
+  personFilterId?: string;
+  /** 调用方本人（person 内部 id） */
+  callerPersonId?: string | null;
+  /** 调用方会话 id（由 taskId 泛化而来） */
+  sessionId?: string | null;
+}
+
 /** 列表分页（默认只看 active，按 sort 排序）。 */
-export function listMemories(db: DatabaseSync, input: ListMemoriesInput): Paginated<Memory> {
+export function listMemories(db: DatabaseSync, input: ListMemoriesQuery): Paginated<Memory> {
   const page = Math.max(1, Math.trunc(input.page ?? 1));
   const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, Math.trunc(input.pageSize ?? DEFAULT_PAGE_SIZE)));
   const where: string[] = ['m.project_id = ?'];
@@ -27,6 +40,10 @@ export function listMemories(db: DatabaseSync, input: ListMemoriesInput): Pagina
 
   where.push('m.status = ?');
   params.push(input.status ?? 'active');
+  if (input.personFilterId !== undefined) {
+    where.push('m.person_id = ?');
+    params.push(input.personFilterId);
+  }
   if (input.userId !== undefined) {
     where.push('m.user_id = ?');
     params.push(input.userId);
@@ -44,8 +61,11 @@ export function listMemories(db: DatabaseSync, input: ListMemoriesInput): Pagina
     params.push(input.taskId);
   }
   const visible = visibilityClause({
+    callerPersonId: input.callerPersonId,
+    callerSessionId: input.sessionId,
     agentId: input.agentId,
     taskId: input.taskId,
+    scope: input.scope,
     visibility: input.visibility,
     includePrivate: input.includePrivate,
   });
@@ -70,7 +90,11 @@ export function listMemories(db: DatabaseSync, input: ListMemoriesInput): Pagina
   const countRow = db.prepare(`SELECT COUNT(*) AS c FROM memories m WHERE ${clause}`).get(...params) as unknown as { c: number } | undefined;
   const total = Number(countRow?.c ?? 0);
   const rows = db
-    .prepare(`SELECT * FROM memories m WHERE ${clause} ORDER BY ${orderBy} LIMIT ? OFFSET ?`)
+    .prepare(
+      `SELECT m.*, p.external_id AS person_external_id
+         FROM memories m LEFT JOIN persons p ON p.id = m.person_id
+        WHERE ${clause} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+    )
     .all(...params, pageSize, (page - 1) * pageSize) as unknown as MemoryRow[];
 
   return {

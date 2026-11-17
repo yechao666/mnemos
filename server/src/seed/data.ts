@@ -840,6 +840,296 @@ export const ORION_PROJECT: SeedProject = {
 
 PROJECTS.push(ORION_PROJECT);
 
+/* ------------------------------------------------------------------ */
+/* 中立记忆服务 v5 演示：人（Person）+ 人级 / 分区共享记忆             */
+/* ------------------------------------------------------------------ */
+
+/** 人级（scope=person）演示记忆。 */
+export interface SeedPersonMemory {
+  text: string;
+  category: MemoryCategory;
+  daysAgo: number;
+  importance?: number;
+  tags?: string[];
+  /** 会话 ID（用于演示人的 sessions 统计） */
+  sessionId?: string;
+}
+
+/** 演示用的人（记忆主体）。 */
+export interface SeedPerson {
+  /** 调用方定义的人 ID（App user_id / Agent id） */
+  externalId: string;
+  type: 'human' | 'agent';
+  displayName: string;
+  attributes?: Record<string, unknown>;
+  status?: 'active' | 'archived';
+  /** 该人的私有记忆（scope=person） */
+  memories: SeedPersonMemory[];
+}
+
+/** 分区共享记忆（scope=partition）。 */
+export interface SeedSharedMemory {
+  text: string;
+  category: MemoryCategory;
+  daysAgo: number;
+  importance?: number;
+  tags?: string[];
+  /** 可选：仍可归属某个人（如「客户 X 的合同条款」），但分区内共享 */
+  personExternalId?: string;
+  /** 可选：写入者（演示 actor 与人不同） */
+  actorExternalId?: string;
+  sessionId?: string;
+}
+
+/** 一个项目的中立人维度演示数据。 */
+export interface SeedNeutralDemo {
+  persons: SeedPerson[];
+  shared: SeedSharedMemory[];
+  /** 可选的人级做梦演示：为某人生成一条 person scope 洞见 */
+  personDream?: {
+    personExternalId: string;
+    id: string;
+    inputCount: number;
+    daysAgo: number;
+    summary: string;
+    insight: { text: string; title: string; sourceTexts: string[] };
+  };
+}
+
+/**
+ * 两个基准场景：
+ * - `aurora-support`：消费类 App 客户（human）+ 礼宾 Agent，CLIENT 私有偏好与分区共享的客服规范；
+ * - `orion-python`：研发协作区（human 负责人/工程师 + 测试 Agent），私有草稿与团队发布/评审约定。
+ */
+export const NEUTRAL_DEMO: Record<string, SeedNeutralDemo> = {
+  'aurora-support': {
+    persons: [
+      {
+        externalId: 'cust-8899',
+        type: 'human',
+        displayName: '许清 · 上海观澜传媒',
+        attributes: { tier: 'enterprise', plan: 'Aurora Cloud', seats: 120, source: 'app' },
+        memories: [
+          {
+            text: '许清是上海观澜传媒的客户成功负责人，账号下 120 个坐席，续约决策人。',
+            category: 'identity',
+            daysAgo: 18,
+            importance: 0.82,
+            tags: ['身份', '企业版'],
+          },
+          {
+            text: '许清偏好英文界面与周一上午的账单提醒，不接受电话回访。',
+            category: 'preference',
+            daysAgo: 16,
+            importance: 0.74,
+            tags: ['联络偏好'],
+          },
+          {
+            text: '许清要求涉及合同的回复必须先经其助理邮箱确认，不得直接对外承诺条款。',
+            category: 'constraint',
+            daysAgo: 9,
+            importance: 0.88,
+            tags: ['合规', '合同'],
+            sessionId: 'sess_aurora_8899_1016',
+          },
+          {
+            text: '许清在 10 月 16 日反馈批量导出偶发超时，对导出稳定性比较敏感。',
+            category: 'event',
+            daysAgo: 30,
+            importance: 0.66,
+            tags: ['导出'],
+          },
+        ],
+      },
+      {
+        externalId: 'cust-9101',
+        type: 'human',
+        displayName: '赵铭 · 成都云帆科技',
+        attributes: { tier: 'growth', plan: 'Aurora Cloud', source: 'app' },
+        memories: [
+          {
+            text: '赵铭是成都云帆科技的技术负责人，负责 Aurora Cloud 的 API 集成与限流配置。',
+            category: 'identity',
+            daysAgo: 22,
+            importance: 0.8,
+            tags: ['技术负责人'],
+          },
+          {
+            text: '赵铭的个人手机号仅用于 P1 事故升级，不得写进工单备注或对外共享。',
+            category: 'constraint',
+            daysAgo: 15,
+            importance: 0.9,
+            tags: ['隐私', '升级'],
+          },
+          {
+            text: '赵铭正在评估 Aurora Knowledge 与现有 Confluence 的导入兼容性，预计 12 月前给出结论。',
+            category: 'plan',
+            daysAgo: 6,
+            importance: 0.72,
+            tags: ['迁移评估'],
+            sessionId: 'sess_aurora_9101_1028',
+          },
+        ],
+      },
+      {
+        externalId: 'agent-vip-concierge',
+        type: 'agent',
+        displayName: 'VIP 礼宾 Agent',
+        attributes: { model: 'deepseek-chat', scope: 'vip', owner: 'aurora-support' },
+        memories: [
+          {
+            text: '礼宾 Agent 的私有笔记：回复 cust-8899 需附 SLA 与升级路径，回复 cust-9101 需附 API 限流说明。',
+            category: 'context',
+            daysAgo: 4,
+            importance: 0.7,
+            tags: ['私有笔记'],
+          },
+          {
+            text: '礼宾 Agent 的私有话术草稿：企业客户先确认续约风险，再给出补偿方案。',
+            category: 'preference',
+            daysAgo: 5,
+            importance: 0.62,
+            tags: ['话术'],
+          },
+        ],
+      },
+    ],
+    shared: [
+      {
+        text: '客服团队通用约定：P1 工单 30 分钟内首响，P2 四小时内，P3 一个工作日内。',
+        category: 'constraint',
+        daysAgo: 55,
+        importance: 0.9,
+        tags: ['SLA'],
+      },
+      {
+        text: '退款承诺类回复必须附带到账时效与工单编号，禁止口头承诺具体金额。',
+        category: 'constraint',
+        daysAgo: 44,
+        importance: 0.86,
+        tags: ['合规', '退款'],
+        actorExternalId: 'agent-vip-concierge',
+      },
+      {
+        text: 'Aurora Cloud 企业版默认提供 99.9% SLA，未达标部分按季度服务抵扣。',
+        category: 'fact',
+        daysAgo: 40,
+        importance: 0.78,
+        tags: ['SLA', '合同'],
+      },
+    ],
+    personDream: {
+      personExternalId: 'cust-8899',
+      id: 'dream_seed_aurora_cust8899',
+      inputCount: 3,
+      daysAgo: 7,
+      summary: '把许清的偏好与合同约束归纳为礼宾回复要点',
+      insight: {
+        title: '企业客户回复先对齐合同约束',
+        text: '对许清这类企业客户，回复顺序应为：先确认合同与预算约束（合同条款须经助理邮箱确认），再给出导出稳定性与 SLA 说明；账单提醒固定在周一上午，且避免电话回访。',
+        sourceTexts: ['许清要求涉及合同的回复必须先经其助理邮箱确认', '许清偏好英文界面与周一上午的账单提醒'],
+      },
+    },
+  },
+  'orion-python': {
+    persons: [
+      {
+        externalId: 'dev-linwei',
+        type: 'human',
+        displayName: '林薇 · 平台负责人',
+        attributes: { role: 'platform-owner', team: 'mnemos', email: 'lin.wei@mnemos.dev' },
+        memories: [
+          {
+            text: '林薇的私有笔记：查询服务拆分先只读灰度，观察 3 天指标再切写流量。',
+            category: 'plan',
+            daysAgo: 2,
+            importance: 0.74,
+            tags: ['拆分', '灰度'],
+            sessionId: 'sess_orion_linwei_1115',
+          },
+          {
+            text: '林薇偏好中文评审意见，并要求附风险等级与回滚方案。',
+            category: 'preference',
+            daysAgo: 30,
+            importance: 0.7,
+            tags: ['评审偏好'],
+          },
+        ],
+      },
+      {
+        externalId: 'dev-zhouye',
+        type: 'human',
+        displayName: '周野 · 算法工程师',
+        attributes: { role: 'engineer', team: 'query', email: 'zhou.ye@mnemos.dev' },
+        memories: [
+          {
+            text: '周野的私有假设：order_id 分片在 618 峰值下可能热点，需要预留预分片方案。',
+            category: 'assumption',
+            daysAgo: 2,
+            importance: 0.72,
+            tags: ['分片', '风险'],
+          },
+          {
+            text: '周野熟悉 SQLAlchemy async 与连接池调优，可负责查询服务性能验证。',
+            category: 'skill',
+            daysAgo: 28,
+            importance: 0.68,
+            tags: ['技能'],
+          },
+        ],
+      },
+      {
+        externalId: 'agent-tester',
+        type: 'agent',
+        displayName: '测试 Agent',
+        attributes: { model: 'deepseek-coder', owner: 'orion-python' },
+        memories: [
+          {
+            text: '测试 Agent 私有：订单拆分回归用例在 tests/query_split/，需覆盖跨分片统计与退款单。',
+            category: 'plan',
+            daysAgo: 3,
+            importance: 0.76,
+            tags: ['测试', '回归'],
+            sessionId: 'sess_orion_tester_1114',
+          },
+        ],
+      },
+    ],
+    shared: [
+      {
+        text: '发布窗口约定：工作日 14:00–17:00 可发布，大促前 48 小时冻结发布。',
+        category: 'constraint',
+        daysAgo: 50,
+        importance: 0.88,
+        tags: ['发布'],
+      },
+      {
+        text: '代码评审 SLA：PR 提交后 4 小时内首评，超过 24 小时自动升级给负责人。',
+        category: 'constraint',
+        daysAgo: 36,
+        importance: 0.84,
+        tags: ['评审', 'SLA'],
+      },
+      {
+        text: '查询服务拆分期间保持双读，主库仍是唯一写入口，切换前必须完成对账脚本。',
+        category: 'decision',
+        daysAgo: 5,
+        importance: 0.86,
+        tags: ['拆分', '决策'],
+        personExternalId: 'dev-linwei',
+      },
+      {
+        text: '团队共识：所有并发相关缺陷必须补 50 并发压测用例，修复后再合并。',
+        category: 'lesson',
+        daysAgo: 33,
+        importance: 0.8,
+        tags: ['并发', '复盘'],
+        actorExternalId: 'agent-tester',
+      },
+    ],
+  },
+};
+
 
 /** 演示用 Webhook 订阅（不实际外发：示例域名不可达，用于展示投递日志与状态）。 */
 export const DEMO_WEBHOOKS: Record<

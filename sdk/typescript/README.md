@@ -1,6 +1,6 @@
 # `@mnemos/sdk` — Mnemos TypeScript SDK
 
-Mnemos 官方 TypeScript 客户端：记忆写入、混合检索、Agent 注册表、任务会话与任务简报、记忆简报 / 做梦、图谱 / 统计、导入导出，以及 Webhook（beta）。
+Mnemos 官方 TypeScript 客户端：记忆写入、混合检索、**分区 + 人（中立记忆服务 v5）**、Agent 注册表、任务会话与任务简报、记忆简报 / 做梦、图谱 / 统计、导入导出，以及 Webhook（beta）。
 
 - **零运行时依赖**：只用全局 `fetch`、`URL`、`AbortSignal`；
 - **Node ≥18 与浏览器通用**（依赖全局 `fetch`）；
@@ -86,8 +86,10 @@ const client = new MnemosClient({
 
 | 资源 | 方法 |
 | --- | --- |
-| `client.memories` | `add` / `search` / `list` / `get` / `update` / `delete` / `history` / `feedback` |
-| `client.agents` | `list` / `create` |
+| `client.memories` | `add` / `search` / `list` / `get` / `update` / `delete` / `history` / `feedback`；入参可带 `partition` / `personId` / `scope` / `sessionId` 走中立分区端点 |
+| `client.partitions` | `create`（org key 按 slug 幂等建分区） / `get` |
+| `client.persons` | `list` / `get` / `upsert` / `update` / `brief` / `context` / `dream` / `dreamRun`（均以 `partition` + `personRef` 定位） |
+| `client` | `personBrief(partition, personRef, input?)` / `personContext(...)` / `personDream(...)` / `personDreamRun(...)` |
 | `client.tasks` | `list` / `create` / `get` / `finish` |
 | `client.context` | `build` |
 | `client` | `graph(limit?)` / `stats()` / `health()` / `export()` / `import(doc)` / `brief(projectId, params?)` / `updateBriefSettings(projectId, maxChars)` / `dream(projectId)` / `updateDreamSettings(projectId, input)` / `runDream(projectId)` |
@@ -191,6 +193,51 @@ await client.memories.add({ text: '要落库的事实' }, { idempotencyKey: key 
 检索时的 `agentId` 是**调用方身份**：它决定能看到哪些私有记忆，但不会过滤掉其他 Agent 写入的项目共享记忆。需要看所有 Agent 私有记忆（控制台/审计）时传 `includePrivate: true`（需服务端支持）。
 `writtenByAgentId` 才是“只看某 Agent 写入”的归属过滤。
 
+## 分区 + 人（中立记忆服务 v5）
+
+v5 起记忆以「人（Person）」组织、以「分区（Partition）」隔离。TypeScript SDK 新增：
+
+- `client.partitions.create/get`：建分区（`POST /v1/partitions`，需 **org key** + `admin`）、查分区；
+- `client.persons.*`：人列表 / 详情 / 建档 / 更新 / 人的简报 / 上下文 / 人级做梦状态与触发；
+- `client.memories.*`：入参带 `partition` 时自动走 `/v1/partitions/:p/memories*`；
+  `personId` / `personExternalId` / `scope` / `sessionId` 等中立字段**必须**配合 `partition`
+  （否则 SDK 抛 `TypeError`，避免旧端点静默忽略）；
+- `get/update/delete` 通过 `options.partition` 切换分区端点（`update` 在分区端点用 `PATCH`）；
+  `history` / `feedback` 仅旧 `/v1/memories` 提供（传 `partition` 会抛 `TypeError`）。
+
+```ts
+// org key：可访问 / 创建本组织任意分区
+const client = new MnemosClient({ apiKey: process.env.MNEMOS_ORG_KEY! });
+
+const { partition, created } = await client.partitions.create({ slug: 'zhiwu-app', name: '知物感恩 App' });
+console.log(partition.id, partition.partition_id, created);
+
+// 建档 + 写该人的私有记忆 + 分区共享知识
+await client.persons.upsert(partition.slug, 'user-123', { type: 'human', displayName: '用户 123' });
+await client.memories.add({ partition: partition.slug, text: '用户 123 喜欢黑咖啡', personId: 'user-123', scope: 'person' });
+await client.memories.add({ partition: partition.slug, text: '团队约定：P1 工单 30 分钟首响', scope: 'partition' });
+
+// 按人过滤 + 人的简报 / 上下文 / 做梦
+const page = await client.persons.list(partition.slug, { type: 'human', q: 'user', sort: 'recent' });
+const person = await client.persons.get(partition.slug, 'user-123');
+const mine = await client.memories.list({ partition: partition.slug, personId: 'user-123', scope: 'person' });
+const brief = await client.personBrief(partition.slug, 'user-123', { maxChars: 400 });
+const context = await client.personContext(partition.slug, 'user-123', { query: '咖啡偏好', budgetTokens: 800 });
+console.log(person.stats?.memories, page.count, mine.count, brief.text, context.prompt);
+await client.personDreamRun(partition.slug, 'user-123'); // 该人正在做梦时返回 { run: null, status }
+```
+
+`scope` 三档（旧 `visibility` 自动映射，双方继续双写）：
+
+| `scope` | 谁能看到 | 旧 `visibility` |
+| --- | --- | --- |
+| `person` | 仅该人 | `agent` |
+| `partition`（默认） | 分区内所有调用方 | `project` |
+| `session` | 仅同一 `sessionId`（必须提供） | `task` |
+
+人级简报 = 该人 `scope=person` 记忆 + 与其相关的分区共享记忆；人级做梦只巩固该人的私有新记忆。
+分区端点 `update` 返回 `MemoryMutationResponse`（`memory` 字段为更新后的记忆）；旧端点返回 `{ message }`。
+
 ## 导入 / 导出
 
 ```ts
@@ -271,11 +318,13 @@ node --test sdk/typescript/test/*.test.ts       # 本地 mock server 测试
 ```
 
 测试使用随机端口的 `node:http` mock，覆盖鉴权头、请求体、查询参数、错误映射、幂等键、
-429 / 5xx 重试、`Retry-After`、超时、webhook 路径，以及记忆简报 / 做梦的控制台端点，共 16 个用例。
+429 / 5xx 重试、`Retry-After`、超时、webhook 路径、记忆简报 / 做梦的控制台端点，以及
+分区 / 人 / 人级简报上下文做梦 / 人级记忆的分区路由，共 21 个用例。
 
 ## 版本兼容
 
-- SDK `1.x` 对应 **Mnemos API v1**（`/v1/*`）；
+- SDK `1.x` 对应 **Mnemos API v1**（`/v1/*`）；v5 的「分区 + 人」为**向后兼容增量**，
+  旧方法签名、旧端点与旧字段保持不变；
 - 同一大版本内只做向后兼容增量（新增可选字段/方法），不会移除已有字段；
 - 服务端新增字段会被忽略，旧字段缺失时提供空值/默认值；
 - `@beta` 标注的 Webhook API 不在兼容性承诺内。
@@ -285,7 +334,7 @@ node --test sdk/typescript/test/*.test.ts       # 本地 mock server 测试
 ```
 sdk/typescript
 ├── src/index.ts     # 客户端、传输层、重试与归一化
-├── src/types.ts     # 手写类型（Memory/Agent/Task/Briefing/SearchHit/Webhook…）
+├── src/types.ts     # 手写类型（Memory/Person/Partition/Agent/Task/Briefing/SearchHit/Webhook…）
 ├── test/client.test.ts
 ├── examples/basic.ts
 ├── tsconfig.json

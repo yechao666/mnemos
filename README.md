@@ -1,14 +1,17 @@
 # Mnemos · 企业级多项目 AI 记忆基础设施
 
-> 面向 **多 Agent × 多项目** 的记忆基础设施。它的用户是 Agent，不是人：不同 Agent、或同一 Agent 在不同时间段，在同一个项目上工作时共享同一份可追溯的经验。
+> 面向 **多 Agent × 多项目** 的记忆基础设施。它的用户是 Agent，也是人：不同 Agent、或同一 Agent 在不同时间段，在同一个项目上工作时共享同一份可追溯的经验；App 的真人用户、客服、研发智能体也能以「人」为单位拥有各自的长期记忆。
 > 控制台只是人类观测、审计和调参的窗口。纯 Node 26 + SQLite + 原生 TypeScript，**零外部服务、零运行时依赖**（仅 zod 做校验），开箱即用。
 
-**Agent 原生能力**：Agent 注册表 · 任务会话（跨时间段归因）· 项目/Agent/任务三档可见性 · 任务简报（把项目经验压成可注入的 system prompt）· 任务结束自动沉淀决策与教训。详见 [`docs/agent-memory-model.md`](docs/agent-memory-model.md)。
+**v5 中立记忆服务**：记忆以 **人（Person）** 组织、以 **分区（Partition）** 隔离——服务只认「分区 + 人」两个键，不预设业务形态（App 用户、研发智能体、客服、租户都能用）。详见 [`docs/neutral-memory-model.md`](docs/neutral-memory-model.md) 与 [「中立记忆服务：分区 + 人」](#中立记忆服务分区--人v5)。
+
+**Agent 原生能力（兼容层）**：Agent 注册表 · 任务会话（跨时间段归因）· 项目/Agent/任务三档可见性 · 任务简报（把项目经验压成可注入的 system prompt）· 任务结束自动沉淀决策与教训。详见 [`docs/agent-memory-model.md`](docs/agent-memory-model.md)。
 
 ```
 组织（Org）
- └── 项目（Project）── 独立向量空间 / 词项索引 / 实体图 / 密钥 / 配额 / 审计
-      └── 记忆作用域：user_id × agent_id × run_id × app_id
+ └── 分区（Partition）—— 独立向量空间 / 词项索引 / 实体图 / 密钥 / 配额 / 审计
+      ├── 人（Person）—— human / agent / service，记忆按人归属
+      └── 记忆 scope：person（仅该人） / partition（分区共享） / session（仅本会话）
 ```
 
 ---
@@ -52,7 +55,8 @@ curl -X POST $BASE/v1/context \
 
 ## 核心能力
 
-- **Agent 原生**：Agent 注册表、任务会话、三档可见性、任务简报、结束任务自动沉淀决策/教训。
+- **中立记忆服务（v5）**：分区隔离 + 人（human/agent/service）归属，人级简报/上下文/做梦；org key 可跨分区建分区。
+- **Agent 原生（兼容层）**：Agent 注册表、任务会话、三档可见性、任务简报、结束任务自动沉淀决策/教训。
 - **记忆写入**：`infer=true` 时规则抽取事实（离线可跑），`infer=false` 原文入库；`additive` 只增不改、`consolidate` 高相似去重合并。
 - **多信号混合检索**：语义向量 + BM25 关键词 + 实体命中 + 时效性 + 重要度加权融合，返回逐信号分解。
 - **本地确定性嵌入**：CJK 感知的 char n-gram + 词特征哈希到 384 维，L2 归一化；同一文本永远得到同一向量，无需 API Key。
@@ -61,7 +65,7 @@ curl -X POST $BASE/v1/context \
 - **版本与历史**：每次变更写入 `memory_history`，记录 old/new、actor、reason。
 - **企业治理**：API Key 作用域、RBAC、限流、审计日志、用量分析（p50/p95/p99、错误率、Token）。
 - **实时控制台**：SSE 事件流（`/api/events`）、命令面板、记忆浏览器、图谱、检索演练场。
-- **演示数据**：6 个项目、233 条中文策展记忆（含 3 条做梦洞见）、15 个 Agent、6 个任务、8500+ 条用量事件与审计日志，首次启动自动 seed。
+- **演示数据**：6 个分区、256 条中文策展记忆（含 4 条做梦洞见）、15 个 Agent、21 个记忆主体（human / agent）、6 个任务、8400+ 条用量事件与审计日志，首次启动自动 seed。
 
 ---
 
@@ -136,6 +140,7 @@ score = w_semantic·cos + w_keyword·BM25' + w_entity·overlap
 | 概览 | 组织级 KPI、30 天趋势、分类构成、项目排行、审计与实时事件流 |
 | 项目 | 卡片/表格双视图、新建项目、配额与成员概览 |
 | 项目 · 概览 | 项目 KPI、健康检查、高频实体、最近记忆、接入示例 |
+| 分区 · 人 | 人列表（真人/智能体筛选、搜索、状态、记忆统计）→ 人详情（资料、记忆时间线、简报、会话、洞察、做梦） |
 | 项目 · 记忆 | 混合检索、可见性/任务筛选、批量操作、详情抽屉（历史/实体/信号分解/反馈） |
 | 项目 · Agent | Agent 注册表：角色、模型、能力、记忆足迹、最近任务、生成简报 |
 | 项目 · 任务 | 任务会话时间线、任务内记忆、结束任务沉淀决策/教训、简报预览 |
@@ -209,6 +214,136 @@ curl "$BASE/v1/stats" -H "Authorization: Bearer $KEY"
 ```
 
 完整接口、响应示例与错误码见控制台「项目 · API 文档」，以及 [`docs/api.md`](docs/api.md)。
+
+---
+
+## 中立记忆服务：分区 + 人（v5）
+
+v4 的记忆模型是「项目 × Agent × 任务」。真实业务里，同一个记忆服务往往还要服务 **App 的真人用户**：
+他们不是 Agent，也不需要登录控制台，只需要「我的偏好/我的记录只有我能看到」。v5 因此把模型收敛为两个键：
+
+| 概念 | 含义 | 存储 |
+| --- | --- | --- |
+| **分区 Partition** | 隔离边界：项目 / 应用 / 租户 / 工作区；分区之间硬隔离 | `projects`（对外叫 partition，`project_id` 列名保留） |
+| **人 Person** | 记忆主体：`human`（App 用户、员工）/ `agent`（智能体）/ `service` | `persons`（`(partition, type, external_id)` 唯一） |
+| **scope** | `person` 仅该人可见 / `partition` 分区共享 / `session` 仅本会话 | `memories.scope`（兼容旧 `visibility`） |
+
+- 记忆的 `person_id` = 这条记忆**属于谁**，`actor_person_id` = **谁写的**（可与人不同）。
+- 「人」不是登录账号：`users` / `project_members` 是控制台操作者；一个账号可管理很多「人」，
+  一个「人」也可以由后端服务（API Key）代为写入。
+- 人的上下文（`/persons/:person/context`）= 人资料 + 人的简报 + 高相关记忆 +（可选）分区共享知识 +
+  可直接注入提示词的 `prompt`；人的简报与做梦都是**人级**的。
+
+### 基准例子 1：知物感恩 App（`user_id` 即人）
+
+分区 = `zhiwu-app`，人 = App 的 `user_id`（`type=human`），默认 `scope=person`——每个用户的记忆彼此不可见。
+
+```bash
+KEY=$ORG_KEY   # org key（kind=org，admin 作用域），见下文「org key」
+BASE=http://127.0.0.1:4380
+
+# 1) 建分区（按 slug 幂等；已存在返回 created=false）
+curl -X POST $BASE/v1/partitions -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' -d '{"slug":"zhiwu-app","name":"知物感恩 App"}'
+
+# 2) 建档（lazy upsert；首次写入也可以自动建档）
+curl -X PUT $BASE/v1/partitions/zhiwu-app/persons/user-123 \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"type":"human","display_name":"用户 123"}'
+
+# 3) 写该人的私有记忆
+curl -X POST $BASE/v1/partitions/zhiwu-app/memories \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"text":"用户 123 喜欢黑咖啡，不加糖","person_id":"user-123","scope":"person","infer":false}'
+
+# 4) 只读该人的记忆 / 简报（user-456 的私有记忆不会出现）
+curl "$BASE/v1/partitions/zhiwu-app/memories?person_id=user-123&include_private=true" \
+  -H "Authorization: Bearer $KEY"
+curl "$BASE/v1/partitions/zhiwu-app/persons/user-123/brief?max_chars=400" \
+  -H "Authorization: Bearer $KEY"
+```
+
+### 基准例子 2：mnemos 代码项目的智能体 A（`agent_id` 即人）
+
+分区 = `mnemos`，人 = 开发智能体 A（`type=agent`，`external_id=agent-a`）。
+A 写的架构决策设为 `scope=partition`，智能体 B/C 也能检索；A 的私有笔记保持 `scope=person`。
+
+```bash
+# A 写一条分区共享约束（智能体 B 也能检索到）
+curl -X POST $BASE/v1/partitions/mnemos/memories \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"text":"所有数据库访问必须经过 repository 层","person_external_id":"agent-a",
+       "scope":"partition","category":"constraint","infer":false}'
+
+# B 检索分区共享知识（scope=partition）
+curl -X POST $BASE/v1/partitions/mnemos/memories/search \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"query":"repository 分层","person_id":"agent-b","scope":"partition"}'
+
+# A 的私有草稿：仅 A 可见
+curl -X POST $BASE/v1/partitions/mnemos/memories \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"text":"草稿：查询服务先读 read replica，再按 order_id 分片","person_id":"agent-a",
+       "scope":"person","infer":false}'
+
+# 人的上下文：资料 + 简报 + 相关记忆 + 可直接注入的 prompt
+curl -X POST $BASE/v1/partitions/mnemos/persons/agent-a/context \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"query":"查询服务拆分","budget_tokens":800}'
+```
+
+TypeScript SDK 覆写同一套能力：
+
+```ts
+import { MnemosClient } from '@mnemos/sdk';
+
+const client = new MnemosClient({ apiKey: process.env.MNEMOS_ORG_KEY! });
+
+const { partition } = await client.partitions.create({ slug: 'zhiwu-app', name: '知物感恩 App' });
+await client.persons.upsert(partition.slug, 'user-123', { type: 'human', displayName: '用户 123' });
+await client.memories.add({ partition: partition.slug, text: '用户 123 喜欢黑咖啡', personId: 'user-123', scope: 'person' });
+const brief = await client.personBrief(partition.slug, 'user-123');
+const context = await client.personContext(partition.slug, 'user-123', { query: '咖啡偏好' });
+console.log(brief.text, context.prompt);
+```
+
+### org key：跨分区能力
+
+| kind | 绑定 | 能力 | 用途 |
+| --- | --- | --- | --- |
+| `project`（默认） | 单个分区 | 只能访问自身分区 | 业务后端、控制台演示 |
+| `org` | 组织 | 可访问 / 创建本组织任意分区（`POST /v1/partitions`） | DSH 插件按工作区自动建分区、SaaS 多租户接入 |
+
+org key **只能由组织 owner 在控制台创建**，明文仅在创建响应出现一次：
+
+```bash
+# 登录拿会话令牌
+SESSION=$(curl -s -X POST $BASE/api/auth/login -H 'content-type: application/json' \
+  -d '{"email":"lin.wei@mnemos.dev","password":"mnemos-demo"}' | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).token')
+
+# 创建 org key（secret 仅此一次；partitionId 可选，缺省取组织最早创建的分区）
+curl -X POST $BASE/api/org/keys \
+  -H "Authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{"name":"DSH 工作区","scopes":["memories:read","memories:write","admin"]}'
+
+# 列表 / 吊销
+curl "$BASE/api/org/keys" -H "Authorization: Bearer $SESSION"
+curl -X DELETE "$BASE/api/org/keys/key_..." -H "Authorization: Bearer $SESSION"
+```
+
+- project key 调用 `POST /v1/partitions` 返回 `403`；org key 也可读写旧 `/v1/partitions/*` 下任意分区。
+- 旧 `/v1/memories`、`/v1/context` 等仍只接受 project key（org key 请走分区端点）。
+
+### API 版本与兼容
+
+- 仍是 **API v1**（`/v1/*`，snake_case），v5 只**增**字段/端点，不移除、不改既有语义；
+  旧 `/v1/memories`、`/v1/memories/search`、`/v1/context`、`/v1/agents`、`/v1/tasks` 全部保留。
+- `/v1/projects/:id/...` 是 `/v1/partitions/:id/...` 的**全量别名**，旧调用方无需改动。
+- 字段双向兼容：`user_id` → `person(type=human)`、`agent_id` → `person(type=agent)`；
+  `visibility` ↔ `scope`（project↔partition、agent↔person、task↔session）；`task_id`/`run_id` → `session_id`，旧列继续双写。
+- 响应只增字段：记忆新增 `partition_id` / `person_id` / `person_external_id` / `actor_person_id` / `scope` / `session_id`。
+- 升级已有 v4 数据：启动时自动完成幂等迁移与回填，旧数据按人建档、按可见性回填 scope。
+  映射表、人回填与合并建议、回滚步骤见 [`docs/migration-v4-v5.md`](docs/migration-v4-v5.md)。
 
 ---
 
@@ -525,7 +660,9 @@ dsh plugin --profile desktop add link:/Volumes/wd2025/devel/aiworker/mnemos/inte
 | [`docs/production-readiness.md`](docs/production-readiness.md) | 成熟度矩阵（P0/P1/P2）、SLO、容量估算、发布/回滚、故障演练、数据保留与备份策略 |
 | [`docs/security.md`](docs/security.md) | 威胁模型、控制项、密钥生命周期、事件响应清单、安全基线 |
 | [`docs/operations.md`](docs/operations.md) | 启动/预检、探针与 `/metrics`、维护任务、备份恢复、迁移升级、密钥轮换、登录锁定、日志字段、常见告警 |
-| [`docs/api.md`](docs/api.md) | `/v1` 与 `/api` 接口；在线版：`GET /openapi.json` |
+| [`docs/neutral-memory-model.md`](docs/neutral-memory-model.md) | v5 唯一契约：分区 + 人模型、存储、API、迁移与验收 |
+| [`docs/migration-v4-v5.md`](docs/migration-v4-v5.md) | v4→v5 升级步骤、数据回填、同人合并建议、回滚要点 |
+| [`docs/api.md`](docs/api.md) | `/v1` 与 `/api` 接口（第 11 节为中立 v5 面）；在线版：`GET /openapi.json` |
 | [`docs/scaling.md`](docs/scaling.md) | 存储与规模演进：Postgres/pgvector、读写分离、多副本（P1 计划，未实现） |
 
 生产运行端点：`/healthz`（存活）、`/readyz`（就绪）、`/metrics`（Prometheus）、`/openapi.json`（OpenAPI 3.1）。`/metrics` 与探针应只在内网暴露。
@@ -565,10 +702,10 @@ docker compose logs -f mnemos
 
 | mem0 | Mnemos |
 | --- | --- |
-| 单用户/单 Agent 记忆 API | 增加组织 → 项目两级多租户与 RBAC |
+| 单用户/单 Agent 记忆 API | 增加组织 → 分区两级多租户与 RBAC；分区内再以「人」组织记忆 |
 | 向量库 + 可选图存储 | 单机 SQLite：向量 + BM25 倒排 + 实体图，事务一致 |
 | 依赖 OpenAI 做抽取/嵌入 | 内置确定性离线实现，可选接入模型 |
-| 托管控制台（Cloud） | 自带控制台：记忆浏览器、图谱、演练场、密钥、用量、审计、设置 |
+| 托管控制台（Cloud） | 自带控制台：记忆浏览器、人维度、图谱、演练场、密钥（project/org）、用量、审计、设置 |
 | `add/search/get/update/delete/history` | 兼容同构 API，并返回逐信号可解释分数 |
 
 ---

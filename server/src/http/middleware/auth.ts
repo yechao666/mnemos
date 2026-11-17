@@ -295,13 +295,24 @@ function authenticateApiKeyInner(rc: RequestContext): ApiKeyAuth {
     }
   }
 
+  const isOrgKey = row.kind === 'org';
+  let org: Org | undefined;
+  if (isOrgKey) {
+    const orgId = (row.org_id ?? '').trim();
+    if (!orgId) throw errors.invalidApiKey('组织级 API Key 缺少组织绑定，请重新创建');
+    const loaded = loadOrg(app.db, orgId);
+    if (!loaded) throw errors.invalidApiKey('API Key 绑定的组织不存在');
+    org = loaded;
+  }
+
   const projectRow = app.db.prepare('SELECT * FROM projects WHERE id = ?').get(row.project_id) as unknown as
     | ProjectRow
     | undefined;
   if (!projectRow) throw errors.invalidApiKey('API Key 绑定的项目不存在');
 
   const project = toProject(projectRow);
-  if (project.status === 'archived') throw errors.forbidden('项目已归档，无法继续调用');
+  // project key 绑定单一分区，归档后整体拒绝；org key 的锚点分区只用于审计，不随其归档失效。
+  if (!isOrgKey && project.status === 'archived') throw errors.forbidden('项目已归档，无法继续调用');
 
   const lastUsedMs = row.last_used_at ? Date.parse(row.last_used_at) : 0;
   let lastUsedAt = row.last_used_at;
@@ -313,7 +324,7 @@ function authenticateApiKeyInner(rc: RequestContext): ApiKeyAuth {
   const key = toApiKey({ ...row, last_used_at: lastUsedAt });
   consumeRateLimit(rc, key.id, Math.max(1, key.rateLimitPerMin));
 
-  return { kind: 'api_key', key, project };
+  return org ? { kind: 'api_key', key, project, org } : { kind: 'api_key', key, project };
 }
 
 export function hasScope(scopes: ApiScope[], required: ApiScope): boolean {
@@ -400,4 +411,49 @@ export function visibleProjects(app: AppContext, user: User): Project[] {
           )
           .all(user.orgId, user.id) as unknown as ProjectRow[]);
   return rows.map(toProject);
+}
+
+/* ------------------------------------------------------------------ */
+/* 中立 API：分区解析（/v1/partitions/:partition）                      */
+/* ------------------------------------------------------------------ */
+
+/** 按内部 id 或组织内 slug 查找分区行。 */
+export function findPartitionRow(app: AppContext, orgId: string, ref: string): ProjectRow | null {
+  const value = typeof ref === 'string' ? ref.trim() : '';
+  if (!value) return null;
+  const byId = app.db.prepare('SELECT * FROM projects WHERE id = ?').get(value) as unknown as ProjectRow | undefined;
+  if (byId) return byId;
+  const bySlug = app.db
+    .prepare('SELECT * FROM projects WHERE org_id = ? AND slug = ?')
+    .get(orgId, value) as unknown as ProjectRow | undefined;
+  return bySlug ?? null;
+}
+
+/**
+ * API Key 视角解析分区：`:partition` 支持内部 id 或 slug。
+ *  - project key：只能命中自身分区（id 或 slug 均可，slug 命中后仍校验 id 一致）；
+ *  - org key：可命中本组织任意分区。
+ * 越权与不存在统一 404，避免探测其他组织的分区。
+ */
+export function requireApiKeyPartition(rc: RequestContext, ref: string): Project {
+  const auth = requireKeyAuth(rc);
+  if (auth.key.kind === 'org') {
+    const org = auth.org;
+    if (!org) throw errors.forbidden('组织级 API Key 缺少组织上下文，请重新创建');
+    const row = findPartitionRow(rc.app, org.id, ref);
+    if (!row || row.org_id !== org.id) throw errors.notFound('分区不存在');
+    return toProject(row);
+  }
+  const row = findPartitionRow(rc.app, auth.project.orgId, ref);
+  if (!row || row.id !== auth.project.id) throw errors.notFound('分区不存在');
+  return toProject(row);
+}
+
+/** 要求 org 级 API Key（如创建分区）；project key 会得到 403。 */
+export function requireOrgKey(rc: RequestContext): ApiKeyAuth {
+  const auth = requireKeyAuth(rc);
+  if (auth.key.kind !== 'org') {
+    throw errors.forbidden('该操作需要组织级 API Key（kind=org），project key 只能操作自身分区');
+  }
+  return auth;
 }

@@ -148,6 +148,15 @@ const memorySchema = objectSchema(
     appId: { type: ['string', 'null'] },
     taskId: { type: ['string', 'null'] },
     visibility: { type: 'string', enum: ['project', 'agent', 'task'] },
+    /** 记忆主体（人，内部 id）；为空表示分区共享知识 */
+    personId: { type: ['string', 'null'] },
+    /** 写入者（人，内部 id） */
+    actorPersonId: { type: ['string', 'null'] },
+    /** 人的 external_id（App user_id / Agent id） */
+    personExternalId: { type: ['string', 'null'] },
+    /** 会话（task_id / run_id 的泛化） */
+    sessionId: { type: ['string', 'null'] },
+    scope: { type: 'string', enum: ['person', 'partition', 'session'] },
     content: { type: 'string' },
     category: { type: 'string', enum: CATEGORIES },
     importance: { type: 'number', minimum: 0, maximum: 1 },
@@ -323,6 +332,8 @@ const memoryBriefItemSchema = objectSchema(
 const memoryBriefSchema = objectSchema(
   {
     projectId: { type: 'string' },
+    /** 人级简报时带上该人的内部 id */
+    personId: { type: ['string', 'null'] },
     text: { type: 'string', description: '简报正文；暂无可用记忆时为空串' },
     maxChars: { type: 'integer', minimum: 100, maximum: 5000 },
     count: { type: 'integer', minimum: 0 },
@@ -338,6 +349,8 @@ const memoryDreamRunSchema = objectSchema(
   {
     id: { type: 'string' },
     projectId: { type: 'string' },
+    /** 人级做梦时的归属人（内部 id）；分区级为空 */
+    personId: { type: ['string', 'null'] },
     trigger: { type: 'string', enum: ['schedule', 'manual'] },
     status: { type: 'string', enum: ['running', 'completed', 'skipped', 'failed'] },
     inputCount: { type: 'integer', minimum: 0 },
@@ -361,6 +374,8 @@ const memoryDreamSettingsSchema = objectSchema(
 
 const memoryDreamStatusSchema = objectSchema(
   {
+    /** 人级状态时带上该人的内部 id；分区级为空 */
+    personId: { type: ['string', 'null'] },
     settings: ref('MemoryDreamSettings'),
     pendingCount: { type: 'integer', minimum: 0, description: '尚未复盘总结的活跃记忆数' },
     lastRun: { anyOf: [ref('MemoryDreamRun'), { type: 'null' }] },
@@ -369,9 +384,97 @@ const memoryDreamStatusSchema = objectSchema(
   ['settings', 'pendingCount', 'runs'],
 );
 
+const memoryScopeSchema: JsonObject = {
+  type: 'string',
+  enum: ['person', 'partition', 'session'],
+  description: '可见范围：person=仅该人；partition=分区共享；session=仅当前会话',
+};
+
+const personStatsSchema = objectSchema(
+  {
+    memories: { type: 'integer', minimum: 0 },
+    sharedMemories: { type: 'integer', minimum: 0 },
+    sessions: { type: 'integer', minimum: 0 },
+    lastMemoryAt: { type: ['string', 'null'], format: 'date-time' },
+  },
+  ['memories', 'sharedMemories', 'sessions'],
+);
+
+const personSchema = objectSchema(
+  {
+    id: { type: 'string' },
+    partitionId: { type: 'string', description: '分区 id（存储上沿用 projects.id）' },
+    externalId: { type: 'string', description: '调用方定义的人 ID（App user_id / Agent id）' },
+    type: { type: 'string', enum: ['human', 'agent', 'service', 'other'] },
+    displayName: { type: 'string' },
+    attributes: { type: 'object', additionalProperties: true },
+    status: { type: 'string', enum: ['active', 'archived', 'deleted'] },
+    firstSeenAt: { type: 'string', format: 'date-time' },
+    lastSeenAt: { type: 'string', format: 'date-time' },
+    createdAt: { type: 'string', format: 'date-time' },
+    updatedAt: { type: 'string', format: 'date-time' },
+    stats: ref('PersonStats'),
+  },
+  ['id', 'partitionId', 'externalId', 'type', 'displayName', 'attributes', 'status', 'createdAt', 'updatedAt'],
+);
+
+const personInputSchema = objectSchema(
+  {
+    externalId: { type: 'string', description: '调用方定义的人 ID；路径里已给出时可不传' },
+    type: { type: 'string', enum: ['human', 'agent', 'service', 'other'], description: '缺省 human' },
+    displayName: { type: 'string' },
+    attributes: { type: 'object', additionalProperties: true },
+    status: { type: 'string', enum: ['active', 'archived', 'deleted'] },
+  },
+  ['externalId'],
+);
+
+const partitionSchema = objectSchema(
+  {
+    id: { type: 'string' },
+    orgId: { type: 'string' },
+    slug: { type: 'string' },
+    name: { type: 'string' },
+    description: { type: 'string' },
+    status: { type: 'string' },
+    region: { type: 'string' },
+    env: { type: 'string' },
+    createdAt: { type: 'string', format: 'date-time' },
+    updatedAt: { type: 'string', format: 'date-time' },
+    archivedAt: { type: ['string', 'null'], format: 'date-time' },
+  },
+  ['id', 'orgId', 'slug', 'name', 'description', 'status', 'region', 'env', 'createdAt', 'updatedAt'],
+);
+
+const personContextSchema = objectSchema(
+  {
+    person: ref('Person'),
+    brief: ref('MemoryBrief'),
+    memories: arrayOf(ref('Memory'), { description: '与 query 最相关、且属于该人的记忆' }),
+    shared: arrayOf(ref('Memory'), { description: '分区共享知识（scope=partition）' }),
+    prompt: { type: 'string', description: '可直接注入提示词的 Markdown' },
+    tokenEstimate: { type: 'integer', minimum: 0 },
+    citations: arrayOf({ type: 'string' }),
+    builtAt: { type: 'string', format: 'date-time' },
+  },
+  ['person', 'brief', 'memories', 'shared', 'prompt', 'tokenEstimate', 'citations', 'builtAt'],
+);
+
+const PARTITION_PARAM = parameter('partition', 'path', { type: 'string' }, '分区 id 或 slug');
+const PERSON_REF_PARAM = parameter(
+  'person',
+  'path',
+  { type: 'string' },
+  '人的内部 id（prs_xxx）或 external_id；external_id 命中 human/agent 多类型时需用内部 id',
+);
+
 const apiKeySchema = objectSchema(
   {
     id: { type: 'string' },
+    /** project=只属于该分区；org=组织级，可访问/创建本组织任意分区 */
+    kind: { type: 'string', enum: ['project', 'org'] },
+    /** org key 所属组织 */
+    orgId: { type: ['string', 'null'] },
     projectId: { type: 'string' },
     name: { type: 'string' },
     prefix: { type: 'string' },
@@ -567,6 +670,79 @@ const importResultSchema = objectSchema(
 );
 
 const importResponse = jsonResponse('导入结果', importResultSchema);
+
+const partitionPersonBodySchema = objectSchema({
+  type: { type: 'string', enum: ['human', 'agent', 'service', 'other'] },
+  display_name: { type: 'string', maxLength: 120 },
+  attributes: { type: 'object', additionalProperties: true },
+  status: { type: 'string', enum: ['active', 'archived', 'deleted'] },
+});
+
+const partitionMemoryAddBodySchema = objectSchema(
+  {
+    messages: arrayOf(
+      objectSchema(
+        {
+          role: { type: 'string', enum: ['user', 'assistant', 'system', 'tool'] },
+          content: { type: 'string' },
+          name: { type: 'string' },
+        },
+        ['role', 'content'],
+      ),
+      { minItems: 1, maxItems: 50 },
+    ),
+    text: { type: 'string', maxLength: 20_000 },
+    person_id: { type: 'string', description: '内部 id 或 external id（与 person_external_id 二选一）' },
+    person_external_id: { type: 'string' },
+    actor_person_id: { type: 'string', description: '写入者（默认同 person）' },
+    scope: ref('MemoryScope'),
+    session_id: { type: 'string', description: 'scope=session 时必须提供' },
+    category: { type: 'string', enum: CATEGORIES, description: '显式分类时默认 infer=false（原文入库）' },
+    tags: arrayOf({ type: 'string' }, { maxItems: 20 }),
+    metadata: { type: 'object', additionalProperties: true },
+    infer: { type: 'boolean', description: 'true=事实抽取；缺省时给 category 则按原文入库' },
+    mode: { type: 'string', enum: ['additive', 'consolidate'] },
+    user_id: { type: 'string', description: '旧字段：映射为 human 人' },
+    agent_id: { type: 'string', description: '旧字段：映射为 agent 人' },
+    run_id: { type: 'string' },
+    app_id: { type: 'string' },
+    task_id: { type: 'string' },
+    visibility: { type: 'string', enum: ['project', 'agent', 'task'], description: '旧字段：映射为 scope' },
+  },
+  ['messages'],
+);
+
+const partitionMemorySearchBodySchema = objectSchema(
+  {
+    query: { type: 'string', maxLength: 2000 },
+    person_id: { type: 'string' },
+    scope: ref('MemoryScope'),
+    category: { type: 'string', enum: CATEGORIES },
+    top_k: { type: 'integer', minimum: 1, maximum: 100 },
+    threshold: { type: 'number', minimum: 0, maximum: 1 },
+    include_private: { type: 'boolean', description: 'false（默认）=分区共享 + 本人私有' },
+  },
+  ['query'],
+);
+
+const partitionMemoryPatchBodySchema = objectSchema({
+  content: { type: 'string', maxLength: 20_000 },
+  category: { type: 'string', enum: CATEGORIES },
+  importance: { type: 'number', minimum: 0, maximum: 1 },
+  status: { type: 'string', enum: ['active', 'archived', 'deleted'] },
+  tags: arrayOf({ type: 'string' }, { maxItems: 20 }),
+  metadata: { type: 'object', additionalProperties: true },
+  expires_at: { type: ['string', 'null'], format: 'date-time' },
+});
+
+const partitionUpsertResponse = jsonResponse(
+  '分区（created=true 表示本次新建，false 表示按 slug 复用已有分区）',
+  objectSchema({ partition: ref('Partition'), created: { type: 'boolean' } }, ['partition', 'created']),
+);
+
+const personSingleResponse = (description: string): JsonObject =>
+  jsonResponse(description, objectSchema({ person: ref('Person') }, ['person']));
+
 
 /* ------------------------------------------------------------------ */
 /* 文档                                                                */
@@ -986,6 +1162,274 @@ export function buildOpenApiDocument(app: AppContext): Record<string, unknown> {
       }),
     },
 
+    /* -------------------------- v1 中立面（分区 / 人） --------------------- */
+    '/v1/partitions': {
+      post: operation({
+        summary: '创建分区 / 按 slug 幂等复用（org key + admin）',
+        description:
+          '中立服务的入口：插件按工作区 slug 首次调用即建分区。同一组织内 slug 已存在时返回该分区（created=false）；project key 不可调用。',
+        tags: ['Partitions'],
+        operationId: 'upsertPartition',
+        security: API_KEY_SECURITY,
+        requestBody: jsonBody(
+          objectSchema(
+            {
+              slug: { type: 'string', pattern: '^[a-z0-9][a-z0-9-]{0,47}$' },
+              name: { type: 'string', maxLength: 80 },
+              description: { type: 'string', maxLength: 500 },
+              region: { type: 'string', maxLength: 64 },
+              env: { type: 'string', enum: ['production', 'staging', 'sandbox'] },
+            },
+            ['slug'],
+          ),
+        ),
+        responses: withErrors({ 201: partitionUpsertResponse, 200: partitionUpsertResponse }),
+      }),
+    },
+    '/v1/partitions/{partition}': {
+      get: operation({
+        summary: '分区信息（id 或 slug；不含敏感设置）',
+        tags: ['Partitions'],
+        operationId: 'getPartition',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM],
+        responses: withErrors({
+          200: jsonResponse('分区信息', objectSchema({ partition: ref('Partition') }, ['partition'])),
+        }),
+      }),
+    },
+    '/v1/partitions/{partition}/persons': {
+      get: operation({
+        summary: '人列表（type / status / q / 分页 / 排序）',
+        tags: ['Persons'],
+        operationId: 'listPersonsV1',
+        security: API_KEY_SECURITY,
+        parameters: [
+          PARTITION_PARAM,
+          parameter('type', 'query', { type: 'string', enum: ['human', 'agent', 'service', 'other'] }),
+          parameter('status', 'query', { type: 'string', enum: ['active', 'archived', 'deleted'] }),
+          parameter('q', 'query', { type: 'string' }),
+          parameter('sort', 'query', { type: 'string', enum: ['recent', 'name', 'memories'] }),
+          parameter('page', 'query', { type: 'integer', minimum: 1, default: 1 }),
+          parameter('page_size', 'query', { type: 'integer', minimum: 1, maximum: 100, default: 20 }),
+        ],
+        responses: withErrors({
+          200: jsonResponse(
+            '分页人列表（stats 含 memories / shared_memories / sessions / last_memory_at）',
+            objectSchema(
+              {
+                results: arrayOf(ref('Person')),
+                count: { type: 'integer', minimum: 0 },
+                page: { type: 'integer', minimum: 1 },
+                page_size: { type: 'integer', minimum: 1 },
+                total_pages: { type: 'integer', minimum: 1 },
+              },
+              ['results', 'count', 'page', 'page_size'],
+            ),
+          ),
+        }),
+      }),
+    },
+    '/v1/partitions/{partition}/persons/{person}': {
+      get: operation({
+        summary: '人详情 + 统计（内部 id 或 external_id）',
+        tags: ['Persons'],
+        operationId: 'getPersonV1',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, PERSON_REF_PARAM],
+        responses: withErrors({ 200: personSingleResponse('人详情') }),
+      }),
+      put: operation({
+        summary: '建人 / 按 externalId 幂等 upsert',
+        description:
+          '路径参数即人的 external_id。type 缺省 human；agent 主体请显式传 type=agent。',
+        tags: ['Persons'],
+        operationId: 'upsertPersonV1',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, PERSON_REF_PARAM],
+        requestBody: jsonBody(partitionPersonBodySchema, false),
+        responses: withErrors({ 200: personSingleResponse('upsert 后的人') }),
+      }),
+      patch: operation({
+        summary: '更新人的展示名 / attributes / status',
+        tags: ['Persons'],
+        operationId: 'updatePersonV1',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, PERSON_REF_PARAM],
+        requestBody: jsonBody(
+          objectSchema({
+            display_name: { type: 'string', maxLength: 120 },
+            attributes: { type: 'object', additionalProperties: true },
+            status: { type: 'string', enum: ['active', 'archived', 'deleted'] },
+          }),
+        ),
+        responses: withErrors({ 200: personSingleResponse('更新后的人') }),
+      }),
+    },
+    '/v1/partitions/{partition}/persons/{person}/brief': {
+      get: operation({
+        summary: '人的记忆简报（person 记忆 + 相关分区共享记忆）',
+        tags: ['Persons'],
+        operationId: 'getPersonBriefV1',
+        security: API_KEY_SECURITY,
+        parameters: [
+          PARTITION_PARAM,
+          PERSON_REF_PARAM,
+          parameter('force', 'query', { type: 'boolean' }, '忽略缓存重新生成'),
+          parameter('max_chars', 'query', { type: 'integer', minimum: 100, maximum: 5000 }),
+        ],
+        responses: withErrors({ 200: jsonResponse('人的简报', ref('MemoryBrief')) }),
+      }),
+    },
+    '/v1/partitions/{partition}/persons/{person}/context': {
+      post: operation({
+        summary: '人的上下文（资料 + 简报 + 高相关记忆 + 可选分区共享，含可注入 prompt）',
+        tags: ['Persons'],
+        operationId: 'getPersonContextV1',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, PERSON_REF_PARAM],
+        requestBody: jsonBody(
+          objectSchema({
+            query: { type: 'string', maxLength: 2000 },
+            budget_tokens: { type: 'integer', minimum: 60, maximum: 32000 },
+            include_partition: { type: 'boolean', description: '是否带上分区共享知识（默认 true）' },
+          }),
+          false,
+        ),
+        responses: withErrors({ 200: jsonResponse('人的上下文', ref('PersonContext')) }),
+      }),
+    },
+    '/v1/partitions/{partition}/persons/{person}/dream': {
+      get: operation({
+        summary: '人级复盘总结状态（pending 只算该人 scope=person 记忆）',
+        tags: ['Memory Insights'],
+        operationId: 'getPersonDreamStatusV1',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, PERSON_REF_PARAM],
+        responses: withErrors({ 200: jsonResponse('人级复盘总结状态', ref('MemoryDreamStatus')) }),
+      }),
+    },
+    '/v1/partitions/{partition}/persons/{person}/dream/run': {
+      post: operation({
+        summary: '立即为该人执行一次复盘总结',
+        description: '该人正在总结时返回 409 CONFLICT；成功返回运行记录与最新状态。',
+        tags: ['Memory Insights'],
+        operationId: 'runPersonDreamV1',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, PERSON_REF_PARAM],
+        responses: withErrors({
+          200: jsonResponse(
+            '复盘总结结果',
+            objectSchema({ run: ref('MemoryDreamRun'), status: ref('MemoryDreamStatus') }, ['run', 'status']),
+          ),
+        }),
+      }),
+    },
+    '/v1/partitions/{partition}/memories': {
+      post: operation({
+        summary: '写记忆（person + scope + session）',
+        description:
+          '首次写入自动建人（personAutoCreate=true 时）。scope 缺省取分区设置 defaultScope；scope=session 必须带 session_id；scope=person 必须给 person。',
+        tags: ['Memories'],
+        operationId: 'createPartitionMemory',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, IDEMPOTENCY_PARAM],
+        requestBody: jsonBody(partitionMemoryAddBodySchema),
+        responses: withErrors({ 200: memoryWriteResponse }),
+      }),
+      get: operation({
+        summary: '记忆列表（person / scope / category / q / 分页）',
+        tags: ['Memories'],
+        operationId: 'listPartitionMemories',
+        security: API_KEY_SECURITY,
+        parameters: [
+          PARTITION_PARAM,
+          parameter('person_id', 'query', { type: 'string' }, '人的内部 id 或 external_id'),
+          parameter('scope', 'query', ref('MemoryScope')),
+          parameter('category', 'query', { type: 'string', enum: CATEGORIES }),
+          parameter('status', 'query', { type: 'string', enum: ['active', 'archived', 'deleted'] }),
+          parameter('q', 'query', { type: 'string' }),
+          parameter('include_private', 'query', { type: 'boolean' }, '默认 false（调用方视角）'),
+          parameter('page', 'query', { type: 'integer', minimum: 1, default: 1 }),
+          parameter('page_size', 'query', { type: 'integer', minimum: 1, maximum: 100, default: 20 }),
+        ],
+        responses: withErrors({ 200: memoryListResponse }),
+      }),
+    },
+    '/v1/partitions/{partition}/memories/search': {
+      post: operation({
+        summary: '记忆检索（person / scope 过滤）',
+        tags: ['Memories'],
+        operationId: 'searchPartitionMemories',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM],
+        requestBody: jsonBody(partitionMemorySearchBodySchema),
+        responses: withErrors({ 200: searchResponse }),
+      }),
+    },
+    '/v1/partitions/{partition}/memories/{id}': {
+      get: operation({
+        summary: '记忆详情（含历史、实体与关系）',
+        tags: ['Memories'],
+        operationId: 'getPartitionMemory',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, ID_PARAM],
+        responses: withErrors({ 200: jsonResponse('记忆详情', ref('Memory')) }),
+      }),
+      patch: operation({
+        summary: '更新记忆正文 / 分类 / 状态 / 标签等',
+        tags: ['Memories'],
+        operationId: 'updatePartitionMemory',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, ID_PARAM],
+        requestBody: jsonBody(partitionMemoryPatchBodySchema),
+        responses: withErrors({ 200: jsonResponse('更新后的记忆', ref('Memory')) }),
+      }),
+      delete: operation({
+        summary: '删除记忆（软删除）',
+        tags: ['Memories'],
+        operationId: 'deletePartitionMemory',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM, ID_PARAM],
+        responses: withErrors({
+          200: jsonResponse('删除结果', objectSchema({ ok: { type: 'boolean' }, message: { type: 'string' } }, ['ok'])),
+        }),
+      }),
+    },
+    '/v1/partitions/{partition}/dream': {
+      get: operation({
+        summary: '分区级复盘总结状态',
+        tags: ['Memory Insights'],
+        operationId: 'getPartitionDreamStatus',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM],
+        responses: withErrors({ 200: jsonResponse('分区级复盘总结状态', ref('MemoryDreamStatus')) }),
+      }),
+    },
+    '/v1/partitions/{partition}/dream/run': {
+      post: operation({
+        summary: '触发分区级 / 指定人的复盘总结',
+        description: 'body 可选 person_id 指定人；缺省为分区级。分区正在总结时返回 409 CONFLICT。',
+        tags: ['Memory Insights'],
+        operationId: 'runPartitionDream',
+        security: API_KEY_SECURITY,
+        parameters: [PARTITION_PARAM],
+        requestBody: jsonBody(
+          objectSchema({
+            person_id: { type: 'string' },
+            batch_size: { type: 'integer', minimum: 1, maximum: 200 },
+          }),
+          false,
+        ),
+        responses: withErrors({
+          200: jsonResponse(
+            '复盘总结结果',
+            objectSchema({ run: ref('MemoryDreamRun'), status: ref('MemoryDreamStatus') }, ['run', 'status']),
+          ),
+        }),
+      }),
+    },
+
     /* -------------------------- v1 export / import ------------------------ */
     '/v1/export': {
       get: operation({
@@ -1388,6 +1832,213 @@ export function buildOpenApiDocument(app: AppContext): Record<string, unknown> {
         }),
       }),
     },
+
+    '/api/partitions': {
+      post: operation({
+        summary: '创建分区（developer+；与 POST /api/projects 等价）',
+        description: '控制台术语从「项目」迁到「分区」：分区可以是项目 / 应用 / 租户 / 工作区。',
+        tags: ['Partitions'],
+        operationId: 'createPartitionConsole',
+        security: SESSION_SECURITY,
+        requestBody: jsonBody(
+          objectSchema(
+            {
+              name: { type: 'string', maxLength: 80 },
+              slug: { type: 'string', maxLength: 48 },
+              description: { type: 'string', maxLength: 500 },
+              region: { type: 'string', maxLength: 64 },
+              env: { type: 'string', enum: ['production', 'staging', 'sandbox'] },
+            },
+            ['name'],
+          ),
+        ),
+        responses: withErrors({
+          201: jsonResponse(
+            '新分区（ProjectSummary）',
+            objectSchema({ id: { type: 'string' }, slug: { type: 'string' }, name: { type: 'string' } }, [
+              'id',
+              'slug',
+              'name',
+            ]),
+          ),
+        }),
+      }),
+    },
+
+    /* ---------------------------- /api 人（Person） ----------------------- */
+    '/api/projects/{id}/persons': {
+      get: operation({
+        summary: '人列表（viewer+；type / status / q / 分页 / 排序）',
+        description: 'stats 含 memories / sharedMemories / sessions / lastMemoryAt。',
+        tags: ['Persons'],
+        operationId: 'listPersons',
+        security: SESSION_SECURITY,
+        parameters: [
+          ID_PARAM,
+          parameter('type', 'query', { type: 'string', enum: ['human', 'agent', 'service', 'other'] }),
+          parameter('status', 'query', { type: 'string', enum: ['active', 'archived', 'deleted'] }),
+          parameter('q', 'query', { type: 'string' }),
+          parameter('sort', 'query', { type: 'string', enum: ['recent', 'name', 'memories'] }),
+          parameter('page', 'query', { type: 'integer', minimum: 1, default: 1 }),
+          parameter('pageSize', 'query', { type: 'integer', minimum: 1, maximum: 100, default: 20 }),
+        ],
+        responses: withErrors({
+          200: jsonResponse(
+            '分页人列表',
+            objectSchema(
+              {
+                items: arrayOf(ref('Person')),
+                page: { type: 'integer', minimum: 1 },
+                pageSize: { type: 'integer', minimum: 1 },
+                total: { type: 'integer', minimum: 0 },
+                totalPages: { type: 'integer', minimum: 1 },
+              },
+              ['items', 'page', 'pageSize', 'total', 'totalPages'],
+            ),
+          ),
+        }),
+      }),
+    },
+    '/api/projects/{id}/persons/{personRef}': {
+      get: operation({
+        summary: '人详情 + 统计（viewer+）',
+        tags: ['Persons'],
+        operationId: 'getPerson',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM, PERSON_REF_PARAM],
+        responses: withErrors({ 200: jsonResponse('人详情', ref('Person')) }),
+      }),
+      put: operation({
+        summary: '建人 / 按 externalId 幂等 upsert（admin+）',
+        description: '路径参数即人的 external_id，请求体中的 externalId 必须与之一致（或省略）。',
+        tags: ['Persons'],
+        operationId: 'upsertPerson',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM, PERSON_REF_PARAM],
+        requestBody: jsonBody(ref('PersonInput')),
+        responses: withErrors({ 200: jsonResponse('upsert 后的人', ref('Person')) }),
+      }),
+      patch: operation({
+        summary: '更新人的展示名 / attributes / status（admin+）',
+        tags: ['Persons'],
+        operationId: 'updatePerson',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM, PERSON_REF_PARAM],
+        requestBody: jsonBody(
+          objectSchema({
+            displayName: { type: 'string', maxLength: 120 },
+            attributes: { type: 'object', additionalProperties: true },
+            status: { type: 'string', enum: ['active', 'archived', 'deleted'] },
+          }),
+        ),
+        responses: withErrors({ 200: jsonResponse('更新后的人', ref('Person')) }),
+      }),
+    },
+    '/api/projects/{id}/persons/{personRef}/brief': {
+      get: operation({
+        summary: '人的记忆简报（viewer+）',
+        tags: ['Persons'],
+        operationId: 'getPersonBrief',
+        security: SESSION_SECURITY,
+        parameters: [
+          ID_PARAM,
+          PERSON_REF_PARAM,
+          parameter('force', 'query', { type: 'boolean' }, '忽略缓存重新生成'),
+          parameter('maxChars', 'query', { type: 'integer', minimum: 100, maximum: 5000 }),
+        ],
+        responses: withErrors({ 200: jsonResponse('人的简报', ref('MemoryBrief')) }),
+      }),
+    },
+    '/api/projects/{id}/persons/{personRef}/context': {
+      post: operation({
+        summary: '人的上下文（viewer+；资料 + 简报 + 高相关记忆 + 可选分区共享）',
+        tags: ['Persons'],
+        operationId: 'getPersonContext',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM, PERSON_REF_PARAM],
+        requestBody: jsonBody(
+          objectSchema({
+            query: { type: 'string', maxLength: 2000 },
+            budgetTokens: { type: 'integer', minimum: 60, maximum: 32000 },
+            includePartition: { type: 'boolean' },
+          }),
+          false,
+        ),
+        responses: withErrors({ 200: jsonResponse('人的上下文', ref('PersonContext')) }),
+      }),
+    },
+    '/api/projects/{id}/persons/{personRef}/dream': {
+      get: operation({
+        summary: '人级复盘总结状态（viewer+；pending 只算该人 scope=person 记忆）',
+        tags: ['Memory Insights'],
+        operationId: 'getPersonDreamStatus',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM, PERSON_REF_PARAM],
+        responses: withErrors({ 200: jsonResponse('人级复盘总结状态', ref('MemoryDreamStatus')) }),
+      }),
+    },
+    '/api/projects/{id}/persons/{personRef}/dream/run': {
+      post: operation({
+        summary: '立即为该人执行一次复盘总结（admin+）',
+        description: '该人正在总结时返回 409 CONFLICT；成功返回运行记录与最新状态。',
+        tags: ['Memory Insights'],
+        operationId: 'runPersonDream',
+        security: SESSION_SECURITY,
+        parameters: [ID_PARAM, PERSON_REF_PARAM],
+        responses: withErrors({
+          200: jsonResponse(
+            '复盘总结结果',
+            objectSchema({ run: ref('MemoryDreamRun'), status: ref('MemoryDreamStatus') }, ['run', 'status']),
+          ),
+        }),
+      }),
+    },
+
+    /* ---------------------------- /api 组织级密钥 ------------------------- */
+    '/api/org/keys': {
+      get: operation({
+        summary: '组织级 API Key 列表（仅 org owner）',
+        description: 'kind=org，可访问/创建本组织任意分区；明文 secret 只在创建响应中出现一次。',
+        tags: ['Keys'],
+        operationId: 'listOrgApiKeys',
+        security: SESSION_SECURITY,
+        responses: withErrors({ 200: jsonResponse('组织级密钥列表', arrayOf(ref('ApiKey'))) }),
+      }),
+      post: operation({
+        summary: '创建组织级 API Key（仅 org owner）',
+        description:
+          '锚点分区（partitionId 可选，缺省取组织最早创建的分区）仅用于审计与用量兜底；访问哪个分区由 /v1/partitions/:partition 决定。建议 scopes 含 admin 以便插件自动建分区。',
+        tags: ['Keys'],
+        operationId: 'createOrgApiKey',
+        security: SESSION_SECURITY,
+        requestBody: jsonBody(
+          objectSchema(
+            {
+              name: { type: 'string', maxLength: 80 },
+              scopes: arrayOf({ type: 'string', enum: SCOPES }, { minItems: 1, maxItems: 4 }),
+              partitionId: { type: 'string', description: '锚点分区 id（可选）' },
+              rateLimitPerMin: { type: 'integer', minimum: 1, maximum: 100000 },
+              expiresAt: { type: 'string', format: 'date-time', description: '必须是未来时间' },
+              allowedIps: arrayOf({ type: 'string', description: '精确 IPv4 或 CIDR' }, { maxItems: 20 }),
+            },
+            ['name', 'scopes'],
+          ),
+        ),
+        responses: withErrors({ 201: jsonResponse('新组织级密钥（含明文）', ref('ApiKeyWithSecret')) }),
+      }),
+    },
+    '/api/org/keys/{keyId}': {
+      delete: operation({
+        summary: '吊销组织级 API Key（仅 org owner）',
+        tags: ['Keys'],
+        operationId: 'revokeOrgApiKey',
+        security: SESSION_SECURITY,
+        parameters: [KEY_ID_PARAM],
+        responses: withErrors({
+          200: jsonResponse('吊销结果', objectSchema({ ok: { type: 'boolean' } }, ['ok'])),
+        }),
+      }),
+    },
   };
 
   const schemas: Record<string, JsonObject> = {
@@ -1406,6 +2057,12 @@ export function buildOpenApiDocument(app: AppContext): Record<string, unknown> {
     Error: errorSchema,
     ApiKey: apiKeySchema,
     ApiKeyWithSecret: apiKeyWithSecretSchema,
+    Person: personSchema,
+    PersonStats: personStatsSchema,
+    PersonInput: personInputSchema,
+    PersonContext: personContextSchema,
+    Partition: partitionSchema,
+    MemoryScope: memoryScopeSchema,
     Org: orgSchema,
     User: userSchema,
     OrgUser: orgUserSchema,
@@ -1446,7 +2103,9 @@ export function buildOpenApiDocument(app: AppContext): Record<string, unknown> {
       { name: 'Auth', description: '控制台登录与会话' },
       { name: 'Ops', description: '生产运维（维护、备份、状态）' },
       { name: 'Org', description: '组织成员管理' },
-      { name: 'Keys', description: 'API Key 生命周期' },
+      { name: 'Keys', description: 'API Key 生命周期（project / org）' },
+      { name: 'Partitions', description: '分区（项目/应用/租户隔离边界）' },
+      { name: 'Persons', description: '人（记忆主体）：真人 / 智能体 / 服务' },
     ],
     paths,
     components: { securitySchemes, schemas },

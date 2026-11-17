@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import type { MemoryBrief } from '@shared';
 import {
   Badge,
@@ -22,6 +22,12 @@ export interface MemoryBriefCardProps {
   canManage: boolean;
   onRefresh: () => void;
   onOpenSettings: () => void;
+  /** 卡片标题：分区级默认「记忆简报」，人详情传「人的记忆简报」 */
+  title?: string;
+  /** 标题下的说明文案 */
+  desc?: string;
+  /** 标题行额外徽标（例如人级上下文提示） */
+  extraBadges?: ReactNode;
 }
 
 /**
@@ -35,6 +41,9 @@ export function MemoryBriefCard({
   canManage,
   onRefresh,
   onOpenSettings,
+  title = '记忆简报',
+  desc = '只取最近活跃记忆与洞见，Agent 接入时可直接注入。',
+  extraBadges,
 }: MemoryBriefCardProps) {
   const [expanded, setExpanded] = useState(false);
   const model = briefModelMeta(brief);
@@ -50,7 +59,7 @@ export function MemoryBriefCard({
           </span>
           <div style={{ minWidth: 0 }}>
             <div className="hstack gap-6 wrap">
-              <strong>记忆简报</strong>
+              <strong>{title}</strong>
               <Badge size="sm" tone="violet" dot>
                 最近记忆
               </Badge>
@@ -62,10 +71,9 @@ export function MemoryBriefCard({
                   缓存
                 </Badge>
               ) : null}
+              {extraBadges}
             </div>
-            <div className="tiny dim mt-4">
-              只取最近活跃记忆与洞见，Agent 接入时可直接注入。
-            </div>
+            <div className="tiny dim mt-4">{desc}</div>
           </div>
         </div>
         {canManage ? (

@@ -113,73 +113,84 @@ export function registerProjectRoutes(router: Router): void {
     },
   });
 
+  /** 创建项目/分区：控制台两个入口（旧「项目」与新「分区」）共用同一实现。 */
+  async function createProject(rc: RequestContext): Promise<void> {
+    const auth = requireConsoleAuth(rc);
+    if (ROLE_RANK[auth.user.role] < ROLE_RANK.developer) {
+      throw errors.forbidden('创建项目需要 developer 及以上角色');
+    }
+    const input = await rc.body(createProjectSchema);
+    const id = newId('prj');
+    const now = nowIso();
+    const slug = uniqueSlug(rc.app.db, auth.user.orgId, input.slug ?? slugify(input.name));
+    const settings = mergeSettings({ ...DEFAULT_PROJECT_SETTINGS }, input.settings);
+    const region = input.region?.trim() || 'cn-shanghai';
+    const env = input.env ?? 'production';
+
+    // 项目 + 创建者成员关系在同一事务中写入。
+    tx(rc.app.db, () => {
+      rc.app.db
+        .prepare(
+          `INSERT INTO projects
+             (id, org_id, slug, name, description, status, region, env, settings, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          auth.user.orgId,
+          slug,
+          input.name,
+          input.description ?? '',
+          region,
+          env,
+          JSON.stringify(settings),
+          now,
+          now,
+        );
+
+      // 创建者自动成为项目管理员（org owner/admin 本身即全项目可见，这里是 developer 创建后的兜底授权）。
+      rc.app.db
+        .prepare(
+          `INSERT INTO project_members (project_id, user_id, role, created_at)
+           VALUES (?, ?, 'admin', ?)
+           ON CONFLICT(project_id, user_id) DO UPDATE SET role = excluded.role`,
+        )
+        .run(id, auth.user.id, now);
+    });
+
+    const project = reloadProject(rc.app.db, id);
+    writeAudit(rc.app.db, {
+      orgId: project.orgId,
+      projectId: project.id,
+      actor: actorForUser(rc, auth.user),
+      action: 'project.create',
+      resourceType: 'project',
+      resourceId: project.id,
+      detail: { name: project.name, slug: project.slug, region, env },
+    });
+    publishLive(rc.app, {
+      type: 'project.created',
+      projectId: project.id,
+      projectName: project.name,
+      actor: auth.user.name,
+      summary: `创建项目「${project.name}」`,
+    });
+    rc.json(projectSummary(rc.app, project), 201);
+  }
+
   router.add({
     method: 'POST',
     path: '/api/projects',
     auth: 'console',
-    handler: async (rc: RequestContext) => {
-      const auth = requireConsoleAuth(rc);
-      if (ROLE_RANK[auth.user.role] < ROLE_RANK.developer) {
-        throw errors.forbidden('创建项目需要 developer 及以上角色');
-      }
-      const input = await rc.body(createProjectSchema);
-      const id = newId('prj');
-      const now = nowIso();
-      const slug = uniqueSlug(rc.app.db, auth.user.orgId, input.slug ?? slugify(input.name));
-      const settings = mergeSettings({ ...DEFAULT_PROJECT_SETTINGS }, input.settings);
-      const region = input.region?.trim() || 'cn-shanghai';
-      const env = input.env ?? 'production';
+    handler: createProject,
+  });
 
-      // 项目 + 创建者成员关系在同一事务中写入。
-      tx(rc.app.db, () => {
-        rc.app.db
-          .prepare(
-            `INSERT INTO projects
-               (id, org_id, slug, name, description, status, region, env, settings, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            id,
-            auth.user.orgId,
-            slug,
-            input.name,
-            input.description ?? '',
-            region,
-            env,
-            JSON.stringify(settings),
-            now,
-            now,
-          );
-
-        // 创建者自动成为项目管理员（org owner/admin 本身即全项目可见，这里是 developer 创建后的兜底授权）。
-        rc.app.db
-          .prepare(
-            `INSERT INTO project_members (project_id, user_id, role, created_at)
-             VALUES (?, ?, 'admin', ?)
-             ON CONFLICT(project_id, user_id) DO UPDATE SET role = excluded.role`,
-          )
-          .run(id, auth.user.id, now);
-      });
-
-      const project = reloadProject(rc.app.db, id);
-      writeAudit(rc.app.db, {
-        orgId: project.orgId,
-        projectId: project.id,
-        actor: actorForUser(rc, auth.user),
-        action: 'project.create',
-        resourceType: 'project',
-        resourceId: project.id,
-        detail: { name: project.name, slug: project.slug, region, env },
-      });
-      publishLive(rc.app, {
-        type: 'project.created',
-        projectId: project.id,
-        projectName: project.name,
-        actor: auth.user.name,
-        summary: `创建项目「${project.name}」`,
-      });
-      rc.json(projectSummary(rc.app, project), 201);
-    },
+  // 中立服务术语下的「分区」创建入口（与 POST /api/projects 等价）。
+  router.add({
+    method: 'POST',
+    path: '/api/partitions',
+    auth: 'console',
+    handler: createProject,
   });
 
   router.add({

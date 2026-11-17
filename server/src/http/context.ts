@@ -37,7 +37,13 @@ export interface ConsoleAuth {
 export interface ApiKeyAuth {
   kind: 'api_key';
   key: ApiKey;
+  /**
+   * 钥匙绑定的分区：project key 即自身分区；org key 为创建时选定的锚点分区
+   * （仅用于审计/用量兜底，实际访问的分区由 `/v1/partitions/:partition` 参数解析）。
+   */
   project: Project;
+  /** org key 所属组织；project key 为空 */
+  org?: Org;
 }
 
 export type AuthState = ConsoleAuth | ApiKeyAuth | null;

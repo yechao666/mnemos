@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import type {
   Memory,
   MemoryCategory,
+  MemoryScope,
   MemorySource,
   MemoryStatus,
   MemoryVisibility,
@@ -26,6 +27,7 @@ import {
   ConfirmDialog,
   EmptyState,
   ErrorState,
+  Icon,
   IconButton,
   Input,
   PageHead,
@@ -55,6 +57,12 @@ import { MemoryBriefCard } from '../../components/project/memory/MemoryBriefCard
 import { DreamStatusCard } from '../../components/project/memory/DreamStatusCard.tsx';
 import { MemorySettingsModal } from '../../components/project/memory/MemorySettingsModal.tsx';
 import { DreamRunsModal } from '../../components/project/memory/DreamRunsModal.tsx';
+import { MemoryCreateModal } from '../../components/project/memory/MemoryCreateModal.tsx';
+import {
+  SCOPE_OPTIONS,
+  ScopeBadge,
+  scopeOf,
+} from '../../components/project/person/shared.tsx';
 import {
   TaskIdChip,
   VisibilityBadge,
@@ -107,6 +115,7 @@ export function MemoriesPage() {
 
   const [searchParams] = useSearchParams();
   const urlQuery = searchParams.get('q') ?? '';
+  const urlPerson = searchParams.get('person') ?? '';
   const [q, setQ] = useState(urlQuery);
   const [term, setTerm] = useState(urlQuery.trim());
   const debouncedQ = useDebounced(q, 350);
@@ -119,14 +128,21 @@ export function MemoriesPage() {
   }, [urlQuery]);
 
   useEffect(() => {
+    setPersonId(urlPerson);
+    setPage(1);
+  }, [urlPerson]);
+
+  useEffect(() => {
     setCategory(urlCategory);
   }, [urlCategory]);
 
   const [userId, setUserId] = useState('');
   const [agentId, setAgentId] = useState('');
+  const [personId, setPersonId] = useState(urlPerson);
   const [category, setCategory] = useState<MemoryCategory | ''>(urlCategory);
   const [status, setStatus] = useState<MemoryStatus | ''>('');
   const [visibility, setVisibility] = useState<MemoryVisibility | ''>('');
+  const [scope, setScope] = useState<MemoryScope | ''>('');
   const [taskId, setTaskId] = useState('');
   const [sort, setSort] = useState<'recent' | 'importance' | 'accessed'>('recent');
   const [page, setPage] = useState(1);
@@ -135,6 +151,7 @@ export function MemoriesPage() {
   const [confirm, setConfirm] = useState<{ action: BulkAction; ids: string[] } | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [detail, setDetail] = useState<{ id: string; hit?: SearchHit } | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [runsOpen, setRunsOpen] = useState(false);
@@ -147,11 +164,11 @@ export function MemoriesPage() {
 
   useEffect(() => {
     setPage(1);
-  }, [term, userId, agentId, category, status, visibility, taskId, sort]);
+  }, [term, userId, agentId, personId, category, status, visibility, scope, taskId, sort]);
 
   useEffect(() => {
     setSelected((prev) => (prev.size ? new Set<string>() : prev));
-  }, [term, userId, agentId, category, status, visibility, taskId, sort, page]);
+  }, [term, userId, agentId, personId, category, status, visibility, scope, taskId, sort, page]);
 
   const { data, loading, error, refresh } = useAsync<MemoryListResponse>(() => {
     // 控制台是审计视角：includePrivate 让私有记忆也可被人类筛选与查看。
@@ -159,12 +176,14 @@ export function MemoriesPage() {
     if (term) params.q = term;
     if (userId.trim()) params.userId = userId.trim();
     if (agentId.trim()) params.writtenByAgentId = agentId.trim();
+    if (personId.trim()) params.personId = personId.trim();
     if (category) params.category = category;
     if (status) params.status = status;
     if (visibility) params.visibility = visibility;
+    if (scope) params.scope = scope;
     if (taskId.trim()) params.taskId = taskId.trim();
     return api.memories.list(projectId, params);
-  }, [projectId, term, userId, agentId, category, status, visibility, taskId, sort, page], Boolean(projectId));
+  }, [projectId, term, userId, agentId, personId, category, status, visibility, scope, taskId, sort, page], Boolean(projectId));
 
   // 记忆简报与复盘总结状态：与记忆列表同页加载，成功后由操作联动刷新。
   const briefAsync = useAsync(
@@ -227,9 +246,18 @@ export function MemoriesPage() {
     return scoreMap.get(row.id);
   };
 
+  /** 打开记忆归属人的详情：优先内部 id，仅有 external id 时后端也支持按 external id 解析。 */
+  const openPerson = (row: MemoryRow) => {
+    const ref = row.personId ?? row.personExternalId;
+    if (!ref) return;
+    navigate(`/projects/${projectId}/persons/${encodeURIComponent(ref)}`);
+  };
+
   const total = data?.total ?? 0;
   const totalPages = data?.totalPages ?? 1;
-  const hasFilters = Boolean(term || userId || agentId || category || status || visibility || taskId);
+  const hasFilters = Boolean(
+    term || userId || agentId || personId || category || status || visibility || scope || taskId,
+  );
 
   // 状态条指标：记忆总数取项目上下文的全量统计（兜底列表 total），洞见数为项目级全量。
   const insightCount = insightAsync.data ?? 0;
@@ -289,9 +317,11 @@ export function MemoriesPage() {
     setTerm('');
     setUserId('');
     setAgentId('');
+    setPersonId('');
     setCategory('');
     setStatus('');
     setVisibility('');
+    setScope('');
     setTaskId('');
     setSort('recent');
     setPage(1);
@@ -372,6 +402,37 @@ export function MemoriesPage() {
   }
 
   columns.push(
+    {
+      key: 'person',
+      header: '人',
+      width: 186,
+      render: (row) => {
+        const label = row.personExternalId ?? row.personId;
+        return (
+          <div className="vstack gap-4" style={{ alignItems: 'flex-start' }}>
+            {label ? (
+              <button
+                type="button"
+                className="chip chip-clickable mono"
+                title={`查看人 ${label}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openPerson(row);
+                }}
+              >
+                <Icon name={scopeOf(row) === 'person' ? 'lock' : 'user'} size={11} />
+                <span className="truncate" style={{ maxWidth: 140 }}>
+                  {label}
+                </span>
+              </button>
+            ) : (
+              <span className="tiny dim">分区共享</span>
+            )}
+            <ScopeBadge scope={scopeOf(row)} size="sm" />
+          </div>
+        );
+      },
+    },
     {
       key: 'scope',
       header: '作用域',
@@ -483,7 +544,7 @@ export function MemoriesPage() {
     <EmptyState
       icon="filter"
       title="没有符合筛选条件的记忆"
-      description="调整用户、Agent、类别、状态、可见性或任务筛选后重试。"
+      description="调整人、用户、Agent、类别、状态、可见范围或任务筛选后重试。"
       action={
         <Button size="sm" variant="secondary" icon="x" onClick={clearFilters}>
           清空筛选
@@ -513,15 +574,20 @@ export function MemoriesPage() {
       <PageHead
         eyebrow="记忆"
         title="记忆浏览器"
-        desc="浏览、检索与维护项目内的全部记忆；搜索会融合语义向量与关键词信号。"
+        desc="浏览、检索与维护分区内的全部记忆；可按人（记忆主体）与可见范围筛选。"
         actions={
-          <Button
-            variant="secondary"
-            icon="play"
-            onClick={() => navigate(`/projects/${projectId}/playground`)}
-          >
-            写入记忆
-          </Button>
+          <>
+            <Button
+              variant="secondary"
+              icon="play"
+              onClick={() => navigate(`/projects/${projectId}/playground`)}
+            >
+              演练场
+            </Button>
+            <Button variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>
+              写入记忆
+            </Button>
+          </>
         }
       />
 
@@ -610,6 +676,20 @@ export function MemoriesPage() {
                 placeholder="Agent ID"
                 aria-label="按 Agent ID 筛选"
                 style={{ width: 148 }}
+              />
+              <Input
+                value={personId}
+                onChange={(event) => setPersonId(event.target.value)}
+                placeholder="人 external ID"
+                aria-label="按人筛选"
+                style={{ width: 164 }}
+              />
+              <Select
+                options={SCOPE_OPTIONS}
+                value={scope}
+                aria-label="按可见范围筛选"
+                style={{ width: 130 }}
+                onChange={(event) => setScope(event.target.value as MemoryScope | '')}
               />
               <Select
                 options={CATEGORY_OPTIONS}
@@ -768,6 +848,16 @@ export function MemoriesPage() {
         confirmLabel={confirm ? BULK_LABEL[confirm.action] : '确认'}
         tone={confirm?.action === 'delete' ? 'red' : 'violet'}
         loading={confirmBusy}
+      />
+
+      <MemoryCreateModal
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        projectId={projectId}
+        defaultScope={project?.settings.defaultScope ?? 'partition'}
+        onCreated={() => {
+          void refreshMemoryData();
+        }}
       />
 
       <MemorySettingsModal

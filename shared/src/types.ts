@@ -91,6 +91,10 @@ export interface ProjectSettings {
   monthlyQuota: number;
   webhookUrl?: string;
   locale: string;
+  /** 新记忆缺省可见范围：消费类 App 用 person，协作项目用 partition */
+  defaultScope: MemoryScope;
+  /** 写入不存在的 person 时是否自动建档 */
+  personAutoCreate: boolean;
   /* --- 记忆简报（最近记忆压缩，可直接注入 Agent 上下文） --- */
   /** 简报字符上限（100–5000） */
   briefMaxChars: number;
@@ -161,6 +165,10 @@ export interface ProjectMember {
 export interface ApiKey {
   id: string;
   projectId: string;
+  /** project=只属于该分区；org=组织级，可访问/创建本组织任意分区（DSH 插件按工作区建分区用） */
+  kind?: ApiKeyKind;
+  /** org key 所属组织 */
+  orgId?: string;
   name: string;
   prefix: string;
   scopes: ApiScope[];
@@ -191,9 +199,111 @@ export interface ChatMessage {
 
 export type MemoryVisibility = 'project' | 'agent' | 'task';
 
+/** 中立服务的可见范围：person=仅该人；partition=分区共享；session=仅当前会话。 */
+export type MemoryScope = 'person' | 'partition' | 'session';
+
+export type ApiKeyKind = 'project' | 'org';
+
+/* ------------------------------------------------------------------ */
+/* 人（Person）与分区（Partition）                                     */
+/* ------------------------------------------------------------------ */
+
+export type PersonType = 'human' | 'agent' | 'service' | 'other';
+export type PersonStatus = 'active' | 'archived' | 'deleted';
+
+/**
+ * 记忆的主体「人」：真人（App 用户 / 员工）或智能体。
+ * 与登录账号（User）无关；externalId 由调用方定义（App 的 user_id、Agent 的 id/name）。
+ */
+export interface Person {
+  id: string;
+  partitionId: string;
+  externalId: string;
+  type: PersonType;
+  displayName: string;
+  attributes: Record<string, unknown>;
+  status: PersonStatus;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  createdAt: string;
+  updatedAt: string;
+  stats?: PersonStats;
+}
+
+export interface PersonStats {
+  memories: number;
+  sharedMemories: number;
+  sessions: number;
+  lastMemoryAt?: string;
+}
+
+export interface PersonInput {
+  externalId: string;
+  type?: PersonType;
+  displayName?: string;
+  attributes?: Record<string, unknown>;
+  status?: PersonStatus;
+}
+
+export interface PersonListInput {
+  projectId: string;
+  type?: PersonType;
+  status?: PersonStatus;
+  q?: string;
+  page?: number;
+  pageSize?: number;
+  sort?: 'recent' | 'name' | 'memories';
+}
+
+export interface PersonContextInput {
+  projectId: string;
+  /** 内部 id 或 external_id */
+  personRef: string;
+  query?: string;
+  budgetTokens?: number;
+  /** 是否带上分区共享知识（默认 true） */
+  includePartition?: boolean;
+}
+
+/** 人的上下文：资料 + 人的简报 + 相关记忆 + 分区共享知识，可直接注入提示词。 */
+export interface PersonContext {
+  person: Person;
+  brief: MemoryBrief;
+  /** 与 query 最相关、且属于该人的记忆 */
+  memories: Memory[];
+  /** 分区共享知识（scope=partition，person_id 可有可无） */
+  shared: Memory[];
+  prompt: string;
+  tokenEstimate: number;
+  citations: string[];
+  builtAt: string;
+}
+
+/** 分区（项目/应用/租户）：对外叫 Partition，存储上仍用 projects。 */
+export type Partition = Project;
+
+export interface PartitionInput {
+  slug: string;
+  name?: string;
+  description?: string;
+  region?: string;
+  env?: string;
+}
+
+
 export interface Memory {
   id: string;
   projectId: string;
+  /** 记忆主体（归属人，内部 id）；为空表示分区共享知识 */
+  personId?: string;
+  /** 写入者（可与人不同）；系统/做梦写入时为一个系统人 */
+  actorPersonId?: string;
+  /** 人的外部 ID（App user_id / Agent id），便于调用方直接比对 */
+  personExternalId?: string;
+  /** 会话（task_id / run_id 的泛化） */
+  sessionId?: string;
+  /** 可见范围：person | partition | session */
+  scope: MemoryScope;
   userId?: string;
   agentId?: string;
   runId?: string;
@@ -420,11 +530,16 @@ export interface MemoryBriefItem {
   updatedAt: string;
   taskId?: string;
   agentId?: string;
+  personId?: string;
+  personExternalId?: string;
+  scope?: MemoryScope;
 }
 
 /** 记忆简报：取最近的活跃记忆/洞见压缩成有字符上限、可直接注入提示词的文本。 */
 export interface MemoryBrief {
   projectId: string;
+  /** 人级简报时带上该人（内部 id） */
+  personId?: string;
   /** 简报正文；暂无可用记忆时为空串 */
   text: string;
   maxChars: number;
@@ -440,6 +555,8 @@ export interface MemoryBrief {
 
 export interface MemoryBriefInput {
   projectId: string;
+  /** 人级简报：只取该人的 person 记忆 + 与其相关的分区共享记忆 */
+  personId?: string;
   /** 覆盖项目设置里的 briefMaxChars（不落库） */
   maxChars?: number;
   /** 按该 Agent 的可见性生成；不传时只使用项目共享记忆 */
@@ -459,6 +576,8 @@ export type MemoryDreamTrigger = 'schedule' | 'manual';
 export interface MemoryDreamRun {
   id: string;
   projectId: string;
+  /** 人级做梦时的归属人（内部 id）；分区级为空 */
+  personId?: string;
   trigger: MemoryDreamTrigger;
   status: MemoryDreamRunStatus;
   inputCount: number;
@@ -510,6 +629,8 @@ export interface MemoryReport {
 
 export interface MemoryDreamStatus {
   settings: MemoryDreamSettings;
+  /** 人级状态时带上该人（内部 id）；分区级为空 */
+  personId?: string;
   /** 尚未做梦的活跃记忆数 */
   pendingCount: number;
   lastRun?: MemoryDreamRun;
@@ -524,6 +645,8 @@ export interface MemoryDreamSettingsInput {
 
 export interface MemoryDreamInput {
   projectId: string;
+  /** 指定人：只巩固该人 scope=person 的新记忆；缺省为分区级（scope=partition） */
+  personId?: string;
   trigger?: MemoryDreamTrigger;
   /** 单批最多处理的记忆条数（1–200，默认 50） */
   batchSize?: number;
@@ -585,6 +708,14 @@ export interface AddMemoryInput {
   projectId: string;
   messages?: ChatMessage[];
   text?: string;
+  /** 记忆主体：内部 id 或 external id（与 personExternalId 二选一） */
+  personId?: string;
+  personExternalId?: string;
+  /** 写入者（默认同 person） */
+  actorPersonId?: string;
+  /** 可见范围；缺省取分区设置 defaultScope */
+  scope?: MemoryScope;
+  sessionId?: string;
   userId?: string;
   agentId?: string;
   runId?: string;
@@ -629,6 +760,10 @@ export interface SearchFilters {
 export interface SearchMemoryInput {
   projectId: string;
   query: string;
+  /** 按人过滤（内部 id 或 external id） */
+  personId?: string;
+  /** 按可见范围过滤 */
+  scope?: MemoryScope;
   userId?: string;
   /** 调用方 Agent 身份：用于可见性判定（project 共享 + 自己的 private + 当前任务） */
   agentId?: string;
@@ -650,6 +785,10 @@ export interface SearchMemoryInput {
 export interface ListMemoriesInput {
   projectId: string;
   q?: string;
+  /** 按人过滤（内部 id 或 external id） */
+  personId?: string;
+  /** 按可见范围过滤 */
+  scope?: MemoryScope;
   userId?: string;
   /** 调用方 Agent 身份（可见性） */
   agentId?: string;
@@ -1074,6 +1213,16 @@ export interface MemoryService {
   brief(input: MemoryBriefInput): Promise<MemoryBrief>;
   updateBriefSettings(projectId: string, maxChars: number, actor: Actor): Promise<MemoryBrief>;
   dreamStatus(projectId: string): Promise<MemoryDreamStatus>;
+  /** 人级做梦状态（pending/runs 只含该人） */
+  personDreamStatus(projectId: string, personRef: string): Promise<MemoryDreamStatus>;
   updateDreamSettings(projectId: string, input: MemoryDreamSettingsInput, actor: Actor): Promise<MemoryDreamStatus>;
   dream(input: MemoryDreamInput, actor: Actor): Promise<MemoryDreamResult>;
+  /* --- 中立服务：人（Person） --- */
+  persons(input: PersonListInput): Promise<Paginated<Person>>;
+  /** personRef 支持内部 id 或 external_id */
+  person(projectId: string, personRef: string): Promise<Person | null>;
+  upsertPerson(projectId: string, input: PersonInput, actor: Actor): Promise<Person>;
+  updatePerson(projectId: string, personRef: string, input: Partial<PersonInput>, actor: Actor): Promise<Person>;
+  /** 人的上下文：资料 + 人的简报 + 相关记忆 + 分区共享知识 */
+  personContext(input: PersonContextInput): Promise<PersonContext>;
 }

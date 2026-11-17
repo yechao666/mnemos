@@ -13,6 +13,8 @@ import { registerMemoryRoutes } from './memories.ts';
 import { registerMemoryInsightRoutes } from './memory-insights.ts';
 import { registerOpsRoutes } from './ops.ts';
 import { registerOrgRoutes } from './org.ts';
+import { registerPartitionRoutes } from './partitions.ts';
+import { registerPersonRoutes } from './persons.ts';
 import { registerPlaygroundRoutes } from './playground.ts';
 import { registerProjectRoutes } from './projects.ts';
 import { registerPublicRoutes } from './public.ts';
@@ -28,6 +30,7 @@ export function registerRoutes(router: Router): void {
   registerKeyRoutes(router);
   registerMemoryRoutes(router);
   registerMemoryInsightRoutes(router);
+  registerPersonRoutes(router);
   registerAgentRoutes(router);
   registerTaskRoutes(router);
   registerWebhookRoutes(router);
@@ -40,4 +43,5 @@ export function registerRoutes(router: Router): void {
   registerOrgRoutes(router);
   registerExportRoutes(router);
   registerPublicRoutes(router);
+  registerPartitionRoutes(router);
 }
