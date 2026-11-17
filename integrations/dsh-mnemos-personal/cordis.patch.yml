@@ -1,0 +1,17 @@
+# dsh-mnemos-personal bundle patch：把宿主侧插件行插入 profile 清单。
+#
+# 作为 profile bundle 层生效（`package.json` 的 `dsh.bundle.patch` 字段），由
+#   dsh plugin --profile <name> add link:<本包路径>
+# 装配。用你实际在跑的那个 profile —— 桌面 GUI 跑的是 `desktop`。
+#
+# 行 id 必须是 `dsh-mnemos-personal`：它同时是设置命名空间（src/config.ts 的
+# MNEMOS_SETTINGS_NAMESPACE），三者不一致时设置页不会出现本插件的配置项。
+#
+# 本插件只有主机半边（无 `dsh.client` 声明）：工具与系统提示段都在宿主进程里，
+# 设置页由 dsh 的自动表单（导出的 Config schema + .volatile() 字段）生成。
+#
+# 新版 Mnemos（中立记忆服务 v5）：分区 = DSH 会话工作区，记忆按人（Person）组织。
+# 旧插件 integrations/dsh-mnemos（行 id `dsh-mnemos`）保持不动，两者可同时安装。
+- insert:
+    - id: dsh-mnemos-personal
+      name: 'dsh-mnemos-personal'
