@@ -14,7 +14,7 @@ import type {
 
 export const APP_NAME = 'Mnemos';
 export const APP_TAGLINE = '企业级 AI 记忆基础设施';
-export const APP_VERSION = '6.0.0';
+export const APP_VERSION = '6.1.0';
 export const DEFAULT_SERVER_PORT = 4380;
 
 /** 游标分页：默认 50，最大 200。 */
@@ -153,7 +153,14 @@ export const DEFAULT_PARTITION_SETTINGS: PartitionSettings = {
   mergeThreshold: 0.95,
   dedupeThreshold: 0.98,
   autoExtractEntities: true,
+  piiRedaction: 'off',
 };
+
+/** 多模态附件（P2）上限：每记忆最多 10 个、URL 最长 2000 字符。 */
+export const ATTACHMENT_KINDS = ['image', 'audio', 'video', 'file'] as const;
+export const MAX_ATTACHMENTS_PER_MEMORY = 10;
+export const MAX_ATTACHMENT_URL_LENGTH = 2000;
+export const MAX_ATTACHMENT_CAPTION_LENGTH = 1000;
 
 /** 检索模式选项（控制台/文档共用）。 */
 export const RETRIEVAL_MODES: { value: 'hybrid' | 'keyword' | 'vector'; label: string }[] = [

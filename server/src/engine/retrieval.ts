@@ -8,10 +8,11 @@ import type {
   MemorySearchSignals,
   RetrievalWeights,
 } from '../../../shared/src/types.ts';
+import { attachmentCaptions, withAttachmentCounts } from './attachments.ts';
 import { blobToEmbedding, cosine, embedText } from './embed.ts';
 import { engineErrors } from './errors.ts';
 import { findPartitionById } from './partition.ts';
-import { findPersonRow } from './persons.ts';
+import { resolvePersonRow } from './persons.ts';
 import {
   escapeLike,
   ftsQuery,
@@ -57,6 +58,8 @@ interface Candidate {
   recency: number;
   importance: number;
   entity: number;
+  /** 附件 caption 命中强度（只用于 matchedOn 标记，不单独计入权重） */
+  attachment: number;
   score: number;
   matchedOn: string[];
 }
@@ -187,6 +190,51 @@ function keywordQuery(
   };
 }
 
+/**
+ * 附件 caption 候选（P2 轻量检索）：把 caption LIKE 命中的记忆并入候选集，
+ * 让「图片描述」这类不在 content 里的文字也能被检索到。
+ */
+function captionQuery(
+  input: MemorySearchInput,
+  baseConditions: string[],
+  baseParams: (string | number)[],
+  personId: string | null,
+): QueryParts | null {
+  const q = (input.query ?? '').trim();
+  if (!q) return null;
+  const conditions = [...baseConditions];
+  const params = [...baseParams];
+  if (personId && input.includePrivate !== true) {
+    conditions.push("(m.person_id = ? OR m.scope = 'partition')");
+    params.push(personId);
+  }
+  const terms = q
+    .split(/[^\p{L}\p{N}]+/u)
+    .map((term) => term.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  if (terms.length === 0) return null;
+  const likes = terms.map(() => "a.caption LIKE ? ESCAPE '\\'");
+  conditions.push(`(${likes.join(' OR ')})`);
+  for (const term of terms) params.push(likeContains(term.slice(0, 200)));
+  return { sql: conditions.join(' AND '), params, limit: FTS_LIMIT };
+}
+
+function runCaptionCandidateQuery(db: DatabaseSync, parts: QueryParts): MemoryRow[] {
+  return db
+    .prepare(
+      `SELECT m.*, p.external_id AS person_external_id
+         FROM memories m
+         JOIN persons p ON p.id = m.person_id
+         JOIN memory_attachments a ON a.memory_id = m.id
+        WHERE ${parts.sql}
+        GROUP BY m.id
+        ORDER BY m.created_at DESC, m.id DESC
+        LIMIT ?`,
+    )
+    .all(...parts.params, parts.limit) as unknown as MemoryRow[];
+}
+
 function runCandidateQuery(db: DatabaseSync, parts: QueryParts): MemoryRow[] {
   return db
     .prepare(
@@ -264,10 +312,10 @@ export function searchMemories(db: DatabaseSync, input: MemorySearchInput): Memo
 
   let personId = input.personId ?? null;
   if (!personId && input.personExternalId) {
-    const person = findPersonRow(db, input.partitionId, input.personExternalId);
+    const person = resolvePersonRow(db, input.partitionId, input.personExternalId);
     personId = person?.id ?? null;
   } else if (personId) {
-    const person = findPersonRow(db, input.partitionId, personId);
+    const person = resolvePersonRow(db, input.partitionId, personId);
     personId = person?.id ?? null;
   }
   if (personRequested && !personId) {
@@ -289,6 +337,7 @@ export function searchMemories(db: DatabaseSync, input: MemorySearchInput): Memo
   const queries: QueryParts[] = [];
   const keywordPart = keywordQuery(input, baseConditions, baseParams, mode, personId);
   if (keywordPart) queries.push(keywordPart);
+  const captionPart = captionQuery(input, baseConditions, baseParams, personId);
 
   const includeRecent = mode !== 'keyword';
   if (includeRecent) {
@@ -317,14 +366,24 @@ export function searchMemories(db: DatabaseSync, input: MemorySearchInput): Memo
 
   const seen = new Set<string>();
   const candidates: MemoryRow[] = [];
+  const accept = (row: MemoryRow): void => {
+    if (seen.has(row.id)) return;
+    seen.add(row.id);
+    candidates.push(row);
+  };
   for (const parts of queries) {
     for (const row of runCandidateQuery(db, parts)) {
-      if (seen.has(row.id)) continue;
-      seen.add(row.id);
-      candidates.push(row);
+      accept(row);
       if (candidates.length >= MAX_CANDIDATES) break;
     }
     if (candidates.length >= MAX_CANDIDATES) break;
+  }
+  // P2：附件 caption 命中的记忆并入候选（content 里没有的字也能被搜到）。
+  if (captionPart && candidates.length < MAX_CANDIDATES) {
+    for (const row of runCaptionCandidateQuery(db, captionPart)) {
+      accept(row);
+      if (candidates.length >= MAX_CANDIDATES) break;
+    }
   }
 
   if (candidates.length === 0) {
@@ -334,6 +393,7 @@ export function searchMemories(db: DatabaseSync, input: MemorySearchInput): Memo
   const queryVector = query ? embedText(query) : null;
   const queryTerms = queryTermsOf(query);
   const entityScores = entitySignals(db, candidates.map((row) => row.id), queryTerms);
+  const captionScores = attachmentCaptions(db, candidates.map((row) => row.id));
   const weights = weightsOf(settings);
   const now = Date.now();
 
@@ -342,14 +402,21 @@ export function searchMemories(db: DatabaseSync, input: MemorySearchInput): Memo
     const vector = queryVector
       ? clamp01(cosine(queryVector, blobToEmbedding(row.embedding)))
       : 0;
-    const keyword = query ? keywordScore(row.content, query) : 0;
+    const contentKeyword = query ? keywordScore(row.content, query) : 0;
+    // 附件 caption 作为记忆的轻量文本参与 keyword 信号；同时单独记录命中用于 matchedOn。
+    let attachment = 0;
+    for (const caption of captionScores.get(row.id) ?? []) {
+      if (!query) break;
+      attachment = Math.max(attachment, keywordScore(caption, query));
+    }
+    const keyword = Math.max(contentKeyword, attachment);
     const createdMs = Date.parse(row.created_at);
     const ageDays = Number.isFinite(createdMs) ? Math.max(0, (now - createdMs) / 86_400_000) : 365;
     const recency = clamp01(0.5 ** (ageDays / 30));
     // importance 信号同时吸收 confidence：反馈（±0.05）会微调排序，避免反馈只改展示。
     const importance = clamp01(row.importance * 0.7 + row.confidence * 0.3);
     const entity = clamp01(entityScores.get(row.id) ?? 0);
-    return { row, memory, vector, keyword, recency, importance, entity, score: 0, matchedOn: [] };
+    return { row, memory, vector, keyword, recency, importance, entity, attachment, score: 0, matchedOn: [] };
   });
 
   const embeddedCount = candidates.reduce((count, row) => count + (row.embedding && row.embedding.length > 0 ? 1 : 0), 0);
@@ -384,6 +451,7 @@ export function searchMemories(db: DatabaseSync, input: MemorySearchInput): Memo
     item.matchedOn = (Object.keys(signals) as (keyof MemorySearchSignals)[]).filter(
       (key) => signals[key] > 0.0001,
     );
+    if (item.attachment > 0.0001) item.matchedOn.push('attachment');
   }
 
   scored.sort((left, right) => {
@@ -399,7 +467,7 @@ export function searchMemories(db: DatabaseSync, input: MemorySearchInput): Memo
       ? scored.filter((item) => item.keyword > 0.0001 || item.vector >= 0.15)
       : scored;
 
-  const hits: MemorySearchHit[] = relevant.slice(0, topK).map((item) => ({
+  const hits: MemorySearchHit[] = withAttachmentCounts(db, relevant.slice(0, topK).map((item) => ({
     ...item.memory,
     score: round(item.score),
     signals: {
@@ -410,7 +478,7 @@ export function searchMemories(db: DatabaseSync, input: MemorySearchInput): Memo
       entity: round(item.entity),
     },
     matchedOn: item.matchedOn,
-  }));
+  })));
 
   return {
     hits,

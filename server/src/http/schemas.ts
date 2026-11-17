@@ -77,6 +77,8 @@ export const partitionSettingsSchema = z
     mergeThreshold: z.coerce.number().min(0).max(1),
     dedupeThreshold: z.coerce.number().min(0).max(1),
     autoExtractEntities: z.boolean(),
+    /* v6.1 P2 合规 */
+    piiRedaction: z.enum(['off', 'basic']),
   })
   .partial();
 
@@ -107,14 +109,18 @@ export const personUpsertSchema = z.object({
   displayName: z.string().trim().max(120).optional(),
   attributes: z.record(z.unknown()).optional(),
   status: personStatusSchema.optional(),
+  /** v6.1 P2：合规/同意标记（整体覆盖） */
+  consent: z.record(z.unknown()).optional(),
 });
 
-/** PATCH 人：type 与 externalId 不可改，只能更新展示名 / attributes / status。 */
+/** PATCH 人：type 与 externalId 不可改，只能更新展示名 / attributes / status / consent。 */
 export const personUpdateSchema = z
   .object({
     displayName: z.string().trim().max(120).optional(),
     attributes: z.record(z.unknown()).optional(),
     status: personStatusSchema.optional(),
+    /** v6.1 P2：合规/同意标记（整体覆盖） */
+    consent: z.record(z.unknown()).optional(),
   })
   .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
 
@@ -123,6 +129,55 @@ export const personListQuerySchema = cursorQuerySchema.extend({
   status: personStatusSchema.optional(),
   q: z.string().trim().max(200).optional(),
   sort: personSortSchema.optional(),
+  /** v6.1 P1：包含已合并的人（排查用）；也接受 snake_case。 */
+  includeMerged: booleanQuerySchema.optional(),
+  include_merged: booleanQuerySchema.optional(),
+});
+
+/* --- v6.1 P1：画像 / 生命周期 --- */
+
+const personFactInputSchema = z.object({
+  key: z.string().trim().min(1).max(120),
+  value: z.string().trim().min(1).max(2000),
+  confidence: z.coerce.number().min(0).max(1).optional(),
+  sourceMemoryId: z.string().trim().max(128).optional(),
+  source_memory_id: z.string().trim().max(128).optional(),
+});
+
+export const personFactsPutSchema = z.union([
+  z.object({ facts: z.array(personFactInputSchema).min(1).max(100) }),
+  personFactInputSchema,
+]);
+
+export const personMergeSchema = z
+  .object({
+    targetId: z.string().trim().min(1).max(128).optional(),
+    target_id: z.string().trim().min(1).max(128).optional(),
+    targetExternalId: z.string().trim().min(1).max(128).optional(),
+    target_external_id: z.string().trim().min(1).max(128).optional(),
+  })
+  .refine(
+    (value) =>
+      Boolean(value.targetId ?? value.target_id ?? value.targetExternalId ?? value.target_external_id),
+    { message: '必须提供 targetId / target_id / targetExternalId' },
+  );
+
+export const personProfileQuerySchema = z.object({
+  force: booleanQuerySchema.optional(),
+  refresh: booleanQuerySchema.optional(),
+});
+
+export const personDeleteQuerySchema = z.object({
+  hard: booleanQuerySchema.optional(),
+});
+
+/** v6.1 P2：多模态附件（每记忆 ≤10、url ≤2000）。 */
+export const memoryAttachmentSchema = z.object({
+  kind: z.enum(['image', 'audio', 'video', 'file']),
+  url: z.string().trim().min(1).max(2000),
+  mime: z.string().trim().max(200).optional(),
+  size: z.coerce.number().int().min(0).optional(),
+  caption: z.string().trim().max(1000).optional(),
 });
 
 export const memoryAddSchema = z.object({
@@ -142,6 +197,8 @@ export const memoryAddSchema = z.object({
   supersedesId: z.string().trim().max(128).optional(),
   factKey: z.string().trim().max(120).optional(),
   validFrom: z.string().trim().max(40).optional(),
+  /* v6.1 P2 多模态附件 */
+  attachments: z.array(memoryAttachmentSchema).max(10).optional(),
 }).refine((value) => Boolean(value.text ?? value.content), {
   message: 'text 不能为空',
   path: ['text'],
@@ -177,6 +234,20 @@ export const memoryFeedbackSchema = z.object({
   helpful: z.boolean(),
   query: z.string().trim().max(2000).optional(),
   reason: z.string().trim().max(500).optional(),
+});
+
+/* v6.1 P2：实体 / 关系图查询（控制台 camelCase） */
+export const entityGraphQuerySchema = z.object({
+  personId: z.string().trim().max(128).optional(),
+  person_id: z.string().trim().max(128).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+
+export const entityListQuerySchema = z.object({
+  personId: z.string().trim().max(128).optional(),
+  person_id: z.string().trim().max(128).optional(),
+  q: z.string().trim().max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
 });
 
 export const memoryListQuerySchema = cursorQuerySchema.extend({

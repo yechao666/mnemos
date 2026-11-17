@@ -1,13 +1,14 @@
-# 生产就绪度（v6）
+# 生产就绪度（v6.1）
 
-> 适用范围：Mnemos v6 单节点部署。配套：[架构](architecture.md) · [运维](operations.md) ·
+> 适用范围：Mnemos v6.1 单节点部署。配套：[架构](architecture.md) · [运维](operations.md) ·
 > [安全](security.md) · [可观测性](observability.md) · [百万级与压测](v6-scale.md)。
 
 ## 1. 结论摘要
 
-v6 已具备**单节点生产运行**的骨架：分区 + 人模型、游标 API、控制台、组织/分区密钥、
-审计与用量、维护与备份、简报/上下文/做梦、DSH 插件。当前范围**不含**多副本、Postgres、
-向量检索、OIDC/SSO；这些属于 P1/P2。
+v6.1 已具备**单节点生产运行**的骨架：分区 + 人模型、游标 API、控制台、组织/分区密钥、
+审计与用量、维护与备份、简报/上下文/做梦、混合检索、记忆历史/反馈、画像/生命周期、
+实体图、多模态附件、PII/可选加密、DSH 插件与多语言 SDK。当前范围**不含**多副本、Postgres、
+ANN/外置向量库、OIDC/SSO。
 
 ## 2. 成熟度矩阵
 
@@ -15,7 +16,7 @@ v6 已具备**单节点生产运行**的骨架：分区 + 人模型、游标 API
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
-| v6 schema + 迁移 | ✅ | 空库自动建；检测到 v5 库拒绝启动；`schema_version=6` |
+| schema v7 + 迁移 | ✅ | 空库自动建；v6 库幂等升级 v7；检测到 v5 库拒绝启动；`schema_version=7` |
 | 分区 / 人 / 记忆 API | ✅ | `/v1/partitions/...`，游标分页，无 total/COUNT(*) |
 | 控制台 | ✅ | 组织 → 分区 → 人 → 记忆；人列表虚拟滚动 |
 | 鉴权 | ✅ | 控制台会话 + 分区/组织 API Key；作用域/限流/过期/IP 白名单 |
@@ -28,7 +29,12 @@ v6 已具备**单节点生产运行**的骨架：分区 + 人模型、游标 API
 | 探针 / 指标 | ✅ | `/healthz` `/readyz` `/health` `/metrics` |
 | 优雅停机 | ✅ | SIGTERM → drain → checkpoint → close |
 | 规模脚本 | ✅ | `seed-scale` / `perf-persons`；10 万人实测预算全达标 |
-| DSH 插件 | ✅ | 工作区=分区、按人记忆、8 个工具 |
+| 混合检索 / 历史反馈 | ✅ | 候选 ≤700 + 内存 cosine；`hits/signals`；`memory_history`/`memory_feedback` |
+| 画像 / 生命周期 | ✅ | facts 版本化 + 画像缓存；merge/archive/export/delete（软/硬） |
+| 图 / 附件 / 合规 | ✅ | entities/relations + `/graph`；附件 URL/caption；PII basic；可选 AES-256-GCM |
+| 异步写管线 | ✅ | `memory_jobs` worker（1s tick、重试、崩溃恢复）；`backfill:embeddings` |
+| 评测门禁 | ✅ | `pnpm eval` 7 场景 / 38 checks |
+| DSH 插件 / SDK / MCP | ✅ | DSH 8 工具、TS/Python SDK、MCP server、LangChain 适配 |
 
 ### P1 — 上生产前建议补齐
 
@@ -45,7 +51,7 @@ v6 已具备**单节点生产运行**的骨架：分区 + 人模型、游标 API
 ### P2 — 规模化与组织级能力
 
 - Postgres/读写分离、无状态多副本（当前 SQLite 单写者）。
-- 向量检索 / 混合检索（当前 FTS5 前缀 + 中文子串回退）。
+- ANN / 外置向量库（当前本地 hash-384 + 候选集内存 cosine，适合单分区百万级记忆以内）。
 - 多区域、跨租户配额计费、精细 RBAC（当前仅组织角色）。
 
 ## 3. SLO / 性能预算

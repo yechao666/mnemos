@@ -21,6 +21,7 @@ import {
   Select,
   Skeleton,
   Stat,
+  Switch,
 } from '@ui';
 import { api } from '@lib/api.ts';
 import { useCursorList, useDebounced } from '@lib/hooks.ts';
@@ -55,6 +56,8 @@ export function PersonsPage() {
   const status = (searchParams.get('status') as PersonStatus | null) ?? '';
   const sort = ((searchParams.get('sort') as PersonSort | null) ?? 'recent');
   const activeSort: PersonSort = sort === 'new' || sort === 'name' ? sort : 'recent';
+  // v6.1：默认由后端过滤已合并/已删除的人；开关用于排查合并历史。
+  const includeMerged = searchParams.get('merged') === '1';
 
   const [query, setQuery] = useState(qParam);
   const debouncedQuery = useDebounced(query, 300);
@@ -104,15 +107,16 @@ export function PersonsPage() {
         sort: activeSort,
         cursor,
         limit: 50,
+        includeMerged: includeMerged || undefined,
       }),
-    [partitionId, qParam, type, status, activeSort],
+    [partitionId, qParam, type, status, activeSort, includeMerged],
     Boolean(partitionId),
   );
 
   // 列表响应自带 partitionStats；请求失败/未返回时用分区布局读取的统计兜底。
   const stats = list.partitionStats ?? layoutStats;
-  const hasFilters = Boolean(qParam || type || status);
-  const filtersKey = `${qParam}|${type}|${status}|${activeSort}`;
+  const hasFilters = Boolean(qParam || type || status || includeMerged);
+  const filtersKey = `${qParam}|${type}|${status}|${activeSort}|${includeMerged ? 'merged' : ''}`;
 
   const clearFilters = () => {
     setQuery('');
@@ -248,6 +252,11 @@ export function PersonsPage() {
                 style={{ width: 132 }}
                 onChange={(event) => patchParams({ sort: event.target.value === 'recent' ? undefined : event.target.value })}
               />
+              <Switch
+                checked={includeMerged}
+                label="包含已合并"
+                onChange={(next) => patchParams({ merged: next ? '1' : undefined })}
+              />
             </div>
             <div className="toolbar-right">
               {hasFilters ? (
@@ -325,6 +334,11 @@ function PersonRow({ person, onClick }: { person: Person; onClick: () => void })
             <span className="strong truncate">{personDisplayName(person)}</span>
             <PersonTypeBadge type={person.type} size="sm" />
             {person.status !== 'active' ? <PersonStatusBadge status={person.status} size="sm" /> : null}
+            {person.mergedInto ? (
+              <Badge tone="amber" size="sm" dot>
+                已合并
+              </Badge>
+            ) : null}
           </span>
           <PersonExternalIdChip externalId={person.externalId} />
         </span>

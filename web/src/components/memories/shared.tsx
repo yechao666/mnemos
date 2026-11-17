@@ -167,6 +167,11 @@ export function MemoryMeta({
       <CategoryBadge category={memory.category} size="sm" />
       <MemoryTemporalBadge memory={memory} size="sm" onOpenSuperseded={onOpenSuperseded} />
       <MemoryFactKey factKey={memory.factKey} />
+      {memory.attachmentCount ? (
+        <Badge tone="blue" size="sm">
+          <Icon name="package" size={10} /> 附件 {memory.attachmentCount}
+        </Badge>
+      ) : null}
       {memory.source === 'dream' ? (
         <Badge tone="violet" size="sm" dot>
           <Icon name="sparkles" size={10} /> 做梦沉淀

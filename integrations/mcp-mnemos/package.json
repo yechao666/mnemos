@@ -1,0 +1,22 @@
+{
+  "name": "mnemos-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mnemos v6.1 MCP server（stdio JSON-RPC，零依赖）",
+  "bin": {
+    "mnemos-mcp": "src/index.js"
+  },
+  "exports": {
+    ".": "./src/server.js"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/"
+  },
+  "keywords": ["mnemos", "mcp", "memory", "agent"],
+  "license": "MIT"
+}

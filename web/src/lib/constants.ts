@@ -2,12 +2,14 @@
 
 import type { Tone } from '@ui';
 import type {
+  AttachmentKind,
   MemoryCategory,
   MemoryHistoryEvent,
   MemoryScope,
   MemorySearchMode,
   PersonStatus,
   PersonType,
+  PiiRedactionMode,
   RetrievalSignal,
   RetrievalWeights,
   Role,
@@ -128,11 +130,78 @@ export const PARTITION_TABS: { to: string; label: string; end?: boolean }[] = [
   { to: '.', label: '概览', end: true },
   { to: 'persons', label: '人' },
   { to: 'memories', label: '记忆', end: true },
+  { to: 'graph', label: '图谱', end: true },
   { to: 'keys', label: '密钥', end: true },
   { to: 'usage', label: '用量', end: true },
   { to: 'audit', label: '审计', end: true },
   { to: 'settings', label: '设置', end: true },
   { to: 'docs', label: 'API 文档', end: true },
+];
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P2：多模态附件 / 实体类型 / PII 合规                           */
+/* ------------------------------------------------------------------ */
+
+export const ATTACHMENT_KINDS: {
+  value: AttachmentKind;
+  label: string;
+  desc: string;
+  tone: Tone;
+}[] = [
+  { value: 'image', label: '图片', desc: '截图、设计稿、照片（抽屉内展示缩略图）', tone: 'violet' },
+  { value: 'audio', label: '音频', desc: '语音消息、录音（以链接/播放器展示）', tone: 'cyan' },
+  { value: 'video', label: '视频', desc: '演示、录屏（以链接/播放器展示）', tone: 'pink' },
+  { value: 'file', label: '文件', desc: '文档、压缩包等（下载链接）', tone: 'slate' },
+];
+
+export const ATTACHMENT_KIND_LABEL: Record<AttachmentKind, string> = Object.fromEntries(
+  ATTACHMENT_KINDS.map((item) => [item.value, item.label]),
+) as Record<AttachmentKind, string>;
+
+/** 附件上限与服务端一致：每记忆 ≤10 条、url ≤2000 字符、caption ≤1000。 */
+export const MAX_ATTACHMENTS = 10;
+export const MAX_ATTACHMENT_URL = 2000;
+export const MAX_ATTACHMENT_CAPTION = 1000;
+
+/** 实体类型展示（当前规则抽取主要产出 concept；保留常见类型供后续扩展）。 */
+export const ENTITY_TYPE_META: Record<string, { label: string; tone: Tone }> = {
+  concept: { label: '概念', tone: 'violet' },
+  person: { label: '人物', tone: 'blue' },
+  org: { label: '组织', tone: 'green' },
+  place: { label: '地点', tone: 'cyan' },
+  event: { label: '事件', tone: 'amber' },
+  product: { label: '产品', tone: 'pink' },
+  other: { label: '其他', tone: 'slate' },
+};
+
+export function entityTypeMeta(type: string | undefined | null): { label: string; tone: Tone } {
+  return (type && ENTITY_TYPE_META[type]) || ENTITY_TYPE_META.other;
+}
+
+/** PII 脱敏级别（分区设置 settings.piiRedaction）。 */
+export const PII_REDACTION_OPTIONS: {
+  value: PiiRedactionMode;
+  label: string;
+  desc: string;
+}[] = [
+  {
+    value: 'off',
+    label: '关闭',
+    desc: '记忆原文落库；如需保留完整联系方式（例如客服工单）时使用。',
+  },
+  {
+    value: 'basic',
+    label: '基础脱敏',
+    desc: '写入前对手机号 / 邮箱 / 身份证 / 银行卡做正则脱敏，其余内容不变。',
+  },
+];
+
+/** 脱敏示例（设置页展示，帮助理解 basic 的效果）。 */
+export const PII_REDACTION_EXAMPLES: { label: string; before: string; after: string }[] = [
+  { label: '手机号', before: '联系我 13812345678', after: '联系我 138****5678' },
+  { label: '邮箱', before: 'alice@example.com', after: 'a***@example.com' },
+  { label: '身份证', before: '110101199001011234', after: '110101********1234' },
+  { label: '银行卡', before: '6222021234567890123', after: '622202********0123' },
 ];
 
 /* ------------------------------------------------------------------ */

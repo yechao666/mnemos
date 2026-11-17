@@ -1,7 +1,7 @@
 {
   "name": "@mnemos/sdk",
-  "version": "1.0.0",
-  "description": "Mnemos v6 官方 TypeScript SDK：分区 / 人 / 记忆的游标分页、人级简报·上下文·做梦与 API Key 管理。零运行时依赖，Node ≥18 与浏览器通用。",
+  "version": "6.1.0",
+  "description": "Mnemos v6.1 官方 TypeScript SDK：分区 / 人 / 记忆的混合检索、历史反馈、画像生命周期、图谱与游标分页。零运行时依赖，Node ≥18 与浏览器通用。",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",

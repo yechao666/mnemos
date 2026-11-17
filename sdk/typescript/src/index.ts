@@ -1,36 +1,51 @@
 /**
- * `@mnemos/sdk` —— Mnemos v6 官方 TypeScript SDK。
+ * `@mnemos/sdk` —— Mnemos v6.1 官方 TypeScript SDK。
  *
  * v6 只有三个核心：**分区（Partition）+ 人（Person）+ 记忆（Memory）**。
  * 所有数据端点都在 `/v1/partitions/:partition/...` 下，`:partition` 支持内部 id
  * 或 slug；人 / 记忆列表统一使用游标分页（`{ items, next_cursor, partition_stats }`）。
+ *
+ * v6.1 新增：混合检索（`hits`/`signals`/`mode`/`strategy`）、记忆历史与反馈、
+ * 结构化画像（profile / facts）、人生命周期（merge / archive / export / remove）、
+ * 实体关系图（graph / entities）、多模态附件与写管线字段（attachments /
+ * supersedesId / factKey / validFrom）、24h `Idempotency-Key`。
  *
  * 设计要点：
  * - 零运行时依赖，Node ≥18（全局 fetch）与浏览器通用；
  * - 入参接受 camelCase 与 snake_case，统一序列化为 snake_case；
  * - 响应统一归一化为 snake_case（含控制台 camelCase 响应）；
  * - 429 / 502 / 503 / 504 与网络错误指数退避重试，尊重 `Retry-After`；
- * - 写请求可传 `idempotencyKey`，重试时复用同一个 `Idempotency-Key`；
- * - 删除 v5 的 agents / tasks / briefing / webhooks / graph 等领域方法。
+ * - 写请求可传 `idempotencyKey`，服务端 24h 幂等回放，重试时复用同一个键；
+ * - 删除 v5 的 agents / tasks / briefing / webhooks 等领域方法。
  */
 
 import type {
   AddMemoryResponse,
   ApiKey,
   CursorPage,
+  EntityGraph,
+  EntityGraphQuery,
+  EntityList,
+  EntityListQuery,
   HealthResponse,
   KeyInput,
   KeyRotateInput,
   Memory,
+  MemoryAttachment,
+  MemoryAttachmentInput,
   MemoryBrief,
   MemoryDetail,
   MemoryDreamInput,
   MemoryDreamResult,
   MemoryDreamStatus,
+  MemoryFeedbackInput,
+  MemoryHistoryEntry,
   MemoryInput,
   MemoryListQuery,
   MemoryMutationResponse,
+  MemorySearchHit,
   MemorySearchInput,
+  MemorySearchSignals,
   MemoryUpdateInput,
   MnemosClientOptions,
   Partition,
@@ -42,15 +57,25 @@ import type {
   PersonBriefQuery,
   PersonContext,
   PersonContextInput,
+  PersonExport,
+  PersonFact,
+  PersonFactInput,
   PersonInput,
   PersonListQuery,
+  PersonMergeInput,
+  PersonMergeResult,
+  PersonProfile,
+  PersonProfileQuery,
+  PersonRemoveOptions,
   PersonUpdateInput,
   RequestOptions,
+  RetrievalWeights,
+  SearchMode,
   SearchResponse,
 } from './types.js';
 
 /** SDK 版本。 */
-export const SDK_VERSION = '1.0.0';
+export const SDK_VERSION = '6.1.0';
 /** 默认服务地址。 */
 export const DEFAULT_BASE_URL = 'http://127.0.0.1:4380';
 /** 默认单次请求超时（毫秒）。 */
@@ -97,6 +122,9 @@ const MEMORY_CATEGORIES = [
   'dependency',
 ] as const;
 const MEMORY_SCOPES = ['person', 'partition', 'session'] as const;
+const MEMORY_SEARCH_MODES = ['hybrid', 'keyword', 'vector'] as const;
+const ATTACHMENT_KINDS = ['image', 'audio', 'video', 'file'] as const;
+const PII_REDACTION_MODES = ['off', 'basic'] as const;
 const MEMORY_STATUSES = ['active', 'archived', 'deleted'] as const;
 const MEMORY_SOURCES = ['api', 'conversation', 'agent', 'import', 'playground', 'dream'] as const;
 const PERSON_TYPES = ['human', 'agent', 'service', 'other'] as const;
@@ -119,7 +147,35 @@ const DEFAULT_SETTINGS: PartitionSettings = {
   monthly_quota: 0,
   person_auto_create: true,
   locale: 'zh-CN',
+  retrieval_mode: 'hybrid',
+  retrieval_weights: { vector: 0.45, keyword: 0.3, recency: 0.15, importance: 0.1, entity: 0 },
+  embedding_model: 'mnemos-hash-384',
+  merge_threshold: 0.95,
+  dedupe_threshold: 0.98,
+  auto_extract_entities: true,
+  pii_redaction: 'off',
 };
+
+const DEFAULT_RETRIEVAL_WEIGHTS: RetrievalWeights = DEFAULT_SETTINGS.retrieval_weights;
+
+/** 归一化检索权重：缺失项取默认值，数值夹在 0–1。 */
+function normalizeWeights(value: unknown): RetrievalWeights {
+  const raw = asRecord(value);
+  const pickWeight = (key: keyof RetrievalWeights): number => {
+    const fallback = DEFAULT_RETRIEVAL_WEIGHTS[key];
+    const candidate = raw[key];
+    return typeof candidate === 'number' && Number.isFinite(candidate)
+      ? Math.min(1, Math.max(0, candidate))
+      : fallback;
+  };
+  return {
+    vector: pickWeight('vector'),
+    keyword: pickWeight('keyword'),
+    recency: pickWeight('recency'),
+    importance: pickWeight('importance'),
+    entity: pickWeight('entity'),
+  };
+}
 
 /* ------------------------------------------------------------------ */
 /* 错误                                                                */
@@ -331,6 +387,33 @@ function normalizeSettings(value: unknown): PartitionSettings {
       DEFAULT_SETTINGS.person_auto_create,
     ),
     locale: asString(raw.locale, DEFAULT_SETTINGS.locale),
+    retrieval_mode: oneOf(
+      raw.retrieval_mode ?? raw.retrievalMode,
+      MEMORY_SEARCH_MODES,
+      DEFAULT_SETTINGS.retrieval_mode,
+    ),
+    retrieval_weights: normalizeWeights(raw.retrieval_weights ?? raw.retrievalWeights),
+    embedding_model: asString(
+      raw.embedding_model ?? raw.embeddingModel,
+      DEFAULT_SETTINGS.embedding_model,
+    ),
+    merge_threshold: asNumber(
+      raw.merge_threshold ?? raw.mergeThreshold,
+      DEFAULT_SETTINGS.merge_threshold,
+    ),
+    dedupe_threshold: asNumber(
+      raw.dedupe_threshold ?? raw.dedupeThreshold,
+      DEFAULT_SETTINGS.dedupe_threshold,
+    ),
+    auto_extract_entities: asBoolean(
+      raw.auto_extract_entities ?? raw.autoExtractEntities,
+      DEFAULT_SETTINGS.auto_extract_entities,
+    ),
+    pii_redaction: oneOf(
+      raw.pii_redaction ?? raw.piiRedaction,
+      PII_REDACTION_MODES,
+      DEFAULT_SETTINGS.pii_redaction,
+    ),
   };
 }
 
@@ -386,12 +469,30 @@ function normalizePerson(value: unknown): Person {
     last_seen_at: asString(raw.last_seen_at ?? raw.lastSeenAt),
     created_at: asString(raw.created_at ?? raw.createdAt),
     updated_at: asString(raw.updated_at ?? raw.updatedAt),
+    merged_into: asNullableString(raw.merged_into ?? raw.mergedInto),
+    consent: asRecordOf(raw.consent),
+    deleted_at: asNullableString(raw.deleted_at ?? raw.deletedAt),
+  };
+}
+
+function normalizeAttachment(value: unknown): MemoryAttachment {
+  const raw = asRecord(value);
+  return {
+    id: asString(raw.id),
+    memory_id: asString(raw.memory_id ?? raw.memoryId),
+    kind: oneOf(raw.kind, ATTACHMENT_KINDS, 'file'),
+    url: asString(raw.url),
+    mime: asNullableString(raw.mime) ?? undefined,
+    size: typeof raw.size === 'number' && Number.isFinite(raw.size) ? raw.size : undefined,
+    caption: asNullableString(raw.caption) ?? undefined,
+    created_at: asString(raw.created_at ?? raw.createdAt),
   };
 }
 
 function normalizeMemory(value: unknown): Memory {
   const raw = asRecord(value);
-  return {
+  const attachments = Array.isArray(raw.attachments) ? raw.attachments.map(normalizeAttachment) : undefined;
+  const memory: Memory = {
     id: asString(raw.id),
     partition_id: asString(raw.partition_id ?? raw.partitionId),
     person_id: asString(raw.person_id ?? raw.personId),
@@ -411,6 +512,41 @@ function normalizeMemory(value: unknown): Memory {
     updated_at: asString(raw.updated_at ?? raw.updatedAt),
     expires_at: asNullableString(raw.expires_at ?? raw.expiresAt),
     dreamed_at: asNullableString(raw.dreamed_at ?? raw.dreamedAt),
+    valid_from: asNullableString(raw.valid_from ?? raw.validFrom),
+    valid_to: asNullableString(raw.valid_to ?? raw.validTo),
+    superseded_by: asNullableString(raw.superseded_by ?? raw.supersededBy),
+    supersedes: asNullableString(raw.supersedes),
+    fact_key: asNullableString(raw.fact_key ?? raw.factKey),
+    feedback_up: asNumber(raw.feedback_up ?? raw.feedbackUp),
+    feedback_down: asNumber(raw.feedback_down ?? raw.feedbackDown),
+    attachment_count: asNumber(
+      raw.attachment_count ?? raw.attachmentCount,
+      attachments?.length ?? 0,
+    ),
+  };
+  if (attachments) memory.attachments = attachments;
+  return memory;
+}
+
+function normalizeSignals(value: unknown): MemorySearchSignals {
+  const raw = asRecord(value);
+  return {
+    vector: asNumber(raw.vector),
+    keyword: asNumber(raw.keyword),
+    recency: asNumber(raw.recency),
+    importance: asNumber(raw.importance),
+    entity: asNumber(raw.entity),
+  };
+}
+
+function normalizeSearchHit(value: unknown): MemorySearchHit {
+  const memory = normalizeMemory(value);
+  const raw = asRecord(value);
+  return {
+    ...memory,
+    score: asNumber(raw.score),
+    signals: normalizeSignals(raw.signals),
+    matched_on: asStringArray(raw.matched_on ?? raw.matchedOn),
   };
 }
 
@@ -428,16 +564,24 @@ function normalizePage<T>(value: unknown, map: (item: unknown) => T): CursorPage
 function normalizeAddResponse(value: unknown): AddMemoryResponse {
   const raw = asRecord(value);
   const memoryRaw = raw.memory ?? asArray(raw.results)[0] ?? raw;
+  const events = asArray(raw.events).map((event) => {
+    const item = asRecord(event);
+    return {
+      type: oneOf(item.type, ['ADD', 'MERGE', 'NOOP', 'SUPERSEDE'] as const, 'ADD'),
+      memory_id: asString(item.memory_id ?? item.memoryId),
+      at: asString(item.at),
+    };
+  });
+  const event = oneOf(
+    raw.event,
+    ['ADD', 'MERGE', 'NOOP', 'SUPERSEDE'] as const,
+    events[0]?.type ?? 'ADD',
+  );
   return {
     memory: normalizeMemory(memoryRaw),
-    events: asArray(raw.events).map((event) => {
-      const item = asRecord(event);
-      return {
-        type: 'ADD' as const,
-        memory_id: asString(item.memory_id ?? item.memoryId),
-        at: asString(item.at),
-      };
-    }),
+    event,
+    superseded_id: asNullableString(raw.superseded_id ?? raw.supersededId),
+    events,
   };
 }
 
@@ -454,11 +598,146 @@ function normalizeMemoryMutation(value: unknown): MemoryMutationResponse {
   return { memory: normalizeMemory(raw.memory ?? raw) };
 }
 
+function normalizeHistoryEntry(value: unknown): MemoryHistoryEntry {
+  const raw = asRecord(value);
+  return {
+    id: asString(raw.id),
+    partition_id: asString(raw.partition_id ?? raw.partitionId),
+    memory_id: asString(raw.memory_id ?? raw.memoryId),
+    person_id: asNullableString(raw.person_id ?? raw.personId),
+    event: oneOf(
+      raw.event,
+      ['ADD', 'UPDATE', 'MERGE', 'SUPERSEDE', 'DELETE', 'NOOP', 'FEEDBACK', 'RESTORE'] as const,
+      'UPDATE',
+    ),
+    old_content: asNullableString(raw.old_content ?? raw.oldContent),
+    new_content: asNullableString(raw.new_content ?? raw.newContent),
+    actor: asNullableString(raw.actor),
+    reason: asNullableString(raw.reason),
+    meta: asRecordOf(raw.meta),
+    created_at: asString(raw.created_at ?? raw.createdAt),
+  };
+}
+
+function normalizePersonFact(value: unknown): PersonFact {
+  const raw = asRecord(value);
+  return {
+    id: asString(raw.id),
+    partition_id: asString(raw.partition_id ?? raw.partitionId),
+    person_id: asString(raw.person_id ?? raw.personId),
+    key: asString(raw.key),
+    value: asString(raw.value),
+    confidence: asNumber(raw.confidence, 0.7),
+    valid_from: asString(raw.valid_from ?? raw.validFrom),
+    valid_to: asNullableString(raw.valid_to ?? raw.validTo),
+    source_memory_id: asNullableString(raw.source_memory_id ?? raw.sourceMemoryId),
+    created_at: asString(raw.created_at ?? raw.createdAt),
+    updated_at: asString(raw.updated_at ?? raw.updatedAt),
+  };
+}
+
+function normalizePersonProfile(value: unknown): PersonProfile {
+  const raw = asRecord(value);
+  return {
+    person: normalizePerson(raw.person),
+    facts: asArray(raw.facts).map(normalizePersonFact),
+    summary: asString(raw.summary),
+    generated_at: asNullableString(raw.generated_at ?? raw.generatedAt),
+    ...(typeof raw.cached === 'boolean' ? { cached: raw.cached } : {}),
+  };
+}
+
+function normalizePersonMergeResult(value: unknown): PersonMergeResult {
+  const raw = asRecord(value);
+  return {
+    person: normalizePerson(raw.person),
+    merged_from: normalizePerson(raw.merged_from ?? raw.mergedFrom),
+    moved_memories: asNumber(raw.moved_memories ?? raw.movedMemories),
+    moved_facts: asNumber(raw.moved_facts ?? raw.movedFacts),
+  };
+}
+
+function normalizePersonExport(value: unknown): PersonExport {
+  const raw = asRecord(value);
+  return {
+    person: normalizePerson(raw.person),
+    facts: asArray(raw.facts).map(normalizePersonFact),
+    memories: asArray(raw.memories).map(normalizeMemory),
+    exported_at: asString(raw.exported_at ?? raw.exportedAt),
+    truncated: asBoolean(raw.truncated),
+  };
+}
+
+function normalizeEntityGraphNode(value: unknown) {
+  const raw = asRecord(value);
+  const mentionCount = asNumber(raw.mention_count ?? raw.mentionCount);
+  return {
+    id: asString(raw.id),
+    label: asString(raw.label ?? raw.name),
+    type: asString(raw.type, 'concept'),
+    weight: asNumber(raw.weight, mentionCount),
+    memories: asNumber(raw.memories),
+  };
+}
+
+function normalizeEntityGraph(value: unknown): EntityGraph {
+  const raw = asRecord(value);
+  const stats = asRecord(raw.stats);
+  const topTypes = asArray(stats.top_types ?? stats.topTypes).map((item) => {
+    const row = asRecord(item);
+    return { type: asString(row.type, 'concept'), count: asNumber(row.count) };
+  });
+  return {
+    nodes: asArray(raw.nodes).map(normalizeEntityGraphNode),
+    edges: asArray(raw.edges).map((item) => {
+      const edge = asRecord(item);
+      return {
+        id: asString(edge.id),
+        source: asString(edge.source),
+        target: asString(edge.target),
+        relation: asString(edge.relation, 'co_occurs'),
+        weight: asNumber(edge.weight, 1),
+      };
+    }),
+    stats: {
+      nodes: asNumber(stats.nodes, asArray(raw.nodes).length),
+      edges: asNumber(stats.edges, asArray(raw.edges).length),
+      top_types: topTypes,
+    },
+  };
+}
+
+function normalizeEntitySummary(value: unknown) {
+  const raw = asRecord(value);
+  return {
+    id: asString(raw.id),
+    name: asString(raw.name),
+    type: asString(raw.type, 'concept'),
+    mention_count: asNumber(raw.mention_count ?? raw.mentionCount),
+    memories: asNumber(raw.memories),
+    created_at: asString(raw.created_at ?? raw.createdAt),
+  };
+}
+
+function normalizeEntityList(value: unknown): EntityList {
+  const raw = asRecord(value);
+  return {
+    items: asArray(raw.items).map(normalizeEntitySummary),
+    next_cursor: asNullableString(raw.next_cursor ?? raw.nextCursor),
+  };
+}
+
 function normalizeSearchResponse(value: unknown): SearchResponse {
   const raw = asRecord(value);
+  const rawHits = asArray(raw.hits);
+  const rawResults = asArray(raw.results);
+  const source = rawHits.length > 0 ? rawHits : rawResults;
   const response: SearchResponse = {
-    results: asArray(raw.results).map(normalizeMemory),
+    hits: source.map(normalizeSearchHit),
+    results: (rawResults.length > 0 ? rawResults : source).map(normalizeMemory),
     took_ms: asNumber(raw.took_ms ?? raw.tookMs),
+    mode: oneOf(raw.mode, MEMORY_SEARCH_MODES, 'hybrid'),
+    strategy: asString(raw.strategy, 'hybrid'),
     next_cursor: asNullableString(raw.next_cursor ?? raw.nextCursor),
   };
   const stats = raw.partition_stats ?? raw.partitionStats;
@@ -604,6 +883,13 @@ function settingsBody(input: PartitionSettingsInput | undefined): JsonRecord | u
     monthly_quota: pick(input.monthlyQuota, input.monthly_quota),
     person_auto_create: pick(input.personAutoCreate, input.person_auto_create),
     locale: input.locale,
+    retrieval_mode: pick(input.retrievalMode, input.retrieval_mode),
+    retrieval_weights: pick(input.retrievalWeights, input.retrieval_weights),
+    embedding_model: pick(input.embeddingModel, input.embedding_model),
+    merge_threshold: pick(input.mergeThreshold, input.merge_threshold),
+    dedupe_threshold: pick(input.dedupeThreshold, input.dedupe_threshold),
+    auto_extract_entities: pick(input.autoExtractEntities, input.auto_extract_entities),
+    pii_redaction: pick(input.piiRedaction, input.pii_redaction),
   });
   return Object.keys(body).length === 0 ? undefined : body;
 }
@@ -625,6 +911,7 @@ function personUpsertBody(input: PersonInput): JsonRecord {
     display_name: pick(input.displayName, input.display_name),
     attributes: input.attributes,
     status: input.status,
+    consent: input.consent,
   });
 }
 
@@ -633,6 +920,7 @@ function personUpdateBody(input: PersonUpdateInput): JsonRecord {
     display_name: pick(input.displayName, input.display_name),
     attributes: input.attributes,
     status: input.status,
+    consent: input.consent,
   });
 }
 
@@ -644,7 +932,61 @@ function personListQuery(input: PersonListQuery): Query {
     sort: input.sort,
     cursor: input.cursor,
     limit: assertLimit(input.limit),
+    include_merged: pick(input.includeMerged, input.include_merged),
   });
+}
+
+function personProfileQuery(input: PersonProfileQuery): Query {
+  return queryFrom({ force: input.force, refresh: input.refresh });
+}
+
+function personMergeBody(input: PersonMergeInput): JsonRecord {
+  return compact({
+    target_id: pick(input.targetId, input.target_id),
+    target_external_id: pick(input.targetExternalId, input.target_external_id),
+  });
+}
+
+function personFactBody(input: PersonFactInput): JsonRecord {
+  return compact({
+    key: input.key,
+    value: input.value,
+    confidence: input.confidence,
+    source_memory_id: pick(input.sourceMemoryId, input.source_memory_id),
+  });
+}
+
+function personFactsBody(input: PersonFactInput[]): JsonRecord {
+  return { facts: input.map(personFactBody) };
+}
+
+function entityGraphQuery(input: EntityGraphQuery): Query {
+  return queryFrom({
+    person_id: pick(input.personId, input.person_id),
+    limit: input.limit,
+  });
+}
+
+function entityListQuery(input: EntityListQuery): Query {
+  return queryFrom({
+    person_id: pick(input.personId, input.person_id),
+    q: input.q,
+    limit: assertLimit(input.limit),
+  });
+}
+
+function memoryAttachmentsBody(input: MemoryAttachmentInput[] | undefined): JsonRecord[] | undefined {
+  if (input === undefined) return undefined;
+  if (input.length > 10) throw new TypeError('memories.add: attachments 最多 10 个');
+  return input.map((attachment) =>
+    compact({
+      kind: attachment.kind,
+      url: attachment.url,
+      mime: attachment.mime,
+      size: attachment.size,
+      caption: attachment.caption,
+    }),
+  );
 }
 
 function memoryAddBody(input: MemoryInput): JsonRecord {
@@ -667,6 +1009,10 @@ function memoryAddBody(input: MemoryInput): JsonRecord {
     tags: input.tags,
     metadata: input.metadata,
     expires_at: pick(input.expiresAt, input.expires_at),
+    supersedes_id: pick(input.supersedesId, input.supersedes_id),
+    fact_key: pick(input.factKey, input.fact_key),
+    valid_from: pick(input.validFrom, input.valid_from),
+    attachments: memoryAttachmentsBody(input.attachments),
   });
 }
 
@@ -693,6 +1039,21 @@ function memoryListQuery(input: MemoryListQuery): Query {
     q: input.q,
     cursor: input.cursor,
     limit: assertLimit(input.limit),
+  });
+}
+
+function memorySearchBody(input: MemorySearchInput): JsonRecord {
+  return compact({
+    query: input.query,
+    person_id: pick(input.personId, input.person_id),
+    person_external_id: pick(input.personExternalId, input.person_external_id),
+    scope: input.scope,
+    category: input.category,
+    mode: input.mode,
+    top_k: pick(input.topK, input.top_k),
+    as_of: pick(input.asOf, input.as_of),
+    include_superseded: pick(input.includeSuperseded, input.include_superseded),
+    include_private: pick(input.includePrivate, input.include_private),
   });
 }
 
@@ -789,13 +1150,15 @@ async function toApiError(response: Response): Promise<MnemosApiError> {
 /**
  * 判断该方法在失败时是否可以安全重试。
  *
- * v6 服务端没有幂等记录存储，因此非只读 POST（写记忆 / 做梦 / 建密钥）
- * 一律不自动重试；只有只读检索 POST 可以安全重放。PUT/PATCH/DELETE 因为
- * 语义幂等，允许重试。
+ * v6.1 服务端会持久化 `Idempotency-Key`（24h）。因此：
+ * - GET 与只读检索 POST 可直接重放；
+ * - PUT/PATCH/DELETE 语义幂等，允许重试；
+ * - 非只读 POST（写记忆 / 做梦 / 建密钥）只有携带幂等键时才允许重试，
+ *   否则保持「只尝试一次」避免重复写入。
  */
-function canRetryRequest(method: HttpMethod, path: string): boolean {
+function canRetryRequest(method: HttpMethod, path: string, hasIdempotencyKey = false): boolean {
   if (method === 'GET') return true;
-  if (method === 'POST') return path.endsWith('/memories/search');
+  if (method === 'POST') return path.endsWith('/memories/search') || hasIdempotencyKey;
   // PUT / PATCH / DELETE 语义上幂等。
   return method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 }
@@ -927,7 +1290,7 @@ export class PersonsResource {
     return normalizePerson(raw);
   }
 
-  /** 局部更新人（展示名 / attributes / status）。 */
+  /** 局部更新人（展示名 / attributes / status / consent）。 */
   async update(
     partition: string,
     personRef: string,
@@ -940,6 +1303,154 @@ export class PersonsResource {
       { body: assertPatchBody('persons.update', personUpdateBody(input)), options },
     );
     return normalizePerson(raw);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* v6.1 P1：画像 / facts / 生命周期                                     */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 人的画像：资料 + 当前有效 facts + 摘要（服务端异步生成并可缓存）。
+   * 传 `{ force: true }` / `{ refresh: true }` 跳过缓存重新生成。
+   */
+  async profile(
+    partition: string,
+    personRef: string,
+    query: PersonProfileQuery = {},
+    options?: RequestOptions,
+  ): Promise<PersonProfile> {
+    const raw = await this.transport.request<unknown>(
+      'GET',
+      `${this.base(partition)}/${encodeRef(personRef)}/profile`,
+      { query: personProfileQuery(query), options },
+    );
+    return normalizePersonProfile(raw);
+  }
+
+  /** 当前有效的 facts（已关闭的历史版本不在此列表；导出会包含历史）。 */
+  async listFacts(
+    partition: string,
+    personRef: string,
+    options?: RequestOptions,
+  ): Promise<PersonFact[]> {
+    const raw = await this.transport.request<unknown>(
+      'GET',
+      `${this.base(partition)}/${encodeRef(personRef)}/facts`,
+      { options },
+    );
+    return asArray(asRecord(raw).items).map(normalizePersonFact);
+  }
+
+  /** 写入单条 fact（同 key 新值会关闭旧版本，valid_to=now）。 */
+  async upsertFact(
+    partition: string,
+    personRef: string,
+    input: PersonFactInput,
+    options?: RequestOptions,
+  ): Promise<PersonFact> {
+    const raw = await this.transport.request<unknown>(
+      'PUT',
+      `${this.base(partition)}/${encodeRef(personRef)}/facts`,
+      { body: personFactBody(input), options },
+    );
+    return normalizePersonFact(asRecord(raw).fact);
+  }
+
+  /** 批量写入 facts（≤100），返回写入后的当前版本。 */
+  async upsertFacts(
+    partition: string,
+    personRef: string,
+    facts: PersonFactInput[],
+    options?: RequestOptions,
+  ): Promise<PersonFact[]> {
+    const raw = await this.transport.request<unknown>(
+      'PUT',
+      `${this.base(partition)}/${encodeRef(personRef)}/facts`,
+      { body: personFactsBody(facts), options },
+    );
+    return asArray(asRecord(raw).items).map(normalizePersonFact);
+  }
+
+  /** 删除 fact（软关闭：保留历史版本，valid_to=now）。 */
+  async removeFact(
+    partition: string,
+    personRef: string,
+    factId: string,
+    options?: RequestOptions,
+  ): Promise<void> {
+    await this.transport.request<void>(
+      'DELETE',
+      `${this.base(partition)}/${encodeRef(personRef)}/facts/${encodeRef(factId)}`,
+      { options },
+    );
+  }
+
+  /**
+   * 合并两个人：memories / facts / feedback / sessions 迁移到目标；
+   * 源人被归档并设 merged_into；目标可用 `targetId` 或 `targetExternalId`。
+   */
+  async merge(
+    partition: string,
+    personRef: string,
+    input: PersonMergeInput,
+    options?: RequestOptions,
+  ): Promise<PersonMergeResult> {
+    const body = assertPatchBody('persons.merge', personMergeBody(input));
+    const raw = await this.transport.request<unknown>(
+      'POST',
+      `${this.base(partition)}/${encodeRef(personRef)}/merge`,
+      { body, options },
+    );
+    return normalizePersonMergeResult(raw);
+  }
+
+  /** 归档人（status=archived，数据全部保留可读）。 */
+  async archive(
+    partition: string,
+    personRef: string,
+    options?: RequestOptions,
+  ): Promise<Person> {
+    const raw = await this.transport.request<unknown>(
+      'POST',
+      `${this.base(partition)}/${encodeRef(personRef)}/archive`,
+      { options },
+    );
+    return normalizePerson(raw);
+  }
+
+  /** 合规导出：person + facts（含历史版本）+ 最近 10000 条 memories。 */
+  async export(
+    partition: string,
+    personRef: string,
+    options?: RequestOptions,
+  ): Promise<PersonExport> {
+    const raw = await this.transport.request<unknown>(
+      'GET',
+      `${this.base(partition)}/${encodeRef(personRef)}/export`,
+      { options },
+    );
+    return normalizePersonExport(raw);
+  }
+
+  /**
+   * 删除人：默认软删（status=deleted，记忆/facts 保留）；`{ hard: true }` 物理级联删除。
+   *
+   * 硬删需要 owner（控制台会话）或 `admin` 作用域的 org key；v1 不额外校验角色。
+   */
+  async remove(
+    partition: string,
+    personRef: string,
+    input: PersonRemoveOptions = {},
+    options?: RequestOptions,
+  ): Promise<void> {
+    await this.transport.request<void>(
+      'DELETE',
+      `${this.base(partition)}/${encodeRef(personRef)}`,
+      {
+        query: input.hard ? { hard: true } : undefined,
+        options,
+      },
+    );
   }
 }
 
@@ -1011,7 +1522,10 @@ export class MemoriesResource {
     return normalizeAddResponse(raw);
   }
 
-  /** 全文检索（FTS5 前缀匹配）。 */
+  /**
+   * 混合检索（默认 hybrid）：返回 `hits`（score / signals / matched_on）、
+   * `took_ms`、`mode`、`strategy`；`results` 是 v6 兼容别名。
+   */
   async search(
     partition: string,
     input: MemorySearchInput,
@@ -1022,17 +1536,51 @@ export class MemoriesResource {
       'POST',
       `${this.base(partition)}/search`,
       {
-        body: compact({
-          query: input.query,
-          person_id: pick(input.personId, input.person_id),
-          scope: input.scope,
-          category: input.category,
-          top_k: pick(input.topK, input.top_k),
-        }),
+        body: memorySearchBody(input),
         options,
       },
     );
     return normalizeSearchResponse(raw);
+  }
+
+  /** 记忆变更历史（ADD/UPDATE/MERGE/SUPERSEDE/DELETE/NOOP/FEEDBACK/RESTORE）。 */
+  async history(
+    partition: string,
+    id: string,
+    options?: RequestOptions,
+  ): Promise<MemoryHistoryEntry[]> {
+    const raw = await this.transport.request<unknown>(
+      'GET',
+      `${this.base(partition)}/${encodeRef(id)}/history`,
+      { options },
+    );
+    const record = asRecord(raw);
+    const list = Array.isArray(raw) ? raw : asArray(record.items ?? record.history);
+    return list.map(normalizeHistoryEntry);
+  }
+
+  /**
+   * 检索反馈：helpful=true/false 更新 feedback_up/down 并按 ±0.05 微调 confidence；
+   * 返回更新后的记忆。
+   */
+  async feedback(
+    partition: string,
+    id: string,
+    input: MemoryFeedbackInput,
+    options?: RequestOptions,
+  ): Promise<MemoryMutationResponse> {
+    if (typeof input.helpful !== 'boolean') {
+      throw new TypeError('memories.feedback: helpful 必须是布尔值');
+    }
+    const raw = await this.transport.request<unknown>(
+      'POST',
+      `${this.base(partition)}/${encodeRef(id)}/feedback`,
+      {
+        body: compact({ helpful: input.helpful, query: input.query, reason: input.reason }),
+        options,
+      },
+    );
+    return normalizeMemoryMutation(raw);
   }
 
   /** 记忆详情（含归属人）。 */
@@ -1226,7 +1774,7 @@ export class MnemosClient implements RequestTransport {
     Object.assign(headers, options.headers ?? {});
 
     const timeoutMs = options.timeoutMs ?? this.timeoutMs;
-    const retryableRequest = canRetryRequest(method, path);
+    const retryableRequest = canRetryRequest(method, path, Boolean(options.idempotencyKey));
     const requestBody = config.body === undefined ? undefined : JSON.stringify(config.body);
     let lastError: MnemosApiError | null = null;
 
@@ -1361,6 +1909,35 @@ export class MnemosClient implements RequestTransport {
   }
 
   /* ------------------------------------------------------------------ */
+  /* v6.1 P2：实体 / 关系图                                               */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 实体关系图（分区级或人级）：节点按关联记忆数排序，边只保留两端都在节点集内的关系。
+   * `limit` 默认 100、最大 500。
+   */
+  async graph(partition: string, query: EntityGraphQuery = {}, options?: RequestOptions): Promise<EntityGraph> {
+    const raw = await this.request<unknown>('GET', `/v1/partitions/${encodeRef(partition)}/graph`, {
+      query: entityGraphQuery(query),
+      options,
+    });
+    return normalizeEntityGraph(raw);
+  }
+
+  /** 实体列表：支持 `q` 子串与 `personId` 过滤，`limit` 默认 50、最大 200。 */
+  async entities(
+    partition: string,
+    query: EntityListQuery = {},
+    options?: RequestOptions,
+  ): Promise<EntityList> {
+    const raw = await this.request<unknown>('GET', `/v1/partitions/${encodeRef(partition)}/entities`, {
+      query: entityListQuery(query),
+      options,
+    });
+    return normalizeEntityList(raw);
+  }
+
+  /* ------------------------------------------------------------------ */
   /* 健康检查                                                            */
   /* ------------------------------------------------------------------ */
 
@@ -1382,6 +1959,7 @@ export type {
   ApiKey,
   ApiKeyKind,
   ApiScope,
+  AttachmentKind,
   Audit,
   AuditLog,
   ChatMessage,
@@ -1390,12 +1968,23 @@ export type {
   DreamRun,
   DreamRunInput,
   DreamStatus,
+  EntityGraph,
+  EntityGraphEdge,
+  EntityGraphNode,
+  EntityGraphQuery,
+  EntityGraphStats,
+  EntityGraphTypeCount,
+  EntityList,
+  EntityListQuery,
+  EntitySummary,
   HealthResponse,
   Key,
   KeyInput,
   KeyRotateInput,
   Memory,
   MemoryAddResponse,
+  MemoryAttachment,
+  MemoryAttachmentInput,
   MemoryBrief,
   MemoryBriefItem,
   MemoryCategory,
@@ -1408,11 +1997,16 @@ export type {
   MemoryDreamStatus,
   MemoryDreamTrigger,
   MemoryEvent,
+  MemoryFeedbackInput,
+  MemoryHistoryEntry,
+  MemoryHistoryEvent,
   MemoryInput,
   MemoryListQuery,
   MemoryMutationResponse,
   MemoryScope,
+  MemorySearchHit,
   MemorySearchInput,
+  MemorySearchSignals,
   MemorySource,
   MemoryStatus,
   MemoryUpdateInput,
@@ -1429,13 +2023,23 @@ export type {
   PersonBriefQuery,
   PersonContext,
   PersonContextInput,
+  PersonExport,
+  PersonFact,
+  PersonFactInput,
   PersonInput,
   PersonListQuery,
+  PersonMergeInput,
+  PersonMergeResult,
+  PersonProfile,
+  PersonProfileQuery,
+  PersonRemoveOptions,
   PersonSort,
   PersonStatus,
   PersonType,
   PersonUpdateInput,
   RequestOptions,
+  RetrievalWeights,
+  SearchMode,
   SearchResponse,
   Session,
   Usage,

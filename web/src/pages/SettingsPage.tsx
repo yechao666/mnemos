@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
-import type { MemoryScope, PartitionStatus } from '@lib/types.ts';
+import type { MemoryScope, PartitionStatus, PiiRedactionMode } from '@lib/types.ts';
 import { MEMORY_SCOPES, PARTITION_STATUSES } from '@lib/constants.ts';
 import {
   Badge,
@@ -24,6 +24,7 @@ import {
   retrievalFormDefaults,
   type RetrievalFormValue,
 } from '../components/settings/RetrievalSettingsCard.tsx';
+import { ComplianceSettingsCard } from '../components/settings/ComplianceSettingsCard.tsx';
 
 interface FormState {
   name: string;
@@ -35,6 +36,7 @@ interface FormState {
   dreamEnabled: boolean;
   dreamIntervalMinutes: string;
   retrieval: RetrievalFormValue;
+  piiRedaction: PiiRedactionMode;
 }
 
 function formFromPartition(partition: {
@@ -54,6 +56,7 @@ function formFromPartition(partition: {
     dreamEnabled: settings.dreamEnabled !== false,
     dreamIntervalMinutes: String(settings.dreamIntervalMinutes ?? 1440),
     retrieval: retrievalFormDefaults(settings),
+    piiRedaction: settings.piiRedaction === 'basic' ? 'basic' : 'off',
   };
 }
 
@@ -156,6 +159,8 @@ export function SettingsPage() {
           mergeThreshold,
           dedupeThreshold,
           autoExtractEntities: form.retrieval.autoExtractEntities,
+          /* --- v6.1 P2 合规 --- */
+          piiRedaction: form.piiRedaction,
         },
       });
       await refresh();
@@ -182,7 +187,7 @@ export function SettingsPage() {
       <PageHead
         eyebrow="设置"
         title="分区设置"
-        desc="分区内的默认行为：新记忆的可见范围、人的自动建档、简报字数与做梦周期，以及 v6.1 混合检索权重与写管线阈值。"
+        desc="分区内的默认行为：新记忆的可见范围、人的自动建档、简报字数与做梦周期，v6.1 混合检索权重与写管线阈值，以及 PII 脱敏等合规设置。"
         actions={
           <Button variant="primary" icon="check" loading={saving} onClick={() => void save()}>
             保存设置
@@ -280,6 +285,11 @@ export function SettingsPage() {
       </div>
 
       <RetrievalSettingsCard value={form.retrieval} onChange={patchRetrieval} />
+
+      <ComplianceSettingsCard
+        value={form.piiRedaction}
+        onChange={(next) => patch({ piiRedaction: next })}
+      />
 
       <Card pad>
         <SectionHead

@@ -23,9 +23,15 @@ import {
   cursorV1,
   dreamResultV1,
   dreamStatusV1,
+  entityV1,
+  graphV1,
   historyV1,
   memoryV1,
   partitionV1,
+  personExportV1,
+  personFactV1,
+  personMergeResultV1,
+  personProfileV1,
   personV1,
   searchResponseV1,
   statsV1,
@@ -73,6 +79,8 @@ const settingsV1Schema = z
     merge_threshold: z.coerce.number().min(0).max(1).optional(),
     dedupe_threshold: z.coerce.number().min(0).max(1).optional(),
     auto_extract_entities: z.boolean().optional(),
+    /* v6.1 P2 合规 */
+    pii_redaction: z.enum(['off', 'basic']).optional(),
   })
   .passthrough();
 
@@ -97,6 +105,7 @@ function settingsFromV1(raw: unknown): Partial<PartitionSettings> | undefined {
   if (input.merge_threshold !== undefined) out.mergeThreshold = Number(input.merge_threshold);
   if (input.dedupe_threshold !== undefined) out.dedupeThreshold = Number(input.dedupe_threshold);
   if (input.auto_extract_entities !== undefined) out.autoExtractEntities = Boolean(input.auto_extract_entities);
+  if (input.pii_redaction !== undefined) out.piiRedaction = input.pii_redaction as PartitionSettings['piiRedaction'];
   return out;
 }
 
@@ -126,6 +135,8 @@ const personWriteV1Schema = z.object({
   display_name: z.string().trim().max(120).optional(),
   attributes: z.record(z.unknown()).optional(),
   status: personStatusSchema.optional(),
+  /** v6.1 P2：合规/同意标记（整体覆盖） */
+  consent: z.record(z.unknown()).optional(),
 });
 
 const personPatchV1Schema = z
@@ -134,6 +145,8 @@ const personPatchV1Schema = z
     display_name: z.string().trim().max(120).optional(),
     attributes: z.record(z.unknown()).optional(),
     status: personStatusSchema.optional(),
+    /** v6.1 P2：合规/同意标记（整体覆盖） */
+    consent: z.record(z.unknown()).optional(),
   })
   .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
 
@@ -142,6 +155,44 @@ const personListQueryV1Schema = cursorQuerySchema.extend({
   status: personStatusSchema.optional(),
   q: z.string().trim().max(200).optional(),
   sort: personSortSchema.optional(),
+  include_merged: booleanQuerySchema.optional(),
+  includeMerged: booleanQuerySchema.optional(),
+});
+
+/* --- v6.1 P1：画像 / 生命周期 --- */
+
+const personFactInputV1Schema = z.object({
+  key: z.string().trim().min(1).max(120),
+  value: z.string().trim().min(1).max(2000),
+  confidence: z.coerce.number().min(0).max(1).optional(),
+  source_memory_id: z.string().trim().max(128).optional(),
+  sourceMemoryId: z.string().trim().max(128).optional(),
+});
+
+const personFactsPutV1Schema = z.union([
+  z.object({ facts: z.array(personFactInputV1Schema).min(1).max(100) }),
+  personFactInputV1Schema,
+]);
+
+const personMergeV1Schema = z
+  .object({
+    target_id: z.string().trim().min(1).max(128).optional(),
+    targetId: z.string().trim().min(1).max(128).optional(),
+    target_external_id: z.string().trim().min(1).max(128).optional(),
+    targetExternalId: z.string().trim().min(1).max(128).optional(),
+  })
+  .refine(
+    (value) => Boolean(value.target_id ?? value.targetId ?? value.target_external_id ?? value.targetExternalId),
+    { message: '必须提供 target_id / target_external_id' },
+  );
+
+const personProfileQueryV1Schema = z.object({
+  force: booleanQuerySchema.optional(),
+  refresh: booleanQuerySchema.optional(),
+});
+
+const personDeleteQueryV1Schema = z.object({
+  hard: booleanQuerySchema.optional(),
 });
 
 const chatMessageV1Schema = z.object({
@@ -170,6 +221,19 @@ const memoryAddV1Schema = z
     valid_from: z.string().trim().max(40).optional(),
     infer: z.boolean().optional(),
     mode: z.enum(['additive', 'consolidate']).optional(),
+    /* v6.1 P2：多模态附件（≤10，url≤2000） */
+    attachments: z
+      .array(
+        z.object({
+          kind: z.enum(['image', 'audio', 'video', 'file']),
+          url: z.string().trim().min(1).max(2000),
+          mime: z.string().trim().max(200).optional(),
+          size: z.coerce.number().int().min(0).optional(),
+          caption: z.string().trim().max(1000).optional(),
+        }),
+      )
+      .max(10)
+      .optional(),
   })
   .refine((value) => Boolean(value.text ?? value.content) || Boolean(value.messages?.length), {
     message: 'messages 与 text 至少提供一个',
@@ -224,6 +288,20 @@ const contextV1Schema = z.object({
 
 const dreamRunV1Schema = z.object({
   batch_size: z.coerce.number().int().min(1).max(200).optional(),
+});
+
+/* v6.1 P2：实体 / 关系图查询 */
+const entityGraphQueryV1Schema = z.object({
+  person_id: z.string().trim().max(128).optional(),
+  personId: z.string().trim().max(128).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+
+const entityListQueryV1Schema = z.object({
+  person_id: z.string().trim().max(128).optional(),
+  personId: z.string().trim().max(128).optional(),
+  q: z.string().trim().max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
 });
 
 /* ------------------------------------------------------------------ */
@@ -353,7 +431,10 @@ export function registerV1Routes(router: Router): void {
     handler: (rc: RequestContext) => {
       const partition = partitionOfPathForWrite(rc);
       const query = rc.query(personListQueryV1Schema);
-      const page = rc.app.engine.listPersons(partition.id, query);
+      const page = rc.app.engine.listPersons(partition.id, {
+        ...query,
+        includeMerged: query.include_merged === true || query.includeMerged === true,
+      });
       markUsage(rc, partition, query.q ? 'search' : 'list', 'api', page.items.length);
       rc.json(cursorV1(page, personV1));
     },
@@ -377,6 +458,7 @@ export function registerV1Routes(router: Router): void {
           displayName: body.display_name,
           attributes: body.attributes,
           status: body.status,
+          consent: body.consent,
         },
         actorOf(rc),
       );
@@ -414,10 +496,203 @@ export function registerV1Routes(router: Router): void {
           displayName: body.display_name,
           attributes: body.attributes,
           status: body.status,
+          consent: body.consent,
         },
         actorOf(rc),
       );
       rc.json(personV1(person));
+    },
+  });
+
+  /* --- v6.1 P1：画像 / 生命周期 --- */
+  router.add({
+    method: 'GET',
+    path: '/v1/partitions/:partition/persons/:person/profile',
+    auth: 'apikey',
+    scopes: ['memories:read'],
+    handler: async (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const query = rc.query(personProfileQueryV1Schema);
+      const ref = personRef(rc);
+      const force = query.force === true || query.refresh === true;
+      const profile = rc.app.engine.refreshPersonProfile
+        ? await rc.app.engine.refreshPersonProfile(partition.id, ref, { force })
+        : rc.app.engine.personProfile(partition.id, ref);
+      markUsage(rc, partition, 'profile', 'api', profile.facts.length);
+      rc.json(personProfileV1(profile));
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/v1/partitions/:partition/persons/:person/facts',
+    auth: 'apikey',
+    scopes: ['memories:read'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const facts = rc.app.engine.listPersonFacts(partition.id, personRef(rc));
+      markUsage(rc, partition, 'facts.list', 'api', facts.length);
+      rc.json({ items: facts.map(personFactV1) });
+    },
+  });
+
+  router.add({
+    method: 'PUT',
+    path: '/v1/partitions/:partition/persons/:person/facts',
+    auth: 'apikey',
+    scopes: ['memories:write'],
+    handler: async (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      assertWritable(partition);
+      const body = await rc.body(personFactsPutV1Schema);
+      const actor = actorOf(rc);
+      const ref = personRef(rc);
+      if ('facts' in body && Array.isArray(body.facts)) {
+        const items = body.facts.map((input) =>
+          rc.app.engine.upsertPersonFact(
+            partition.id,
+            ref,
+            {
+              key: input.key,
+              value: input.value,
+              confidence: input.confidence,
+              sourceMemoryId: input.source_memory_id ?? input.sourceMemoryId,
+            },
+            actor,
+          ),
+        );
+        rc.json({ items: items.map(personFactV1) });
+        return;
+      }
+      const single = body as z.output<typeof personFactInputV1Schema>;
+      const fact = rc.app.engine.upsertPersonFact(
+        partition.id,
+        ref,
+        {
+          key: single.key,
+          value: single.value,
+          confidence: single.confidence,
+          sourceMemoryId: single.source_memory_id ?? single.sourceMemoryId,
+        },
+        actor,
+      );
+      rc.json({ fact: personFactV1(fact) });
+    },
+  });
+
+  router.add({
+    method: 'DELETE',
+    path: '/v1/partitions/:partition/persons/:person/facts/:factId',
+    auth: 'apikey',
+    scopes: ['memories:write'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const factId = rc.params.factId ?? '';
+      if (!factId) throw errors.badRequest('缺少路径参数 factId');
+      rc.app.engine.removePersonFact(partition.id, personRef(rc), factId, actorOf(rc));
+      rc.res.statusCode = 204;
+      rc.res.end();
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/v1/partitions/:partition/persons/:person/merge',
+    auth: 'apikey',
+    scopes: ['admin'],
+    handler: async (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      assertWritable(partition);
+      const body = await rc.body(personMergeV1Schema);
+      const targetRef =
+        body.target_id ?? body.targetId ?? body.target_external_id ?? body.targetExternalId ?? '';
+      const result = rc.app.engine.mergePersons(partition.id, personRef(rc), targetRef, actorOf(rc));
+      markUsage(rc, partition, 'person.merge', 'api', result.movedMemories);
+      rc.json(personMergeResultV1(result));
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/v1/partitions/:partition/persons/:person/archive',
+    auth: 'apikey',
+    scopes: ['memories:write'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      assertWritable(partition);
+      const person = rc.app.engine.archivePerson(partition.id, personRef(rc), actorOf(rc));
+      rc.json(personV1(person));
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/v1/partitions/:partition/persons/:person/export',
+    auth: 'apikey',
+    scopes: ['memories:read'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const exported = rc.app.engine.exportPerson(partition.id, personRef(rc));
+      markUsage(rc, partition, 'person.export', 'api', exported.memories.length);
+      rc.json(personExportV1(exported));
+    },
+  });
+
+  router.add({
+    method: 'DELETE',
+    path: '/v1/partitions/:partition/persons/:person',
+    auth: 'apikey',
+    scopes: ['admin'],
+    handler: async (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const query = rc.query(personDeleteQueryV1Schema);
+      let hard = query.hard === true;
+      if (!hard) {
+        // 兼容 DELETE body { hard: true }（部分客户端不方便拼 query）。
+        const raw = await rc.readBody();
+        if (raw && typeof raw === 'object' && (raw as Record<string, unknown>).hard === true) hard = true;
+      }
+      rc.app.engine.deletePerson(partition.id, personRef(rc), { hard }, actorOf(rc));
+      rc.res.statusCode = 204;
+      rc.res.end();
+    },
+  });
+
+  /* --- v6.1 P2：实体 / 关系图 --- */
+  router.add({
+    method: 'GET',
+    path: '/v1/partitions/:partition/graph',
+    auth: 'apikey',
+    scopes: ['memories:read'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const query = rc.query(entityGraphQueryV1Schema);
+      const graph = rc.app.engine.entityGraph({
+        partitionId: partition.id,
+        personId: query.person_id ?? query.personId,
+        limit: query.limit,
+      });
+      markUsage(rc, partition, 'graph', 'api', graph.stats.nodes);
+      rc.json(graphV1(graph));
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/v1/partitions/:partition/entities',
+    auth: 'apikey',
+    scopes: ['memories:read'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const query = rc.query(entityListQueryV1Schema);
+      const result = rc.app.engine.listEntities({
+        partitionId: partition.id,
+        personId: query.person_id ?? query.personId,
+        q: query.q,
+        limit: query.limit,
+      });
+      markUsage(rc, partition, 'entities.list', 'api', result.items.length);
+      rc.json({ items: result.items.map(entityV1), next_cursor: result.nextCursor });
     },
   });
 
@@ -476,6 +751,7 @@ export function registerV1Routes(router: Router): void {
         supersedesId: body.supersedes_id,
         factKey: body.fact_key,
         validFrom: body.valid_from,
+        attachments: body.attachments,
         actor: actorOf(rc),
       });
       rc.markUsage({ partitionId: partition.id, operation: 'add', channel: 'api', orgId: partition.orgId });

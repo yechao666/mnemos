@@ -33,6 +33,7 @@ export {
   enqueueMemoryJobs,
   executeJob,
   extractEntities,
+  linkCoOccurringRelations,
   MAX_JOB_ATTEMPTS,
   processJobs,
   requeueStaleJobs,
@@ -43,4 +44,35 @@ export {
 } from './jobs.ts';
 export { writeHistory, listMemoryHistory } from './history.ts';
 export { llmText } from './llm.ts';
+export {
+  buildDeterministicSummary,
+  getPersonProfile,
+  listPersonFacts,
+  normalizeFactInput,
+  profileSourceHash,
+  refreshPersonProfile,
+  removePersonFact,
+  syncFactsFromMemories,
+  upsertPersonFact,
+} from './profile.ts';
+export {
+  archivePerson,
+  deletePerson,
+  exportPerson,
+  mergePersons,
+  resolvePersonRow,
+} from './persons.ts';
+export { PERSON_EXPORT_MEMORY_LIMIT } from './persons.ts';
+/* --- v6.1 P2 --- */
+export { buildEntityGraph, listEntities } from './graph.ts';
+export {
+  attachmentCaptions,
+  attachmentCounts,
+  insertAttachments,
+  listAttachments,
+  normalizeAttachments,
+  withAttachmentCounts,
+} from './attachments.ts';
+export { redactPii, applyPiiRedaction } from '../lib/pii.ts';
+export { decryptField, encryptField, encryptionKeyFromEnv, isEncryptedField } from '../lib/crypto.ts';
 export type { LlmConfig };

@@ -1,243 +1,272 @@
-# `mnemos-sdk` — Mnemos Python SDK
+# `mnemos-sdk` — Mnemos v6.1 Python SDK
 
-Mnemos 官方 Python 客户端（同步）：记忆写入、混合检索、Agent 注册表、任务会话与任务简报、图谱 / 统计、导入导出，以及 Webhook（beta）。
+Mnemos 官方 Python 客户端（同步）：**分区（Partition）+ 人（Person）+ 记忆（Memory）**。
+面向 `/v1/partitions/:partition/...` 公开 API（API Key 鉴权、`snake_case` 契约）。
 
 - **零第三方依赖**：只用标准库 `urllib` / `json` / `dataclasses` / `typing`；
-- **Python ≥ 3.9**；
-- 面向 `/v1/*` 公开 API（API Key 鉴权、snake_case 契约），带 `py.typed` 类型标记。
+- **Python ≥ 3.9**，带 `py.typed`（PEP 561）；
+- 人 / 记忆列表统一**游标分页**：`{ items, next_cursor, partition_stats }`，**不返回 total**；
+- v6.1：混合检索信号（`score` / `signals` / `matched_on`）、记忆历史、检索反馈、
+  时效字段（`valid_from` / `valid_to` / `superseded_by` / `supersedes` / `fact_key`）；
+- 可选 P1 接口（画像 / facts / merge / archive / export / delete）按契约提供，
+  服务端端点上线后可直接使用。
+
+> 旧的 v5 SDK（`mnemos_sdk` 包，Agent / 任务 / Webhook 模型）已随 v6 重建移除；
+> v6.1 把「记忆永远属于一个人」作为唯一写入路径。
+
+---
 
 ## 安装
 
 ```bash
-# 发布后
-pip install mnemos-sdk
-
-# 仓库内
+# 仓库内（推荐先建虚拟环境）
 pip install ./sdk/python
+
+# 或直接设置 PYTHONPATH（不安装）
+export PYTHONPATH="$PWD/sdk/python:$PYTHONPATH"
 ```
 
-要求 Python ≥ 3.9。
+发布后：`pip install mnemos-sdk`。
 
 ## 快速开始
 
 ```python
-from mnemos_sdk import MnemosApiError, MnemosClient
+from mnemos import MnemosClient
 
 client = MnemosClient(
-    "mnemos_live_demo_atlas_ci",          # 演示项目 Atlas
-    base_url="http://127.0.0.1:4380",     # 默认值
+    api_key="mnemos_live_…",                 # 也可用 MNEMOS_API_KEY
+    base_url="http://127.0.0.1:4380",        # 默认值，也可用 MNEMOS_BASE_URL
+    partition="ws-demo",                     # 可选默认分区（id 或 slug）
 )
 
-# 1. 写入记忆
-added = client.memories.add(
-    messages=[{"role": "user", "content": "我是张倩，偏好企业微信联系。"}],
-    user_id="cust-1042",
-    agent_id="agent-support-l1",
-    infer=True,
+# 1) 建 / 幂等 upsert 人（App 用户、员工、智能体都是「人」）
+person = client.persons.upsert(
+    "user-1",
+    type="human",
+    display_name="周野",
+    attributes={"team": "core"},
 )
 
-# 2. 混合检索
-hits = client.memories.search(
-    "张倩的联系偏好",
-    user_id="cust-1042",
-    top_k=5,
-    threshold=0.2,
+# 2) 写记忆（person 必填；scope 缺省取分区设置）
+result = client.memories.add(
+    "user-1",
+    text="周野偏好中文评审意见，先看结论。",
+    scope="partition",          # person=仅本人 / partition=分区共享 / session=仅会话
+    category="preference",
+    importance=0.8,
+    tags=["偏好"],
 )
-for hit in hits.results:
-    print(hit.score, hit.content)  # content 与 memory 是同一个正文
+print(result.event, result.memory.id)   # ADD / MERGE / NOOP / SUPERSEDE
 
-# 3. 任务简报（可直接拼进 system prompt）
-briefing = client.context.build(
-    agent_id="agent-support-l1",
-    query="客户联系方式偏好",
-    budget_tokens=800,
-)
-print(briefing.prompt)
+# 3) 混合检索（默认 hybrid），信号可解释
+response = client.memories.search("评审偏好", top_k=5)
+for hit in response.hits:
+    print(hit.score, hit.signals.keyword, hit.signals.vector, hit.content)
+
+# 4) 人的上下文 / 简报（可直接注入提示词）
+ctx = client.context("user-1", query="评审关注点", budget_tokens=800)
+print(ctx.prompt)
+brief = client.brief("user-1", max_chars=400)
+print(brief.text)
 ```
 
-仓库内可运行示例：
+可运行示例：
 
 ```bash
+MNEMOS_API_KEY=mnemos_live_… \
+MNEMOS_BASE_URL=http://127.0.0.1:4380 \
+MNEMOS_PARTITION=ws-demo \
 python3 sdk/python/examples/basic.py
-# 可选：MNEMOS_API_KEY=... MNEMOS_BASE_URL=... python3 sdk/python/examples/basic.py
 ```
 
 ## 客户端配置
 
 ```python
 client = MnemosClient(
-    "mnemos_live_xxx",
-    base_url="https://mnemos.example.com",  # 默认 http://127.0.0.1:4380
-    timeout=30.0,                          # 单次尝试超时（秒），默认 30
-    max_retries=2,                         # 默认 2
+    api_key="mnemos_live_…",
+    base_url="http://127.0.0.1:4380",
+    partition="ws-demo",       # 可选默认分区
+    person="user-1",           # 可选默认人
+    timeout=30.0,              # 单次请求超时（秒）
+    max_retries=2,             # GET / 幂等写 / 检索的重试次数
+    retry_base_delay=0.2,      # 指数退避基数（秒）
 )
 ```
 
-`base_url` 允许带路径前缀，SDK 会保留。
+- `base_url` 允许带路径前缀，尾斜杠自动去掉；
+- `MnemosClient("http://host", "mnemos_live_…")` 这种反序参数也会被自动纠正；
+- 未传 `api_key` / `base_url` 时读 `MNEMOS_API_KEY` / `MNEMOS_BASE_URL`；
+- 也支持 `with MnemosClient(...) as client:`（`close()` 是空操作，urllib 每请求独立连接）。
 
 ## API 一览
 
-| 资源 | 方法 |
-| --- | --- |
-| `client.memories` | `add` / `search` / `list` / `get` / `update` / `delete` / `history` / `feedback` |
-| `client.agents` | `list` / `create` |
-| `client.tasks` | `list` / `create` / `get` / `finish` |
-| `client.context` | `build` |
-| `client` | `graph(limit=120)` / `stats()` / `health()` / `export()` / `import_memories(doc)` |
-| `client.webhooks` | `list` / `create` / `update` / `delete` / `rotate_secret` / `deliveries` / `replay`（**beta**） |
+### 分区 `client.partitions`
 
-> `import` 是 Python 关键字，因此导入方法是 `client.import_memories(...)`，并提供 `client.import_(...)` 别名。
+| 方法 | 端点 | 说明 |
+| --- | --- | --- |
+| `list()` | `GET /v1/partitions` | 本组织分区（需 org key，每项带 `stats`） |
+| `create(slug, name=…, description=…, status=…, settings=…)` | `POST /v1/partitions` | 按 slug 幂等 upsert（org key + admin） |
+| `get(ref=None)` | `GET /v1/partitions/:p` | 分区信息（不含 stats） |
+| `update(ref=None, …)` | `PATCH /v1/partitions/:p` | 名称 / 描述 / 状态 / 设置 |
+| `stats(ref=None)` | `GET /v1/partitions/:p/stats` | 统计（读 `partition_stats`，O(1)） |
 
-写请求通过 `idempotency_key` 传入幂等键：
+`client.stats()` 是 `client.partitions.stats()` 的便捷入口。
+
+### 人 `client.persons`
+
+| 方法 | 端点 | 说明 |
+| --- | --- | --- |
+| `list(partition=None, type=…, status=…, q=…, sort=…, cursor=…, limit=…)` | `GET .../persons` | 游标分页；`sort` = `recent` / `new` / `name` |
+| `get(person=None, partition=None)` | `GET .../persons/:person` | 内部 id 或 external_id |
+| `upsert(external_id, type=…, display_name=…, attributes=…, status=…)` | `PUT .../persons/:externalId` | 建档 / 更新 |
+| `update(person=None, type=…, display_name=…, attributes=…, status=…)` | `PATCH .../persons/:person` | 部分更新 |
+| `memories(person=None, scope=…, category=…, status=…, q=…, cursor=…, limit=…)` | `GET .../persons/:person/memories` | 某人的记忆 |
+
+### 记忆 `client.memories`
+
+| 方法 | 端点 | 说明 |
+| --- | --- | --- |
+| `add(person=None, text=… / content=… / messages=…, …)` | `POST .../persons/:person/memories` | 写入；返回 `{memory, event, superseded_id}` |
+| `list(partition=None, person_id=…, person_external_id=…, scope=…, category=…, status=…, q=…, cursor=…, limit=…)` | `GET .../memories` | 分区记忆列表 |
+| `list_by_person(person=None, …)` | `GET .../persons/:person/memories` | 等价 `persons.memories` |
+| `search(query, top_k=…, mode=…, as_of=…, include_superseded=…)` | `POST .../memories/search` | 混合检索；返回 `hits` + `signals` |
+| `get(memory_id)` | `GET .../memories/:id` | `{memory, person}` |
+| `update(memory_id, content=…, …)` | `PATCH .../memories/:id` | 部分更新 |
+| `delete(memory_id)` | `DELETE .../memories/:id` | 204 |
+| `history(memory_id)` | `GET .../memories/:id/history` | ADD/UPDATE/MERGE/SUPERSEDE/DELETE/NOOP/FEEDBACK |
+| `feedback(memory_id, helpful, query=…, reason=…)` | `POST .../memories/:id/feedback` | 检索反馈（调 confidence） |
+
+### 简报 / 上下文 / 做梦 `client.*`
+
+| 方法 | 端点 | 说明 |
+| --- | --- | --- |
+| `brief(person=None, max_chars=…, force=…)` | `GET .../persons/:person/brief` | 可注入提示词的 `text` |
+| `context(person=None, query=…, budget_tokens=…, include_partition=…)` | `POST .../persons/:person/context` | 资料 + 简报 + 记忆 + 共享知识 + `prompt` |
+| `dream_status(person=None)` | `GET .../persons/:person/dream` 或分区级 | 做梦设置 / 待巩固数 / 最近运行 |
+| `dream_run(person=None, batch_size=…)` | `POST .../persons/:person/dream/run` | 手动触发一次做梦 |
+| `dream(person=None, run=False, batch_size=…)` | — | `run=False` 状态 / `run=True` 触发 |
+| `health()` | `GET /health` | 无需鉴权 |
+
+### v6.1 P1：画像 / 生命周期（可选，端点上线后可用）
+
+| 方法 | 约定端点 | 说明 |
+| --- | --- | --- |
+| `persons.profile(person=None, force=…)` | `GET .../persons/:person/profile` | `PersonProfile`（当前 facts + summary；`force` 跳过缓存） |
+| `persons.facts(person=None)` | `GET .../persons/:person/facts` | 当前有效事实槽位 |
+| `persons.upsert_fact(person=None, key=…, value=…)` | `PUT .../persons/:person/facts` | 显式维护单个槽位（响应 `{fact}` 自动解包） |
+| `persons.upsert_facts(person=None, facts=[…])` | `PUT .../persons/:person/facts` | 批量维护槽位（body `{facts}`，响应 `{items}`） |
+| `persons.remove_fact(person=None, fact_id=…)` | `DELETE .../persons/:person/facts/:factId` | 删除槽位 |
+| `persons.merge(person=None, target=…)` | `POST .../persons/:person/merge` body `{target_id}` | 合并到 canonical 人 |
+| `persons.archive(person=None)` | `POST .../persons/:person/archive` | 归档 |
+| `persons.export(person=None)` | `GET .../persons/:person/export` | 合规导出（含 `truncated` 标记） |
+| `persons.delete(person=None, hard=False)` | `DELETE .../persons/:person?hard=true` | 软删 / 硬删 |
+
+这些端点由 P1 后端提供（v6.1 已实现 v1 路由）；SDK 已按同一契约实现路径与字段，
+未部署 P1 的旧服务会返回 `404 NOT_FOUND`。
+
+## 游标分页
 
 ```python
-client.memories.add(
-    text="必须保留的决策",
-    user_id="u-1",
-    idempotency_key="memory-add-20261105-0001",
+cursor = None
+while True:
+    page = client.memories.list(partition="ws-demo", limit=100, cursor=cursor)
+    for memory in page.items:
+        print(memory.id, memory.content)
+    print("分区统计：", page.partition_stats.memories_total if page.partition_stats else None)
+    cursor = page.next_cursor
+    if not cursor:
+        break
+```
+
+- `limit` 默认 50、最大 200（服务端夹取）；`next_cursor is None` 表示没有下一页；
+- **换 `sort` 必须丢弃旧游标**，否则服务端返回 `400 INVALID_CURSOR`；
+- 列表不返回 `total`，头部统计用响应里的 `partition_stats`。
+
+## 检索信号
+
+```python
+response = client.memories.search(
+    "评审偏好",
+    top_k=8,
+    mode="hybrid",              # hybrid | keyword | vector
+    as_of="2026-10-01T00:00:00Z",  # 回看当时有效的事实（P1）
+    include_superseded=False,
+)
+print(response.mode, response.strategy, response.took_ms)
+for hit in response.hits:
+    print(hit.score, hit.signals.vector, hit.signals.keyword,
+          hit.signals.recency, hit.signals.importance, hit.signals.entity,
+          hit.matched_on)
+```
+
+`signals` 权重来自分区 `settings.retrieval_weights`，默认
+`vector 0.45 / keyword 0.30 / recency 0.15 / importance 0.10 / entity 0`。
+
+## 写入去重 / 合并 / 取代
+
+```python
+# 完全重复 → NOOP（不新增，返回已有记忆）
+# 余弦 ≥ mergeThreshold → MERGE
+# 显式 supersedes_id 或同 fact_key → 旧记忆 valid_to=now，新记忆 supersedes=旧
+result = client.memories.add(
+    "user-1",
+    text="用户偏好英文回复",
+    fact_key="preference.language",
+    supersedes_id="mem_old",
+    idempotency_key="req-20261118-1",   # POST 写请求幂等键
 )
 ```
 
-### 命名约定
-
-- 全部使用 **snake_case**（`user_id`、`top_k`、`include_private`、`created_at`、`matched_on`）；
-- 模型类的 `from_dict` 同时兼容服务端个别接口返回的 camelCase（例如写入接口的 `createdAt`）；
-- 记忆正文同时暴露 `content` 与 `memory` 属性（`memory` 是只读别名）；
-- 任务简报的 `agent` / `task` 可能为 `None`（未指定时）。
+- `idempotency_key` 会以 `Idempotency-Key` 头发送，24h 内相同 key+body 返回首次响应；
+- 写记忆这类非幂等 POST **不会自动重试**，避免重复写入；
+- GET / PUT / PATCH / DELETE 与 `memories.search` 在 429/5xx/网络错误时指数退避重试，
+  并尊重 `Retry-After`。
 
 ## 错误处理
 
-所有失败都抛 `MnemosApiError`（`mnemos_sdk.MnemosApiError`）：
-
 ```python
-from mnemos_sdk import MnemosApiError
+from mnemos import MnemosApiError, MnemosNetworkError, MnemosError
 
 try:
-    client.memories.get("mem_missing")
+    client.persons.get("nobody")
 except MnemosApiError as error:
-    print(error.status)      # HTTP 状态；网络/超时为 0
-    print(error.code)        # 稳定错误码，比较时建议忽略大小写
-    print(error.message)     # 可直接展示的中文文案
-    print(error.request_id)  # 服务端请求 ID，便于排查
-    print(error.details)     # 校验明细等
+    print(error.status, error.code, error.message, error.request_id)
+    if error.code == "NOT_FOUND":
+        ...
+    elif error.is_rate_limited:
+        ...
+except MnemosNetworkError as error:
+    print("网络/超时：", error)
 ```
 
-常见错误码（`docs/api.md`）：
-
-| HTTP | code | 含义 |
-| --- | --- | --- |
-| 400 | `validation_error` | 参数不合法（`details` 带字段明细） |
-| 401 | `unauthorized` | 缺少/无效 API Key |
-| 403 | `forbidden` | 作用域不足（如缺 `memories:write`） |
-| 404 | `not_found` | 资源不存在或不属于该项目 |
-| 409 | `conflict` | 唯一约束 / 幂等键冲突 |
-| 413 | `payload_too_large` | 请求体超过 1 MB |
-| 422 | `unprocessable` | 语义校验失败 |
-| 429 | `rate_limited` | 超出限流或配额 |
-| 500 | `internal_error` | 服务端异常 |
-
-> 当前服务端实现返回大写错误码（如 `VALIDATION_ERROR`），SDK 原样透传；建议用 `error.code.lower()` 比较。
-
-网络错误与超时也使用 `MnemosApiError`：
-
-| 场景 | `status` | `code` |
-| --- | --- | --- |
-| DNS / 连接失败 | `0` | `network_error` |
-| 超时 | `0` | `timeout` |
-
-## 重试语义
-
-默认 `max_retries = 2`（即最多 3 次尝试）：
-
-- **会重试**：`429`、`502`、`503`、`504`、网络错误与超时；
-- **不会重试**：`400/401/403/404/409/413/422/500` 等确定性错误；
-- 退避：`200ms × 2^attempt` + 最多 50% 抖动（`time.sleep`）；
-- 响应带 `Retry-After`（秒数或 HTTP 日期）时优先按它等待；
-- **非幂等 POST** 只有传入 `idempotency_key` 才重试；`POST /v1/memories/search` 是只读接口，可安全重试；
-- `GET` / `PUT` / `PATCH` / `DELETE` 默认允许重试；
-- 超时按**单次尝试**计算（`urllib` 的 `timeout`），重试会重新计时。
-
-## 幂等键
-
-- 通过 `idempotency_key` 显式传入，SDK **不会自动生成**；
-- 服务端要求 8–128 字符；相同 key + 相同请求体在 24h 内回放首次响应，请求体不同返回 `409 idempotency_conflict`；
-- 重试时复用同一个 key，因此带 key 的写请求是安全的；
-- 适用接口：`POST /v1/memories`、`POST /v1/tasks`、`POST /v1/tasks/{id}/finish` 等写接口。
-
-## 可见性参数
-
-| `visibility` | 谁能看到 |
-| --- | --- |
-| `project`（默认） | 项目内所有 Agent（共享） |
-| `agent` | 仅写入该记忆的 Agent（`agent_id`） |
-| `task` | 仅当前任务（`task_id`） |
-
-检索时的 `agent_id` 是**调用方身份**：决定可见的私有记忆，但不会过滤其他 Agent 写入的项目共享记忆。
-需要查看所有 Agent 私有记忆（控制台/审计）时传 `include_private=True`（需服务端支持）；
-`written_by_agent_id` 才是“只看某 Agent 写入”的归属过滤。
-
-## 导入 / 导出
-
-```python
-document = client.export()        # ProjectExport，已归一化为 snake_case 模型
-client.import_memories(document)  # 自动转回服务端导入格式；≤1000 条/次
-```
-
-`export()` 返回 `ProjectExport`（`memories` / `agents` / `tasks` / `project`），
-`import_memories()` 也接受 `{"memories": [...]}` 字典；导入去重计入 `skipped`。
-
-## Webhook（beta）
-
-服务端 `/v1/webhooks` 已实现，SDK 覆盖完整生命周期（标记 **beta**，字段可能调整）：
-
-```python
-hooks = client.webhooks.list()            # .results / .count（服务端返回数组）
-hook = client.webhooks.create(
-    "CI 回调",
-    "https://ci.example.com/hook",
-    event_types=["memory.created"],       # 至少订阅一个事件
-)                                          # 响应含一次性明文 secret
-client.webhooks.update(hook.id, enabled=False)
-client.webhooks.delete(hook.id)            # MutationResult(message="ok", ok=True)
-
-deliveries = client.webhooks.deliveries(hook.id, page=1, page_size=20, status="failed")
-# deliveries.items / page / page_size / total / total_pages
-client.webhooks.replay("del_xxx")          # POST /v1/webhook-deliveries/{id}/replay
-```
-
-作用域：列表与投递记录需要 `memories:read`；创建 / 更新 / 删除 / 轮换需要 `admin`。
-事件类型：`memory.created`、`memory.updated`、`memory.deleted`、`task.finished`、
-`agent.registered`、`key.created`、`key.revoked`、`quota.exceeded`。
+- 服务端错误体 `{"error": {"code", "message", "requestId", "details"}}` 被映射为
+  `MnemosApiError`（属性：`status` / `code` / `message` / `request_id` / `details` /
+  `retry_after` / `payload`）；
+- 判断逻辑用稳定 `code`（如 `NOT_FOUND`、`VALIDATION`、`RATE_LIMITED`、
+  `QUOTA_EXCEEDED`、`PARTITION_ARCHIVED`），不要匹配中文 `message`；
+- 网络失败 / 超时分别抛 `MnemosNetworkError` / `MnemosTimeoutError`（均继承 `MnemosError`）。
 
 ## 测试
 
-从仓库根目录执行：
+测试使用本地 `http.server` fake（随机端口，无外部服务），覆盖签名、游标、检索信号与错误映射：
 
 ```bash
-python3 -m unittest discover -s sdk/python/tests -v
+cd sdk/python
+python3 -m unittest discover -s tests -v
 ```
 
-测试使用随机端口的 `ThreadingHTTPServer` mock，覆盖鉴权头、请求体、查询参数、错误映射、
-幂等键、429 / 5xx 重试、`Retry-After`、超时、非幂等 POST 不重试与 webhook 路径，共 13 个用例。
+## 目录结构
 
-## 版本兼容
-
-- SDK `1.x` 对应 **Mnemos API v1**（`/v1/*`）；
-- 同一大版本内只做向后兼容增量（新增可选字段/方法），不会移除已有字段；
-- 服务端新增字段会被忽略，旧字段缺失时提供空值/默认值；
-- `beta` 标注的 Webhook API 不在兼容性承诺内。
-
-## 目录
-
-```
-sdk/python
-├── mnemos_sdk/
-│   ├── __init__.py   # 公开导出
-│   ├── client.py     # 同步客户端、传输层、重试
-│   ├── types.py      # dataclass 模型与 from_dict
-│   ├── errors.py     # MnemosApiError
+```text
+sdk/python/
+├── mnemos/
+│   ├── __init__.py     # 公共入口
+│   ├── client.py       # MnemosClient + partitions/persons/memories 资源
+│   ├── errors.py       # 错误类型
+│   ├── types.py        # dataclass 模型（from_dict 宽容解析）
 │   └── py.typed
-├── tests/test_client.py
 ├── examples/basic.py
-└── pyproject.toml
+├── tests/test_client.py
+├── pyproject.toml
+└── README.md
 ```

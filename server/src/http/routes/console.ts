@@ -17,6 +17,8 @@ import {
   apiKeyRotateSchema,
   auditQuerySchema,
   dreamRunSchema,
+  entityGraphQuerySchema,
+  entityListQuerySchema,
   memoryAddSchema,
   memoryFeedbackSchema,
   memoryListQuerySchema,
@@ -26,7 +28,11 @@ import {
   partitionUpsertSchema,
   personBriefQuerySchema,
   personContextSchema,
+  personDeleteQuerySchema,
+  personFactsPutSchema,
   personListQuerySchema,
+  personMergeSchema,
+  personProfileQuerySchema,
   personUpdateSchema,
   personUpsertSchema,
   usageQuerySchema,
@@ -39,7 +45,7 @@ import {
  * 列表统一 CursorPage { items, nextCursor, partitionStats }。
  */
 
-function partitionFor(rc: RequestContext, minRole: 'viewer' | 'developer' | 'admin' = 'viewer'): Partition {
+function partitionFor(rc: RequestContext, minRole: 'viewer' | 'developer' | 'admin' | 'owner' = 'viewer'): Partition {
   const ref = rc.params.partition;
   if (!ref) throw errors.badRequest('缺少路径参数 partition');
   return requireConsolePartition(rc, ref, minRole);
@@ -155,7 +161,10 @@ export function registerConsoleRoutes(router: Router): void {
     handler: (rc: RequestContext) => {
       const partition = partitionFor(rc);
       const query = rc.query(personListQuerySchema);
-      const page = rc.app.engine.listPersons(partition.id, query);
+      const page = rc.app.engine.listPersons(partition.id, {
+        ...query,
+        includeMerged: query.includeMerged === true || query.include_merged === true,
+      });
       rc.markUsage({ partitionId: partition.id, operation: query.q ? 'search' : 'list', channel: 'console' });
       rc.noteUsage(page.items.length);
       rc.json(page);
@@ -180,6 +189,7 @@ export function registerConsoleRoutes(router: Router): void {
           displayName: body.displayName,
           attributes: body.attributes,
           status: body.status,
+          consent: body.consent,
         },
         actorForUser(rc, auth.user),
       );
@@ -214,10 +224,200 @@ export function registerConsoleRoutes(router: Router): void {
           displayName: body.displayName,
           attributes: body.attributes,
           status: body.status,
+          consent: body.consent,
         },
         actorForUser(rc, auth.user),
       );
       rc.json(person);
+    },
+  });
+
+  /* --- v6.1 P1：画像 / 生命周期 --- */
+  router.add({
+    method: 'GET',
+    path: '/api/partitions/:partition/persons/:person/profile',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const partition = partitionFor(rc);
+      const query = rc.query(personProfileQuerySchema);
+      const ref = personRef(rc);
+      const force = query.force === true || query.refresh === true;
+      const profile = rc.app.engine.refreshPersonProfile
+        ? await rc.app.engine.refreshPersonProfile(partition.id, ref, { force })
+        : rc.app.engine.personProfile(partition.id, ref);
+      rc.markUsage({ partitionId: partition.id, operation: 'profile', channel: 'console' });
+      rc.noteUsage(profile.facts.length);
+      rc.json(profile);
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/api/partitions/:partition/persons/:person/facts',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const partition = partitionFor(rc);
+      const facts = rc.app.engine.listPersonFacts(partition.id, personRef(rc));
+      rc.json({ items: facts });
+    },
+  });
+
+  router.add({
+    method: 'PUT',
+    path: '/api/partitions/:partition/persons/:person/facts',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const partition = partitionFor(rc, 'developer');
+      assertWritable(partition);
+      const auth = requireConsoleAuth(rc);
+      const body = await rc.body(personFactsPutSchema);
+      const actor = actorForUser(rc, auth.user);
+      const ref = personRef(rc);
+      if ('facts' in body && Array.isArray(body.facts)) {
+        const items = body.facts.map((input) =>
+          rc.app.engine.upsertPersonFact(
+            partition.id,
+            ref,
+            {
+              key: input.key,
+              value: input.value,
+              confidence: input.confidence,
+              sourceMemoryId: input.sourceMemoryId ?? input.source_memory_id,
+            },
+            actor,
+          ),
+        );
+        rc.json({ items });
+        return;
+      }
+      const single = body as { key: string; value: string; confidence?: number; sourceMemoryId?: string; source_memory_id?: string };
+      const fact = rc.app.engine.upsertPersonFact(
+        partition.id,
+        ref,
+        {
+          key: single.key,
+          value: single.value,
+          confidence: single.confidence,
+          sourceMemoryId: single.sourceMemoryId ?? single.source_memory_id,
+        },
+        actor,
+      );
+      rc.json({ fact });
+    },
+  });
+
+  router.add({
+    method: 'DELETE',
+    path: '/api/partitions/:partition/persons/:person/facts/:factId',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const partition = partitionFor(rc, 'developer');
+      assertWritable(partition);
+      const auth = requireConsoleAuth(rc);
+      const factId = rc.params.factId ?? '';
+      if (!factId) throw errors.badRequest('缺少路径参数 factId');
+      rc.app.engine.removePersonFact(partition.id, personRef(rc), factId, actorForUser(rc, auth.user));
+      rc.res.statusCode = 204;
+      rc.res.end();
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/partitions/:partition/persons/:person/merge',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const partition = partitionFor(rc, 'admin');
+      assertWritable(partition);
+      const auth = requireConsoleAuth(rc);
+      const body = await rc.body(personMergeSchema);
+      const targetRef =
+        body.targetId ?? body.target_id ?? body.targetExternalId ?? body.target_external_id ?? '';
+      const result = rc.app.engine.mergePersons(partition.id, personRef(rc), targetRef, actorForUser(rc, auth.user));
+      rc.json(result);
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/partitions/:partition/persons/:person/archive',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const partition = partitionFor(rc, 'developer');
+      assertWritable(partition);
+      const auth = requireConsoleAuth(rc);
+      const person = rc.app.engine.archivePerson(partition.id, personRef(rc), actorForUser(rc, auth.user));
+      rc.json(person);
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/api/partitions/:partition/persons/:person/export',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const partition = partitionFor(rc);
+      const exported = rc.app.engine.exportPerson(partition.id, personRef(rc));
+      rc.markUsage({ partitionId: partition.id, operation: 'person.export', channel: 'console' });
+      rc.noteUsage(exported.memories.length);
+      rc.json({ ...exported, truncated: exported.truncated === true });
+    },
+  });
+
+  router.add({
+    method: 'DELETE',
+    path: '/api/partitions/:partition/persons/:person',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const query = rc.query(personDeleteQuerySchema);
+      let hard = query.hard === true;
+      if (!hard) {
+        const raw = await rc.readBody();
+        if (raw && typeof raw === 'object' && (raw as Record<string, unknown>).hard === true) hard = true;
+      }
+      const partition = partitionFor(rc, hard ? 'owner' : 'admin');
+      const auth = requireConsoleAuth(rc);
+      rc.app.engine.deletePerson(partition.id, personRef(rc), { hard }, actorForUser(rc, auth.user));
+      rc.res.statusCode = 204;
+      rc.res.end();
+    },
+  });
+
+  /* --- v6.1 P2：实体 / 关系图 --- */
+  router.add({
+    method: 'GET',
+    path: '/api/partitions/:partition/graph',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const partition = partitionFor(rc);
+      const query = rc.query(entityGraphQuerySchema);
+      const graph = rc.app.engine.entityGraph({
+        partitionId: partition.id,
+        personId: query.personId ?? query.person_id,
+        limit: query.limit,
+      });
+      rc.markUsage({ partitionId: partition.id, operation: 'graph', channel: 'console' });
+      rc.noteUsage(graph.stats.nodes);
+      rc.json(graph);
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/api/partitions/:partition/entities',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const partition = partitionFor(rc);
+      const query = rc.query(entityListQuerySchema);
+      const result = rc.app.engine.listEntities({
+        partitionId: partition.id,
+        personId: query.personId ?? query.person_id,
+        q: query.q,
+        limit: query.limit,
+      });
+      rc.markUsage({ partitionId: partition.id, operation: 'entities.list', channel: 'console' });
+      rc.noteUsage(result.items.length);
+      rc.json({ items: result.items, nextCursor: result.nextCursor });
     },
   });
 
@@ -276,6 +476,7 @@ export function registerConsoleRoutes(router: Router): void {
         supersedesId: body.supersedesId,
         factKey: body.factKey,
         validFrom: body.validFrom,
+        attachments: body.attachments,
         actor: actorForUser(rc, auth.user),
       });
       rc.markUsage({ partitionId: partition.id, operation: 'add', channel: 'console' });

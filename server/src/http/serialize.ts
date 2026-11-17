@@ -1,6 +1,9 @@
 import type {
   CursorPage,
+  EntityGraph,
+  EntitySummary,
   Memory,
+  MemoryAttachment,
   MemoryBrief,
   MemoryDreamResult,
   MemoryDreamRun,
@@ -13,6 +16,10 @@ import type {
   PartitionStats,
   Person,
   PersonContext,
+  PersonExport,
+  PersonFact,
+  PersonMergeResult,
+  PersonProfile,
 } from '../../../shared/src/types.ts';
 
 /**
@@ -40,6 +47,8 @@ export function settingsV1(settings: PartitionSettings): Json {
     merge_threshold: settings.mergeThreshold,
     dedupe_threshold: settings.dedupeThreshold,
     auto_extract_entities: settings.autoExtractEntities,
+    /* --- v6.1 P2 合规 --- */
+    pii_redaction: settings.piiRedaction,
   };
 }
 
@@ -90,6 +99,10 @@ export function personV1(person: Person): Json {
     last_seen_at: person.lastSeenAt,
     created_at: person.createdAt,
     updated_at: person.updatedAt,
+    /* --- v6.1 P1 --- */
+    merged_into: person.mergedInto ?? null,
+    consent: person.consent ?? {},
+    deleted_at: person.deletedAt ?? null,
   };
 }
 
@@ -122,6 +135,22 @@ export function memoryV1(memory: Memory): Json {
     fact_key: memory.factKey ?? null,
     feedback_up: memory.feedbackUp ?? 0,
     feedback_down: memory.feedbackDown ?? 0,
+    /* --- v6.1 P2 多模态 --- */
+    attachment_count: memory.attachmentCount ?? memory.attachments?.length ?? 0,
+    ...(memory.attachments ? { attachments: memory.attachments.map(attachmentV1) } : {}),
+  };
+}
+
+export function attachmentV1(attachment: MemoryAttachment): Json {
+  return {
+    id: attachment.id,
+    memory_id: attachment.memoryId,
+    kind: attachment.kind,
+    url: attachment.url,
+    mime: attachment.mime ?? null,
+    size: attachment.size ?? null,
+    caption: attachment.caption ?? null,
+    created_at: attachment.createdAt,
   };
 }
 
@@ -239,5 +268,95 @@ export function cursorV1<T>(page: CursorPage<T>, map: (item: T) => Json): Json {
     items: page.items.map(map),
     next_cursor: page.nextCursor,
     ...(page.partitionStats ? { partition_stats: statsV1(page.partitionStats) } : {}),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P2：实体 / 关系图                                               */
+/* ------------------------------------------------------------------ */
+
+export function graphV1(graph: EntityGraph): Json {
+  return {
+    nodes: graph.nodes.map((node) => ({
+      id: node.id,
+      label: node.label,
+      type: node.type,
+      weight: node.weight,
+      memories: node.memories,
+    })),
+    edges: graph.edges.map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      relation: edge.relation,
+      weight: edge.weight,
+    })),
+    stats: {
+      nodes: graph.stats.nodes,
+      edges: graph.stats.edges,
+      // 公开 v1 以 snake_case 为主；topTypes 作为兼容别名（与任务契约/控制台命名一致）。
+      top_types: graph.stats.topTypes,
+      topTypes: graph.stats.topTypes,
+    },
+  };
+}
+
+export function entityV1(entity: EntitySummary): Json {
+  return {
+    id: entity.id,
+    name: entity.name,
+    type: entity.type,
+    mention_count: entity.mentionCount,
+    memories: entity.memories,
+    created_at: entity.createdAt,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P1：画像 / 生命周期                                             */
+/* ------------------------------------------------------------------ */
+
+export function personFactV1(fact: PersonFact): Json {
+  return {
+    id: fact.id,
+    partition_id: fact.partitionId,
+    person_id: fact.personId,
+    key: fact.key,
+    value: fact.value,
+    confidence: fact.confidence,
+    valid_from: fact.validFrom,
+    valid_to: fact.validTo ?? null,
+    source_memory_id: fact.sourceMemoryId ?? null,
+    created_at: fact.createdAt,
+    updated_at: fact.updatedAt,
+  };
+}
+
+export function personProfileV1(profile: PersonProfile): Json {
+  return {
+    person: personV1(profile.person),
+    facts: profile.facts.map(personFactV1),
+    summary: profile.summary,
+    generated_at: profile.generatedAt ?? null,
+    ...(profile.cached !== undefined ? { cached: profile.cached } : {}),
+  };
+}
+
+export function personMergeResultV1(result: PersonMergeResult): Json {
+  return {
+    person: personV1(result.person),
+    merged_from: personV1(result.mergedFrom),
+    moved_memories: result.movedMemories,
+    moved_facts: result.movedFacts,
+  };
+}
+
+export function personExportV1(exported: PersonExport): Json {
+  return {
+    person: personV1(exported.person),
+    facts: exported.facts.map(personFactV1),
+    memories: exported.memories.map(memoryV1),
+    exported_at: exported.exportedAt,
+    truncated: exported.truncated === true,
   };
 }

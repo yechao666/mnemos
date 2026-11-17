@@ -1,4 +1,4 @@
-# 运维手册（v6）
+# 运维手册（v6.1）
 
 > 配套：[安全模型](security.md) · [可观测性](observability.md) · [百万级与压测](v6-scale.md) · [API](api.md)
 > 示例假设服务在 `http://127.0.0.1:4380`，演示账号 `admin@mnemos.dev / Demo123456`（仅演示环境）。
@@ -118,7 +118,7 @@ pnpm start
 
 创建后立即在控制台修改密码，并从环境变量中移除明文密码。
 
-## 3. 配置项（v6）
+## 3. 配置项（v6.1）
 
 完整列表与注释见 [`.env.example`](../.env.example)。生产要点：
 
@@ -143,7 +143,9 @@ pnpm start
 | `MNEMOS_MAINTENANCE_INTERVAL_MIN` | `360` | 维护任务间隔 |
 | `MNEMOS_BODY_LIMIT_BYTES` | `1048576` | 请求体上限 |
 | `MNEMOS_DREAM_SCHEDULER/TICK_MS` | `1` / `60000` | 分区级做梦调度 |
-| `MNEMOS_LLM_*` | 空 | 可选模型；不配则离线确定性实现 |
+| `MNEMOS_WECOM_MOCK` | 跟随 `MNEMOS_DEMO` | 登录页企业微信 Mock；生产必须 0 |
+| `MNEMOS_ENCRYPTION_KEY` | 空 | v6.1 P2：配置后 AES-256-GCM 加密 `memory_attachments.url`；空=明文 |
+| `MNEMOS_LLM_*` | 空 | 可选模型；不配则离线确定性实现（画像摘要同样回退确定性） |
 | `MNEMOS_STORAGE` | `sqlite` | postgres 未实现，启动会拒绝 |
 
 启动时 `assertEnv` 校验：数据/备份目录可写、端口/超时/维护间隔/日志级别合法、
@@ -250,7 +252,60 @@ K8s 参数建议：liveness `/healthz`（10s 周期，3 次失败）；readiness
 
 完整面板与告警见 [observability.md](observability.md)。
 
-## 7. 维护任务
+## 7. v6.1 异步任务、回填与评测
+
+### 7.1 异步写管线（memory_jobs）
+
+服务启动即拉起同进程 worker（`startMemoryJobWorker`），默认每 **1s** 处理一批（10 条）：
+
+- 任务来自写入事务：`embed`（补 embedding）、`extract`（实体/关系）、`profile`（facts/画像）。
+- 失败重试 5 次（指数退避）；重启后 `running` 超过 5 分钟自动重新入队，任务不丢。
+- 手动排障（admin）：`POST /api/ops/jobs/tick {"limit":20}` → `{claimed,done,failed,at}`；
+  可连续调用直到 `claimed=0`。
+- 观察积压：
+  ```bash
+  sqlite3 data-v6/mnemos.db "SELECT status, type, COUNT(*) FROM memory_jobs GROUP BY status, type;"
+  ```
+  大量 `pending` 且 worker 未动 → 检查进程是否存活、是否有长事务锁库；大量 `failed` 看 `error`。
+
+### 7.2 回填历史 embedding
+
+v6 → v7 迁移不阻塞启动；升级后旧记忆的 `embedding` 为空（检索会退化为 keyword 信号）：
+
+```bash
+# 全量补齐（默认读取 data-v6/mnemos.db）
+pnpm backfill:embeddings
+
+# 指定库 / 预演
+node scripts/backfill-embeddings.ts --db /var/lib/mnemos/mnemos.db
+node scripts/backfill-embeddings.ts --db /var/lib/mnemos/mnemos.db --dry-run
+```
+
+- 幂等：只处理 `embedding IS NULL`（或模型变更）的记忆；可重复执行。
+- 大数据量建议低峰运行；批事务写入，单进程单写者，避免与备份/VACUUM 并发。
+
+### 7.3 计数校准（reconcile）
+
+手工 SQL / 批量导入绕过触发器后，计数可能漂移：
+
+```bash
+curl -s -X POST http://127.0.0.1:4380/api/partitions/<partition>/reconcile   -H "authorization: Bearer $TOKEN" | jq .
+```
+
+重算该分区 `partition_stats` 与所有 `persons` 计数（全表聚合，低频操作）。人合并后同样建议执行。
+
+### 7.4 记忆质量评测（eval）
+
+```bash
+pnpm eval                      # 7 个场景，全通过 exit 0
+pnpm --silent eval > eval-report.json
+jq '.summary' eval-report.json
+```
+
+覆盖改写召回、时效更新、冲突取代、隔离、反馈调权、人合并、画像 facts；阈值与扩展见
+[`eval.md`](eval.md)。建议在 CI 中作为 `pnpm verify` 之外的门禁。
+
+## 8. 维护任务
 
 启动后 60s 首次执行，之后每 `MNEMOS_MAINTENANCE_INTERVAL_MIN`（默认 360 分钟）；
 也可 `POST /api/ops/maintenance` 手动触发（admin+）。
@@ -275,7 +330,7 @@ curl -s "http://127.0.0.1:4380/api/ops/maintenance?limit=20" -H "authorization: 
 
 失败会在 `maintenance_runs` 记录 `failed`，不中断调度器；大库首次归档建议低峰执行。
 
-## 8. 密钥轮换与登录锁定
+## 9. 密钥轮换与登录锁定
 
 ```bash
 # 创建最小作用域分区 key（secret 只返回一次）
@@ -301,13 +356,14 @@ curl -s -X DELETE http://127.0.0.1:4380/api/partitions/<partition>/keys/<keyId> 
 
 - 管理员重置账号密码：`POST /api/org/users/:id/reset-password`（返回一次性临时密码并清理会话）。
 
-## 9. 升级与回滚
+## 10. 升级与回滚
 
 1. **备份**：`POST /api/ops/backup`。
 2. **预检**：`MNEMOS_DATA_DIR=data-v6 node scripts/preflight.ts`；确认目录可写、端口空闲、DB 完整性与 schema 版本。
 3. **部署**：拉代码 → `pnpm install --frozen-lockfile` → `pnpm build`（前端）→ 重启进程。
-4. **schema**：v6 启动时幂等执行 `schema.sql`（`IF NOT EXISTS`，补索引/触发器），
-   `meta.schema_version` 为 6；检测到 v5 库会拒绝启动。
+4. **schema**：v6.1 启动时幂等执行 `schema.sql`（`IF NOT EXISTS`，补索引/触发器）；
+   v6 库自动升级到 v7（补列 + 回填 hash/valid_from），`meta.schema_version` 为 7；
+   检测到 v5 库会拒绝启动。升级后跑 `pnpm backfill:embeddings` 补历史向量。
 5. **验证**：`/readyz`、`/health`、控制台登录、关键列表/搜索。
 6. **回滚**：停新版本 → 回退代码/镜像 → 启动旧版本。若期间 schema 已变更，
    先恢复升级前备份（替换 `mnemos.db` 并删除 `-wal/-shm`）。
@@ -317,7 +373,7 @@ sqlite3 -readonly data-v6/mnemos.db "SELECT value FROM meta WHERE key='schema_ve
 sqlite3 -readonly data-v6/mnemos.db "PRAGMA integrity_check;"
 ```
 
-## 10. 容量与性能
+## 11. 容量与性能
 
 - 1M 人分区列表/搜索预算与实测、种子与压测步骤见 [v6-scale.md](v6-scale.md)。
 - 单进程单写者：写入串行；大量导入用批事务；避免与 VACUUM/备份争 I/O。
@@ -325,7 +381,7 @@ sqlite3 -readonly data-v6/mnemos.db "PRAGMA integrity_check;"
 - 用量事件会持续增长，可按需清理（保留审计）：`DELETE FROM usage_events WHERE created_at < ?`。
 - 审计日志按合规要求保留，建议外送 SIEM。
 
-## 11. 常见问题
+## 12. 常见问题
 
 | 现象 | 排查 |
 | --- | --- |
@@ -343,13 +399,19 @@ sqlite3 -readonly data-v6/mnemos.db "PRAGMA integrity_check;"
 | `database is locked` | 确认只有一个写进程；不要用 GUI 工具长事务锁库；避开 VACUUM/备份 |
 | `/metrics` 404 | `MNEMOS_METRICS_ENABLED=0`，或请求命中了 SPA 静态回退 |
 | 备份 API 404 | 版本不含运维路由；用 `VACUUM INTO` 兜底 |
+| 检索没有 vector 信号 | 旧记忆未回填 embedding；跑 `pnpm backfill:embeddings` 或等 worker |
+| 图谱为空 | `settings.autoExtractEntities=false` 或 extract 任务未跑；看 `memory_jobs` |
+| 附件 URL 读不出 | 配置了 `MNEMOS_ENCRYPTION_KEY` 但换/丢了密钥；密文无法用新密钥解密 |
+| 502/503 写重试重复 | 写接口未带 `Idempotency-Key`；v6.1 建议所有写请求带稳定幂等键 |
 | 恢复后 `/readyz` 503 | 备份不完整或 schema 不匹配；重新启动触发迁移并核对 `integrity_check` |
 
-## 12. 脚本现状（v6）
+## 13. 脚本现状（v6.1）
 
 | 脚本 | 用途 |
 | --- | --- |
 | `scripts/preflight.ts` | 上线预检：数据目录/完整性/schema/端口/账号 |
 | `scripts/seed-scale.ts` | 规模种子（默认 10 万，可 100 万） |
 | `scripts/perf-persons.ts` | 人列表/搜索/统计/详情/记忆压测 |
+| `scripts/backfill-embeddings.ts` | 补历史记忆 embedding（`pnpm backfill:embeddings`） |
+| `scripts/eval-memory.ts` | v6.1 记忆质量评测（`pnpm eval`） |
 | `pnpm seed`（`server/src/seed/run-seed.ts`） | v6 演示数据（幂等） |

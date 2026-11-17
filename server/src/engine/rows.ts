@@ -12,6 +12,7 @@ import type {
   PartitionStats,
   PartitionStatus,
   Person,
+  PersonFact,
   PersonStatus,
   PersonType,
   RetrievalWeights,
@@ -61,6 +62,10 @@ export interface PersonRow {
   last_seen_at: string;
   created_at: string;
   updated_at: string;
+  /* --- v6.1 --- */
+  merged_into?: string | null;
+  consent?: string | null;
+  deleted_at?: string | null;
 }
 
 export interface MemoryRow {
@@ -95,6 +100,21 @@ export interface MemoryRow {
   fact_key: string | null;
   feedback_up: number;
   feedback_down: number;
+}
+
+/** person_facts 行（当前有效 = valid_to IS NULL）。 */
+export interface PersonFactRow {
+  id: string;
+  partition_id: string;
+  person_id: string;
+  key: string;
+  value: string;
+  confidence: number;
+  valid_from: string;
+  valid_to: string | null;
+  source_memory_id: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface SessionRow {
@@ -223,6 +243,11 @@ export function parseSettings(raw: string | null | undefined): PartitionSettings
       typeof parsed.autoExtractEntities === 'boolean'
         ? parsed.autoExtractEntities
         : DEFAULT_PARTITION_SETTINGS.autoExtractEntities,
+    piiRedaction: oneOf<'off' | 'basic'>(
+      parsed.piiRedaction,
+      ['off', 'basic'],
+      DEFAULT_PARTITION_SETTINGS.piiRedaction,
+    ),
   };
 }
 
@@ -261,6 +286,7 @@ export function mergeSettings(
   merged.dedupeThreshold = clampUnit(merged.dedupeThreshold, base.dedupeThreshold);
   merged.autoExtractEntities =
     typeof merged.autoExtractEntities === 'boolean' ? merged.autoExtractEntities : base.autoExtractEntities;
+  merged.piiRedaction = oneOf<'off' | 'basic'>(merged.piiRedaction, ['off', 'basic'], base.piiRedaction);
   return merged;
 }
 
@@ -309,6 +335,26 @@ export function toPerson(row: PersonRow): Person {
     lastMemoryAt: row.last_memory_at ?? undefined,
     firstSeenAt: row.first_seen_at,
     lastSeenAt: row.last_seen_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    /* --- v6.1 --- */
+    mergedInto: row.merged_into ?? undefined,
+    consent: parseJson<Record<string, unknown>>(row.consent, {}),
+    deletedAt: row.deleted_at ?? undefined,
+  };
+}
+
+export function toPersonFact(row: PersonFactRow): PersonFact {
+  return {
+    id: row.id,
+    partitionId: row.partition_id,
+    personId: row.person_id,
+    key: row.key,
+    value: row.value,
+    confidence: row.confidence,
+    validFrom: row.valid_from,
+    validTo: row.valid_to ?? undefined,
+    sourceMemoryId: row.source_memory_id ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

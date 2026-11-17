@@ -35,6 +35,10 @@ import {
   personDisplayName,
   personTone,
 } from '../components/persons/shared.tsx';
+import { PersonProfileCard } from '../components/persons/PersonProfileCard.tsx';
+import { PersonLifecycleCard } from '../components/persons/PersonLifecycleCard.tsx';
+import { PersonConsentCard } from '../components/persons/PersonConsentCard.tsx';
+import { MemoryCreateModal } from '../components/memories/MemoryCreateModal.tsx';
 import { usePartitionContext } from '@lib/partition-context.tsx';
 
 /**
@@ -85,7 +89,10 @@ export function PersonDetailPage() {
 
   const [running, setRunning] = useState(false);
   const [drawerMemory, setDrawerMemory] = useState<Memory | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
   const canManage = Boolean(user && ROLE_RANK[user.role] >= ROLE_RANK.admin);
+  // 写入记忆只需 developer（与后端写权限一致）；画像/生命周期等管理操作仍要 admin。
+  const canWrite = Boolean(user && ROLE_RANK[user.role] >= ROLE_RANK.developer);
 
   const openMemoryById = async (id: string) => {
     if (!id) return;
@@ -162,6 +169,11 @@ export function PersonDetailPage() {
             <Button icon="chevronLeft" onClick={() => navigate(`/partitions/${partitionId}/persons`)}>
               返回人列表
             </Button>
+            {canWrite ? (
+              <Button variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>
+                写记忆
+              </Button>
+            ) : null}
             <Button
               variant="secondary"
               icon="brain"
@@ -260,6 +272,32 @@ export function PersonDetailPage() {
               hint={person.lastMemoryAt ? fmtFullDateTime(person.lastMemoryAt) : '尚未写入记忆'}
             />
           </div>
+
+          <PersonProfileCard
+            partitionId={partitionId}
+            personRef={personRef}
+            canManage={canManage}
+            onOpenMemory={(id) => void openMemoryById(id)}
+            onChanged={() => void personQuery.refresh()}
+          />
+
+          {user ? (
+            <PersonLifecycleCard
+              partitionId={partitionId}
+              personRef={personRef}
+              person={person}
+              role={user.role}
+              onChanged={refreshPerson}
+            />
+          ) : null}
+
+          <PersonConsentCard
+            partitionId={partitionId}
+            personRef={personRef}
+            person={person}
+            canManage={canManage}
+            onChanged={() => void personQuery.refresh()}
+          />
 
           <Card pad>
             <div className="between wrap gap-10">
@@ -454,6 +492,18 @@ export function PersonDetailPage() {
         onChanged={() => {
           void memories.refresh();
           void personQuery.refresh();
+        }}
+      />
+
+      <MemoryCreateModal
+        open={createOpen}
+        partitionId={partitionId}
+        defaultPersonRef={person?.externalId ?? personRef}
+        defaultScope={partition?.settings?.defaultScope ?? 'partition'}
+        defaultCategory="fact"
+        onClose={() => setCreateOpen(false)}
+        onCreated={async () => {
+          await Promise.all([memories.refresh(), personQuery.refresh(), briefQuery.refresh()]);
         }}
       />
     </div>

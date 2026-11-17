@@ -119,8 +119,14 @@ export interface PartitionSettings {
   dedupeThreshold?: number;
   /** 写入后异步抽取实体 */
   autoExtractEntities?: boolean;
+  /* --- v6.1 P2 合规 --- */
+  /** PII 脱敏：off=原文落库；basic=手机/邮箱/身份证/银行卡正则脱敏 */
+  piiRedaction?: PiiRedactionMode;
   [key: string]: unknown;
 }
+
+/** PII 脱敏级别（分区设置 settings.piiRedaction）。 */
+export type PiiRedactionMode = 'off' | 'basic';
 
 export interface Partition {
   id: string;
@@ -166,6 +172,12 @@ export interface Person {
   lastSeenAt?: string;
   createdAt?: string;
   updatedAt?: string;
+  /** v6.1：人合并后的 canonical 目标（源人被归档并指向它） */
+  mergedInto?: string;
+  /** 合规/同意标记（自由 JSON） */
+  consent?: Record<string, unknown>;
+  /** 软删除时间 */
+  deletedAt?: string;
 }
 
 export interface PersonInput {
@@ -174,6 +186,59 @@ export interface PersonInput {
   displayName?: string;
   attributes?: Record<string, unknown>;
   status?: PersonStatus;
+  /** v6.1 P2：合规/同意标记（整体覆盖） */
+  consent?: Record<string, unknown>;
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P1：结构化画像 / 生命周期                                       */
+/* ------------------------------------------------------------------ */
+
+/** 事实槽位（当前有效 = validTo 为空；更新会关闭旧 fact 的 validTo）。 */
+export interface PersonFact {
+  id: string;
+  partitionId: string;
+  personId: string;
+  key: string;
+  value: string;
+  confidence: number;
+  validFrom: string;
+  validTo?: string;
+  sourceMemoryId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PersonFactInput {
+  key: string;
+  value: string;
+  confidence?: number;
+  sourceMemoryId?: string;
+}
+
+export interface PersonProfile {
+  person: Person;
+  facts: PersonFact[];
+  summary: string;
+  generatedAt?: string;
+  /** 摘要是否命中缓存（未重新生成） */
+  cached?: boolean;
+}
+
+export interface PersonMergeResult {
+  person: Person;
+  mergedFrom: Person;
+  movedMemories: number;
+  movedFacts: number;
+}
+
+export interface PersonExport {
+  person: Person;
+  facts: PersonFact[];
+  memories: Memory[];
+  exportedAt: string;
+  /** 导出有上限（服务端截断时置 true） */
+  truncated?: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -183,6 +248,23 @@ export interface PersonInput {
 export type MemoryScope = 'person' | 'partition' | 'session';
 export type MemoryStatus = 'active' | 'archived' | 'deleted';
 export type MemorySource = 'conversation' | 'api' | 'agent' | 'import' | 'playground' | 'dream';
+
+/** 多模态附件类型（P2）：媒体本体由调用方托管，这里只存 URL/元数据/描述。 */
+export type AttachmentKind = 'image' | 'audio' | 'video' | 'file';
+
+export interface MemoryAttachmentInput {
+  kind: AttachmentKind;
+  url: string;
+  mime?: string;
+  size?: number;
+  caption?: string;
+}
+
+export interface MemoryAttachment extends MemoryAttachmentInput {
+  id: string;
+  memoryId: string;
+  createdAt: string;
+}
 export type MemoryCategory =
   | 'preference'
   | 'identity'
@@ -237,7 +319,10 @@ export interface Memory {
   factKey?: string;
   feedbackUp?: number;
   feedbackDown?: number;
+  /** 附件数量（列表按页批量统计，避免 N+1） */
   attachmentCount?: number;
+  /** 详情（GET 记忆）才返回附件明细；批量列表只带 attachmentCount */
+  attachments?: MemoryAttachment[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -295,6 +380,55 @@ export interface MemoryFeedbackInput {
   helpful: boolean;
   query?: string;
   reason?: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P2：实体 / 关系图                                              */
+/* ------------------------------------------------------------------ */
+
+export interface EntityGraphNode {
+  id: string;
+  label: string;
+  type: string;
+  /** 实体权重（分区内关联记忆的 salience 累计） */
+  weight: number;
+  /** 关联记忆数 */
+  memories: number;
+}
+
+export interface EntityGraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  relation: string;
+  weight: number;
+}
+
+export interface EntityGraphTypeCount {
+  type: string;
+  count: number;
+}
+
+export interface EntityGraphStats {
+  nodes: number;
+  edges: number;
+  topTypes: EntityGraphTypeCount[];
+}
+
+export interface EntityGraph {
+  nodes: EntityGraphNode[];
+  edges: EntityGraphEdge[];
+  stats: EntityGraphStats;
+}
+
+/** 实体列表行：mentionCount 为被提及次数，memories 为关联记忆数。 */
+export interface EntitySummary {
+  id: string;
+  name: string;
+  type: string;
+  mentionCount: number;
+  memories: number;
+  createdAt?: string;
 }
 
 /* ------------------------------------------------------------------ */

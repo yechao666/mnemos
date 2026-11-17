@@ -6,7 +6,7 @@ import { engineErrors } from './errors.ts';
 import { llmText } from './llm.ts';
 import { briefSourceMemories } from './memories.ts';
 import { findPartitionById } from './partition.ts';
-import { findPersonRow } from './persons.ts';
+import { resolvePersonRow } from './persons.ts';
 import { parseSettings, toBrief, type BriefRow } from './rows.ts';
 import type { LlmConfig } from '../env.ts';
 
@@ -89,7 +89,7 @@ export async function generateBrief(
 
   const personId = input.personId;
   if (personId) {
-    const person = findPersonRow(db, input.partitionId, personId);
+    const person = resolvePersonRow(db, input.partitionId, personId);
     if (!person) throw engineErrors.notFound('人不存在');
   }
 

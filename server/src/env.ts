@@ -62,6 +62,8 @@ export interface Env {
   otelServiceName: string;
   /** 存储驱动：当前仅 sqlite */
   storageDriver: 'sqlite' | 'postgres';
+  /** v6.1 P2：可选字段加密密钥（MNEMOS_ENCRYPTION_KEY）；配置后加密 memory_attachments.url */
+  encryptionKey: string | null;
 }
 
 function num(value: string | undefined, fallback: number): number {
@@ -144,6 +146,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     otelSampleRate: Math.min(1, Math.max(0, Number(process.env.MNEMOS_OTEL_SAMPLE_RATE ?? 0.1) || 0.1)),
     otelServiceName: process.env.MNEMOS_OTEL_SERVICE_NAME ?? 'mnemos',
     storageDriver: (process.env.MNEMOS_STORAGE === 'postgres' ? 'postgres' : 'sqlite') as 'sqlite' | 'postgres',
+    encryptionKey: process.env.MNEMOS_ENCRYPTION_KEY?.trim() || null,
     ...overrides,
   };
 

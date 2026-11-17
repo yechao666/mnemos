@@ -18,19 +18,22 @@ import type {
 } from '../../../shared/src/types.ts';
 import { tx } from '../db/index.ts';
 import { newId, nowIso } from '../lib/ids.ts';
+import { applyPiiRedaction } from '../lib/pii.ts';
 import { memoryContentHash } from '../lib/text.ts';
+import { attachmentCounts, insertAttachments, listAttachments, normalizeAttachments, withAttachmentCounts } from './attachments.ts';
 import { decodeCursor, encodeCursor, normalizeLimit } from './cursor.ts';
 import { blobToEmbedding, cosine, embedText, EMBEDDING_DIM, EMBEDDING_MODEL, embeddingToBlob } from './embed.ts';
 import { engineErrors } from './errors.ts';
 import { listMemoryHistory, writeHistory } from './history.ts';
 import { enqueueMemoryJobs } from './jobs.ts';
 import { findPartitionById, loadStatsRow } from './partition.ts';
-import { findPersonRow, resolvePerson, upsertPerson } from './persons.ts';
+import { findPersonRow, resolvePerson, resolvePersonRow, upsertPerson } from './persons.ts';
 import {
   escapeLike,
   ftsQuery,
   likeContains,
   needsSubstringSearch,
+  parseJson,
   parseSettings,
   toMemory,
   toPerson,
@@ -176,7 +179,7 @@ function fetchMemoryRow(db: DatabaseSync, partitionId: string, id: string): Memo
 function memoryOf(db: DatabaseSync, partitionId: string, id: string): Memory {
   const row = fetchMemoryRow(db, partitionId, id);
   if (!row) throw engineErrors.notFound('记忆不存在');
-  return toMemory(row);
+  return withAttachmentCounts(db, [toMemory(row)])[0];
 }
 
 interface NearDuplicate {
@@ -233,9 +236,13 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
   if (partition.status === 'archived') throw engineErrors.archivedPartition();
   const settings = parseSettings(partition.settings);
 
-  const content = typeof input.content === 'string' ? input.content.trim() : '';
-  if (!content) throw engineErrors.validation('content 不能为空');
-  if (content.length > MAX_CONTENT_CHARS) throw engineErrors.validation('content 最长 20000 字符');
+  const rawContent = typeof input.content === 'string' ? input.content.trim() : '';
+  if (!rawContent) throw engineErrors.validation('content 不能为空');
+  if (rawContent.length > MAX_CONTENT_CHARS) throw engineErrors.validation('content 最长 20000 字符');
+  // P2：按分区设置做 basic PII 脱敏（off 时原样）；附件校验在事务外完成。
+  const redaction = applyPiiRedaction(settings, rawContent);
+  const content = redaction.text;
+  const attachments = normalizeAttachments(input.attachments);
 
   const person = resolveWritePerson(db, input.partitionId, input, settings.personAutoCreate);
   const scope = scopeOf(input.scope, settings.defaultScope);
@@ -267,7 +274,9 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
   const confidence = clamp01(input.confidence, 0.8);
   const source = sourceOf(input.source);
   const tags = JSON.stringify(input.tags ?? []);
-  const metadata = JSON.stringify(input.metadata ?? {});
+  const metadataObject: Record<string, unknown> = { ...(input.metadata ?? {}) };
+  if (redaction.redacted) metadataObject.piiRedacted = true;
+  const metadata = JSON.stringify(metadataObject);
   const expiresAt = input.expiresAt === null ? null : input.expiresAt ?? null;
   const supersedesId = input.supersedesId?.trim() || null;
 
@@ -295,7 +304,9 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
         reason: 'duplicate:hash',
         meta: { normalizedHash, similarity: 1 },
       });
-      return { memory: memoryOf(db, input.partitionId, duplicate.id), event: 'NOOP' };
+      // 内容重复（NOOP）仍允许补充附件：附件是独立资源，不改变记忆内容。
+      insertAttachments(db, input.partitionId, duplicate.id, attachments);
+      return { memory: withAttachmentCounts(db, [memoryOf(db, input.partitionId, duplicate.id)])[0], event: 'NOOP' };
     }
 
     /* 2) 近重复 / 合并：同人同分区余弦（显式取代 / factKey 优先，不做自动合并） */
@@ -312,7 +323,9 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
         reason: 'duplicate:similarity',
         meta: { similarity: Number(near.similarity.toFixed(6)), threshold: settings.dedupeThreshold },
       });
-      return { memory: memoryOf(db, input.partitionId, near.row.id), event: 'NOOP' };
+      // 近重复（NOOP）同样允许补充附件。
+      insertAttachments(db, input.partitionId, near.row.id, attachments);
+      return { memory: withAttachmentCounts(db, [memoryOf(db, input.partitionId, near.row.id)])[0], event: 'NOOP' };
     }
     if (near && near.similarity >= settings.mergeThreshold) {
       const mergedTags = unionTags(near.row.tags, input.tags);
@@ -366,7 +379,10 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
         autoExtractEntities: settings.autoExtractEntities,
         factKey,
       });
-      return { memory: memoryOf(db, input.partitionId, near.row.id), event: 'MERGE' };
+      // P2：合并写入同样接受附件（追加到已有记忆）。
+      insertAttachments(db, input.partitionId, near.row.id, attachments);
+      const merged = withAttachmentCounts(db, [memoryOf(db, input.partitionId, near.row.id)])[0];
+      return { memory: merged, event: 'MERGE', ...(redaction.redacted ? { piiRedacted: true } : {}) };
     }
 
     /* 3) 取代：显式 supersedesId 或同 factKey 的旧记忆 */
@@ -433,6 +449,8 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
       oldRows[0]?.id ?? null,
       factKey,
     );
+    // P2：多模态附件（memory_attachments），写入与主体同事务。
+    insertAttachments(db, input.partitionId, id, attachments);
 
     for (const old of oldRows) {
       db.prepare(
@@ -460,7 +478,13 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
       newContent: content,
       actor: input.actor,
       reason: 'add',
-      meta: { scope, category, factKey: factKey ?? undefined, supersedes: oldRows[0]?.id ?? undefined },
+      meta: {
+        scope,
+        category,
+        factKey: factKey ?? undefined,
+        supersedes: oldRows[0]?.id ?? undefined,
+        attachments: attachments.length > 0 ? attachments.length : undefined,
+      },
       createdAt: now,
     });
 
@@ -474,9 +498,10 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
     });
 
     return {
-      memory: memoryOf(db, input.partitionId, id),
+      memory: withAttachmentCounts(db, [memoryOf(db, input.partitionId, id)])[0],
       event: oldRows.length > 0 ? 'SUPERSEDE' : 'ADD',
       supersededId: oldRows[0]?.id,
+      ...(redaction.redacted ? { piiRedacted: true } : {}),
     };
   });
 }
@@ -492,7 +517,8 @@ export function listMemories(db: DatabaseSync, query: MemoryListQuery): CursorPa
 
   if (query.personId || query.personExternalId) {
     const ref = query.personId ?? query.personExternalId ?? '';
-    const person = findPersonRow(db, query.partitionId, ref);
+    // 跟随 merged_into：按被合并源人查询时返回 canonical 人的记忆。
+    const person = resolvePersonRow(db, query.partitionId, ref);
     if (!person) {
       return {
         items: [],
@@ -552,7 +578,7 @@ export function listMemories(db: DatabaseSync, query: MemoryListQuery): CursorPa
     .all(...params, limit + 1) as unknown as MemoryRow[];
 
   const hasMore = rows.length > limit;
-  const items = (hasMore ? rows.slice(0, limit) : rows).map(memoryFromJoinedRow);
+  const items = withAttachmentCounts(db, (hasMore ? rows.slice(0, limit) : rows).map(memoryFromJoinedRow));
   const last = items[items.length - 1];
   const nextCursor =
     hasMore && last ? encodeCursor({ v: last.createdAt, id: last.id, s: 'recent' }) : null;
@@ -577,8 +603,12 @@ export function getMemory(db: DatabaseSync, partitionId: string, id: string): Me
   const personRow = db.prepare('SELECT * FROM persons WHERE id = ?').get(row.person_id) as unknown as
     | PersonRow
     | undefined;
+  const memory = toMemory(row);
+  const attachments = listAttachments(db, id);
+  memory.attachmentCount = attachments.length;
+  memory.attachments = attachments;
   return {
-    memory: toMemory(row),
+    memory,
     person: personRow ? toPerson(personRow) : null,
   };
 }
@@ -596,13 +626,23 @@ export function updateMemory(
       .get(partitionId, id) as unknown as MemoryRow | undefined;
     if (!existing) throw engineErrors.notFound('记忆不存在');
 
+    const partitionRow = db.prepare('SELECT settings FROM partitions WHERE id = ?').get(partitionId) as unknown as
+      | { settings: string }
+      | undefined;
+    const settings = parseSettings(partitionRow?.settings ?? null);
+
     const sets: string[] = [];
     const params: (string | number | null | Uint8Array)[] = [];
     let nextContent = existing.content;
+    let piiRedacted = false;
     if (input.content !== undefined) {
-      const content = input.content.trim();
-      if (!content) throw engineErrors.validation('content 不能为空');
-      if (content.length > MAX_CONTENT_CHARS) throw engineErrors.validation('content 最长 20000 字符');
+      const raw = input.content.trim();
+      if (!raw) throw engineErrors.validation('content 不能为空');
+      if (raw.length > MAX_CONTENT_CHARS) throw engineErrors.validation('content 最长 20000 字符');
+      // P2：更新内容时同样按分区设置脱敏。
+      const redaction = applyPiiRedaction(settings, raw);
+      const content = redaction.text;
+      piiRedacted = redaction.redacted;
       nextContent = content;
       sets.push('content = ?', 'normalized_hash = ?', 'embedding = ?', 'embedding_model = ?', 'dim = ?');
       params.push(
@@ -635,9 +675,13 @@ export function updateMemory(
       sets.push('tags = ?');
       params.push(JSON.stringify(input.tags));
     }
-    if (input.metadata !== undefined) {
+    if (input.metadata !== undefined || piiRedacted) {
+      const metadataObject: Record<string, unknown> = {
+        ...(input.metadata ?? parseJson<Record<string, unknown>>(existing.metadata, {})),
+      };
+      if (piiRedacted) metadataObject.piiRedacted = true;
       sets.push('metadata = ?');
-      params.push(JSON.stringify(input.metadata));
+      params.push(JSON.stringify(metadataObject));
     }
     if (input.expiresAt !== undefined) {
       sets.push('expires_at = ?');
@@ -668,6 +712,7 @@ export function updateMemory(
           status: input.status ?? existing.status,
         },
         normalizedHash: nextContent === existing.content ? undefined : memoryContentHash(nextContent),
+        piiRedacted: piiRedacted || undefined,
       },
       createdAt: at,
     });
@@ -692,6 +737,10 @@ export function removeMemory(db: DatabaseSync, partitionId: string, id: string, 
       reason: 'delete',
       meta: { personId: existing.person_id, scope: existing.scope },
     });
+    // P2：按 memory_id 清理实体关联 / 共现关系 / 附件（无 FK，需显式清理）。
+    db.prepare('DELETE FROM relations WHERE memory_id = ?').run(id);
+    db.prepare('DELETE FROM memory_entities WHERE memory_id = ?').run(id);
+    db.prepare('DELETE FROM memory_attachments WHERE memory_id = ?').run(id);
     db.prepare('DELETE FROM memories WHERE partition_id = ? AND id = ?').run(partitionId, id);
   });
 }

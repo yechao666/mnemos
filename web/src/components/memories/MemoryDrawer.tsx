@@ -7,7 +7,7 @@ import type {
 import { HISTORY_EVENT_META } from '@lib/constants.ts';
 import { api } from '@lib/api.ts';
 import { useAsync } from '@lib/hooks.ts';
-import { fmtFullDateTime, fmtRelative, truncateMiddle } from '@lib/format.ts';
+import { fmtFullDateTime, fmtInt, fmtRelative, truncateMiddle } from '@lib/format.ts';
 import {
   Badge,
   Button,
@@ -27,6 +27,7 @@ import {
   MemoryMeta,
   MemoryTemporalBadge,
 } from './shared.tsx';
+import { AttachmentGallery } from './Attachments.tsx';
 import { SearchHitInsight } from './SearchSignals.tsx';
 
 /** 判断一条记忆是否来自检索结果（带 score/signals/matchedOn）。 */
@@ -376,6 +377,25 @@ export function MemoryDrawer({
               </details>
             ) : null}
           </section>
+
+          {current.attachments?.length || current.attachmentCount ? (
+            <section>
+              <div className="between wrap gap-8">
+                <div>
+                  <div className="section-title">附件</div>
+                  <div className="tiny dim mt-4">
+                    多模态附件（图片 / 音频 / 视频 / 文件）；媒体本体由调用方托管，这里只展示 URL 与描述，caption 参与检索。
+                  </div>
+                </div>
+                <Badge tone="slate" size="sm">
+                  {fmtInt(current.attachments?.length ?? current.attachmentCount ?? 0)} 个
+                </Badge>
+              </div>
+              <div className="mt-10">
+                <AttachmentGallery attachments={current.attachments} count={current.attachmentCount} />
+              </div>
+            </section>
+          ) : null}
 
           <section>
             <div className="between wrap gap-8">

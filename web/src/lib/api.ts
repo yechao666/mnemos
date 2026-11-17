@@ -19,8 +19,15 @@ import type {
   DreamResult,
   DreamRun,
   DreamStatus,
+  EntityGraph,
+  EntityGraphEdge,
+  EntityGraphNode,
+  EntityGraphTypeCount,
+  EntitySummary,
   HealthInfo,
   Memory,
+  MemoryAttachment,
+  MemoryAttachmentInput,
   MemoryBrief,
   MemoryCategory,
   MemoryFeedbackInput,
@@ -38,7 +45,12 @@ import type {
   PartitionStats,
   Person,
   PersonContext,
+  PersonExport,
+  PersonFact,
+  PersonFactInput,
   PersonInput,
+  PersonMergeResult,
+  PersonProfile,
   PersonStatus,
   PersonType,
   Role,
@@ -64,7 +76,13 @@ export class ApiError extends Error {
 }
 
 export function isNotFoundError(error: string | null | undefined): boolean {
-  return Boolean(error && (error.includes('404') || error.includes('不存在')));
+  return Boolean(
+    error &&
+      (error.includes('404') ||
+        error.includes('不存在') ||
+        error.includes('未找到') ||
+        error.includes('NOT_FOUND')),
+  );
 }
 
 export function getToken(): string | null {
@@ -242,6 +260,8 @@ function adaptSettings(value: unknown): Partition['settings'] {
     mergeThreshold: num(raw.mergeThreshold ?? raw.merge_threshold, 0.95),
     dedupeThreshold: num(raw.dedupeThreshold ?? raw.dedupe_threshold, 0.98),
     autoExtractEntities: bool(raw.autoExtractEntities ?? raw.auto_extract_entities, true),
+    // v6.1 P2：默认不脱敏，保证旧分区行为不变。
+    piiRedaction: raw.piiRedaction === 'basic' || raw.pii_redaction === 'basic' ? 'basic' : 'off',
   };
 }
 
@@ -292,6 +312,85 @@ export function adaptPerson(value: unknown): Person {
     lastSeenAt: optStr(raw.lastSeenAt ?? raw.last_seen_at),
     createdAt: optStr(raw.createdAt ?? raw.created_at),
     updatedAt: optStr(raw.updatedAt ?? raw.updated_at),
+    mergedInto: optStr(raw.mergedInto ?? raw.merged_into),
+    consent: Object.keys(parseJsonRecord(raw.consent)).length ? parseJsonRecord(raw.consent) : undefined,
+    deletedAt: optStr(raw.deletedAt ?? raw.deleted_at),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P1：画像 / facts / 生命周期 归一化                              */
+/* ------------------------------------------------------------------ */
+
+function adaptFact(value: unknown): PersonFact {
+  const raw = asRecord(value);
+  return {
+    id: str(raw.id),
+    partitionId: str(raw.partitionId ?? raw.partition_id),
+    personId: str(raw.personId ?? raw.person_id),
+    key: str(raw.key ?? raw.factKey ?? raw.fact_key),
+    value: str(raw.value),
+    confidence: num(raw.confidence, 0.7),
+    validFrom: str(raw.validFrom ?? raw.valid_from ?? raw.createdAt ?? raw.created_at),
+    validTo: optStr(raw.validTo ?? raw.valid_to),
+    sourceMemoryId: optStr(raw.sourceMemoryId ?? raw.source_memory_id),
+    createdAt: str(raw.createdAt ?? raw.created_at),
+    updatedAt: str(raw.updatedAt ?? raw.updated_at),
+  };
+}
+
+/** facts 可能是裸数组、{items} 或 {facts}。 */
+function adaptFactList(value: unknown): PersonFact[] {
+  const list = Array.isArray(value)
+    ? value
+    : Array.isArray(asRecord(value).items)
+      ? (asRecord(value).items as unknown[])
+      : Array.isArray(asRecord(value).facts)
+        ? (asRecord(value).facts as unknown[])
+        : [];
+  return list.map(adaptFact);
+}
+
+export function adaptPersonProfile(value: unknown): PersonProfile {
+  const outer = asRecord(value);
+  const raw = asRecord(outer.profile ?? outer);
+  const factsSource = raw.facts ?? raw.items ?? outer.facts;
+  return {
+    person: adaptPerson(raw.person ?? outer.person ?? {}),
+    facts: adaptFactList(factsSource),
+    summary: str(raw.summary ?? outer.summary),
+    generatedAt: optStr(
+      raw.generatedAt ?? raw.generated_at ?? outer.generatedAt ?? outer.generated_at,
+    ),
+    cached: bool(raw.cached ?? outer.cached),
+  };
+}
+
+function adaptMergeResult(value: unknown): PersonMergeResult {
+  const outer = asRecord(value);
+  const raw = asRecord(outer.result ?? outer);
+  return {
+    person: adaptPerson(raw.person ?? raw.target ?? raw.canonical ?? {}),
+    mergedFrom: adaptPerson(raw.mergedFrom ?? raw.merged_from ?? raw.source ?? {}),
+    movedMemories: num(raw.movedMemories ?? raw.moved_memories),
+    movedFacts: num(raw.movedFacts ?? raw.moved_facts),
+  };
+}
+
+function adaptPersonExport(value: unknown): PersonExport {
+  const outer = asRecord(value);
+  const raw = asRecord(outer.export ?? outer);
+  const memories = Array.isArray(raw.memories)
+    ? raw.memories
+    : Array.isArray(asRecord(raw.memories).items)
+      ? (asRecord(raw.memories).items as unknown[])
+      : [];
+  return {
+    person: adaptPerson(raw.person ?? raw),
+    facts: adaptFactList(raw.facts),
+    memories: memories.map(adaptMemory),
+    exportedAt: str(raw.exportedAt ?? raw.exported_at),
+    truncated: bool(raw.truncated) || undefined,
   };
 }
 
@@ -307,8 +406,31 @@ function adaptMemoryCategory(value: unknown): MemoryCategory {
   return text as MemoryCategory;
 }
 
+function adaptAttachment(value: unknown): MemoryAttachment {
+  const raw = asRecord(value);
+  const kindRaw = str(raw.kind, 'file');
+  const kind: MemoryAttachment['kind'] =
+    kindRaw === 'image' || kindRaw === 'audio' || kindRaw === 'video' ? kindRaw : 'file';
+  return {
+    id: str(raw.id),
+    memoryId: str(raw.memoryId ?? raw.memory_id),
+    kind,
+    url: str(raw.url),
+    mime: optStr(raw.mime),
+    size: typeof raw.size === 'number' ? raw.size : undefined,
+    caption: optStr(raw.caption),
+    createdAt: str(raw.createdAt ?? raw.created_at),
+  };
+}
+
+function adaptAttachments(value: unknown): MemoryAttachment[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.map(adaptAttachment);
+}
+
 export function adaptMemory(value: unknown): Memory {
   const raw = asRecord(value);
+  const attachments = adaptAttachments(raw.attachments);
   return {
     id: str(raw.id),
     partitionId: str(raw.partitionId ?? raw.partition_id ?? raw.projectId ?? raw.project_id),
@@ -336,7 +458,8 @@ export function adaptMemory(value: unknown): Memory {
     factKey: optStr(raw.factKey ?? raw.fact_key),
     feedbackUp: num(raw.feedbackUp ?? raw.feedback_up),
     feedbackDown: num(raw.feedbackDown ?? raw.feedback_down),
-    attachmentCount: num(raw.attachmentCount ?? raw.attachment_count) || undefined,
+    attachmentCount: num(raw.attachmentCount ?? raw.attachment_count) || attachments?.length || undefined,
+    attachments,
   };
 }
 
@@ -418,6 +541,66 @@ function adaptHistoryEntry(value: unknown): MemoryHistoryEntry {
     reason: optStr(raw.reason),
     meta: parseJsonRecord(raw.meta),
     createdAt: str(raw.createdAt ?? raw.created_at),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P2：实体 / 关系图归一化                                        */
+/* ------------------------------------------------------------------ */
+
+function adaptGraphNode(value: unknown): EntityGraphNode {
+  const raw = asRecord(value);
+  return {
+    id: str(raw.id),
+    label: str(raw.label ?? raw.name),
+    type: str(raw.type, 'concept'),
+    weight: num(raw.weight ?? raw.mentionCount ?? raw.mention_count),
+    memories: num(raw.memories ?? raw.memoryCount ?? raw.memory_count),
+  };
+}
+
+function adaptGraphEdge(value: unknown): EntityGraphEdge {
+  const raw = asRecord(value);
+  return {
+    id: str(raw.id),
+    source: str(raw.source ?? raw.sourceEntityId ?? raw.source_entity_id),
+    target: str(raw.target ?? raw.targetEntityId ?? raw.target_entity_id),
+    relation: str(raw.relation, 'co_occurs'),
+    weight: num(raw.weight, 1),
+  };
+}
+
+function adaptGraphTypeCount(value: unknown): EntityGraphTypeCount {
+  const raw = asRecord(value);
+  return { type: str(raw.type, 'concept'), count: num(raw.count) };
+}
+
+export function adaptEntityGraph(value: unknown): EntityGraph {
+  const raw = asRecord(value);
+  const stats = asRecord(raw.stats);
+  const topTypesRaw = stats.topTypes ?? stats.top_types;
+  const nodes = (Array.isArray(raw.nodes) ? raw.nodes : []).map(adaptGraphNode);
+  const edges = (Array.isArray(raw.edges) ? raw.edges : []).map(adaptGraphEdge);
+  return {
+    nodes,
+    edges,
+    stats: {
+      nodes: num(stats.nodes, nodes.length),
+      edges: num(stats.edges, edges.length),
+      topTypes: (Array.isArray(topTypesRaw) ? topTypesRaw : []).map(adaptGraphTypeCount),
+    },
+  };
+}
+
+export function adaptEntitySummary(value: unknown): EntitySummary {
+  const raw = asRecord(value);
+  return {
+    id: str(raw.id),
+    name: str(raw.name ?? raw.label),
+    type: str(raw.type, 'concept'),
+    mentionCount: num(raw.mentionCount ?? raw.mention_count),
+    memories: num(raw.memories),
+    createdAt: optStr(raw.createdAt ?? raw.created_at),
   };
 }
 
@@ -613,6 +796,16 @@ export interface PersonListParams {
   sort?: 'recent' | 'new' | 'name';
   cursor?: string | null;
   limit?: number;
+  /** v6.1：包含已合并到其他人的人（默认由服务端排除） */
+  includeMerged?: boolean;
+}
+
+export interface PersonUpdateInput {
+  displayName?: string;
+  attributes?: Record<string, unknown>;
+  status?: PersonStatus;
+  /** v6.1 P2：合规/同意标记（整体覆盖） */
+  consent?: Record<string, unknown>;
 }
 
 export interface MemoryListParams {
@@ -671,6 +864,9 @@ export interface MemoryCreateInput {
   validFrom?: string;
   /** 幂等键：相同 key + body 24h 内返回首次响应 */
   idempotencyKey?: string;
+  /* --- v6.1 P2 多模态 --- */
+  /** 附件（≤10）：URL 由调用方托管，caption 参与检索。 */
+  attachments?: MemoryAttachmentInput[];
 }
 
 export interface KeyCreateInput {
@@ -764,6 +960,37 @@ export const api = {
     },
     get: async (partitionId: string): Promise<Partition> =>
       adaptPartition(await request<unknown>(partitionPath(partitionId))),
+    /* --- v6.1 P2：实体关系图 --- */
+    /** 分区（或某人视角）的实体关系图：节点 / 边 / 统计（topTypes）。 */
+    graph: async (
+      partitionId: string,
+      params: { personId?: string; limit?: number } = {},
+    ): Promise<EntityGraph> =>
+      adaptEntityGraph(
+        await request<unknown>(
+          `${partitionPath(partitionId)}/graph${qs({
+            personId: params.personId,
+            person_id: params.personId,
+            limit: params.limit,
+          })}`,
+        ),
+      ),
+    /** 实体列表（按关联记忆数排序；q 做名称前缀/包含匹配）。 */
+    entities: async (
+      partitionId: string,
+      params: { personId?: string; q?: string; limit?: number } = {},
+    ): Promise<CursorPage<EntitySummary>> =>
+      adaptPage(
+        await request<unknown>(
+          `${partitionPath(partitionId)}/entities${qs({
+            personId: params.personId,
+            person_id: params.personId,
+            q: params.q,
+            limit: params.limit,
+          })}`,
+        ),
+        adaptEntitySummary,
+      ),
     create: async (input: { name: string; slug?: string; description?: string }): Promise<Partition> =>
       adaptPartition(
         await request<unknown>('/api/partitions', { method: 'POST', body: JSON.stringify(input) }),
@@ -810,11 +1037,16 @@ export const api = {
 
   persons: {
     /** 人列表：服务端游标分页 + FTS 前缀搜索；响应自带分区头部统计。 */
-    list: async (partitionId: string, params: PersonListParams = {}): Promise<CursorPage<Person>> =>
-      adaptPage(
-        await request<unknown>(`${partitionPath(partitionId)}/persons${qs({ ...params })}`),
-        adaptPerson,
-      ),
+    list: async (partitionId: string, params: PersonListParams = {}): Promise<CursorPage<Person>> => {
+      const { includeMerged, ...rest } = params;
+      // 控制台 camelCase 与 v1 snake_case 同时携带，兼容并行实现。
+      const query = qs({
+        ...rest,
+        includeMerged: includeMerged || undefined,
+        include_merged: includeMerged || undefined,
+      });
+      return adaptPage(await request<unknown>(`${partitionPath(partitionId)}/persons${query}`), adaptPerson);
+    },
     get: async (partitionId: string, personRef: string): Promise<Person> =>
       adaptPerson(await request<unknown>(personPath(partitionId, personRef))),
     upsert: async (partitionId: string, input: PersonInput): Promise<Person> =>
@@ -824,12 +1056,97 @@ export const api = {
           { method: 'PUT', body: JSON.stringify(input) },
         ),
       ),
-    update: async (partitionId: string, personRef: string, input: Partial<PersonInput>): Promise<Person> =>
+    update: async (partitionId: string, personRef: string, input: PersonUpdateInput): Promise<Person> =>
       adaptPerson(
         await request<unknown>(personPath(partitionId, personRef), {
           method: 'PATCH',
           body: JSON.stringify(input),
         }),
+      ),
+    /**
+     * v6.1 P1：人画像（当前 facts + 摘要 + generatedAt）。
+     * `force` 用于请求服务端重新生成摘要（不被支持时只是忽略该参数，仍返回缓存）。
+     */
+    profile: async (
+      partitionId: string,
+      personRef: string,
+      params: { force?: boolean } = {},
+    ): Promise<PersonProfile> =>
+      adaptPersonProfile(
+        await request<unknown>(
+          `${personPath(partitionId, personRef)}/profile${qs({
+            force: params.force || undefined,
+            // 服务端兼容别名 refresh；不带 force 时命中缓存（sourceHash 未变则 generatedAt 不变）。
+            refresh: params.force || undefined,
+          })}`,
+        ),
+      ),
+    /** 当前有效的 facts（画像卡也可直接用 profile.facts）。 */
+    facts: {
+      list: async (partitionId: string, personRef: string): Promise<PersonFact[]> =>
+        adaptFactList(await request<unknown>(`${personPath(partitionId, personRef)}/facts`)),
+      /** 显式维护事实槽位：同 person+key 的新 fact 会关闭旧 fact 的 validTo。 */
+      upsert: async (
+        partitionId: string,
+        personRef: string,
+        input: PersonFactInput,
+      ): Promise<PersonFact> => {
+        const raw = await request<unknown>(`${personPath(partitionId, personRef)}/facts`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            key: input.key,
+            value: input.value,
+            confidence: input.confidence,
+            sourceMemoryId: input.sourceMemoryId,
+            source_memory_id: input.sourceMemoryId,
+          }),
+        });
+        const record = asRecord(raw);
+        return adaptFact(record.fact ?? raw);
+      },
+      remove: (partitionId: string, personRef: string, factId: string) =>
+        request<{ ok: boolean }>(
+          `${personPath(partitionId, personRef)}/facts/${encodeURIComponent(factId)}`,
+          { method: 'DELETE' },
+        ),
+    },
+    /** 合并到另一人：迁移 memories/facts/feedback，源人标记 mergedInto 并归档。 */
+    merge: async (
+      partitionId: string,
+      personRef: string,
+      targetRef: string,
+    ): Promise<PersonMergeResult> =>
+      adaptMergeResult(
+        await request<unknown>(`${personPath(partitionId, personRef)}/merge`, {
+          method: 'POST',
+          // targetId 为内部 id 或 externalId；camelCase / snake_case 同时携带，服务端取其一。
+          body: JSON.stringify({
+            targetId: targetRef,
+            target_id: targetRef,
+            targetExternalId: targetRef,
+            target_external_id: targetRef,
+          }),
+        }),
+      ),
+    archive: async (partitionId: string, personRef: string): Promise<Person> =>
+      adaptPerson(
+        await request<unknown>(`${personPath(partitionId, personRef)}/archive`, {
+          method: 'POST',
+          body: '{}',
+        }),
+      ),
+    /** 导出人的资料 + facts + 全部记忆（JSON；服务端可能截断并置 truncated）。 */
+    export: async (partitionId: string, personRef: string): Promise<PersonExport> =>
+      adaptPersonExport(
+        await request<unknown>(`${personPath(partitionId, personRef)}/export`),
+      ),
+    /**
+     * 删除人：默认软删（status=deleted + deletedAt）；`hard=true` 仅 owner 且级联记忆。
+     */
+    remove: (partitionId: string, personRef: string, params: { hard?: boolean } = {}) =>
+      request<{ ok: boolean }>(
+        `${personPath(partitionId, personRef)}${qs({ hard: params.hard || undefined })}`,
+        { method: 'DELETE' },
       ),
     /** 该人的记忆：游标分页 + scope/category 过滤。 */
     memories: async (
@@ -865,6 +1182,8 @@ export const api = {
           fact_key: input.factKey,
           validFrom: input.validFrom,
           valid_from: input.validFrom,
+          // v6.1 P2：附件（kind/url/mime/size/caption，≤10）
+          attachments: input.attachments,
         }),
       });
       // 控制台写入返回 { memory }；适配裸 Memory 与包裹两种形状。

@@ -14,6 +14,8 @@
 | 人与会话 | `persons` / `sessions` | 中高：external_id、属性、交互归组 |
 | 账号口令哈希 / 会话令牌哈希 | `users` / `user_sessions` | 高 |
 | API Key 哈希 | `api_keys.key_hash` | 高（明文只在创建/轮换响应出现一次） |
+| 画像 / 事实 | `person_facts` / `person_profiles` | 中高：结构化偏好、身份信息 |
+| 多模态附件 | `memory_attachments`（URL/元数据/caption） | 中高：URL 可能含签名参数；可配置字段加密 |
 | 审计 / 用量 | `audit_logs` / `usage_events` | 中高：含 actor、IP、UA |
 | 备份文件 | `$MNEMOS_BACKUP_DIR`（默认 `data-v6/backups`） | 高：完整数据库副本 |
 | 结构化日志 | stdout / 容器日志驱动 | 中：含请求路径、IP，敏感字段脱敏 |
@@ -56,10 +58,12 @@ Mnemos 进程（单节点，非 root）
 | T9 | **供应链 / 容器** | 依赖投毒；镜像 root 运行 | 依赖锁定；多阶段镜像、非 root `node`、不带数据目录；CI 类型检查/测试 | 无镜像签名/SBOM/漏洞扫描；镜像未真机验证 |
 | T10 | **日志/审计泄漏** | 日志打印令牌/密码；审计 detail 含敏感值 | 日志递归脱敏（authorization/password/apikey/secret/token/cookie/credential）；登录只记 email；API Key 只记 prefix | 限制日志访问；外送 SIEM 前复核 |
 | T11 | **误操作 / 内部威胁** | 误删记忆/分区、直接改库 | 危险操作需 developer/admin+；删除有审计；备份与恢复演练；软删除 30 天后才物理清理 | 无审批流/四眼原则；DB 文件权限需收紧 |
+| T12 | **PII 外泄 / 未授权使用** | 记忆正文含手机号/邮箱/身份证；附件 URL 可被直读 | 分区 `piiRedaction=basic` 写入脱敏并审计 `memory.pii_redacted`；`persons.consent` 随导出；`MNEMOS_ENCRYPTION_KEY` 可加密附件 URL（AES-256-GCM） | 脱敏是确定性正则、非全量 DLP；密钥丢失会导致旧附件 URL 无法解密，须与备份同管 |
+| T13 | **合规删除不彻底** | 用户要求删除但历史/画像残留 | `DELETE persons?hard=true` 级联删除 memories（含 FTS/实体/历史/反馈）/facts/profile/sessions；默认软删可导出 | 备份中的副本不在在线删除范围，需按备份保留策略处理 |
 
 ---
 
-## 3. 控制项清单（v6）
+## 3. 控制项清单（v6.1）
 
 | 控制 | 实现位置 | 说明 | 验证 |
 | --- | --- | --- | --- |
@@ -159,6 +163,9 @@ curl -s -X DELETE "http://127.0.0.1:4380/api/partitions/<partition>/keys/<keyId>
 - 下载：`GET /api/ops/backups/:file`（admin+，文件名白名单，防路径穿越）。
 - **应用不加密备份**。生产要求：备份目录 0700；异地上传前用 age/GPG/KMS 加密；
   按合规要求保留/删除；每月恢复演练。
+- **可选字段加密**：`MNEMOS_ENCRYPTION_KEY` 配置后 `memory_attachments.url` 以
+  AES-256-GCM（`v1:iv:tag:cipher`）落库；不加密 `memories.content`（保护 FTS/embedding/去重）。
+  密钥必须与备份分开管理并可恢复，否则旧附件 URL 不可解密。
 - 恢复流程见 [operations.md](operations.md)「数据与备份」。
 
 ---
@@ -290,5 +297,5 @@ for i in $(seq 1 5); do curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE/
 | OIDC/SSO、SCIM | 未实现 |
 | 镜像签名 / SBOM / 漏洞扫描 | 未接入 |
 | 多副本、集中密钥管理 | 未实现（单节点假设） |
-| v6 黑盒安全脚本 | `preflight.ts` + 第 7 节手工基线 |
+| v6.1 黑盒安全脚本 | `preflight.ts` + 第 7 节手工基线 |
 | 登录锁定探测 | 会锁定测试账号 15 分钟；务必对一次性实例执行 |

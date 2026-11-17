@@ -19,6 +19,7 @@
 | 排序 | `recent/new/name` 各有索引（带/不带 status 过滤） | 内存排序 / 临时 B-tree |
 | UI | 服务端每页 50 + 自实现窗口化（固定行高 56px，只渲染可视行） | DOM/数组随总数增长 |
 | 写入 | 单条 INSERT，触发器同步 FTS 与计数 | 读写分离的额外一致性成本 |
+| 检索（v6.1） | 候选上限 700 + 内存 cosine 融合 | 全表扫 embedding / `ORDER BY` 大结果集 |
 
 关键索引见 [`architecture.md` 第 3 节](architecture.md#3-表索引与状态)。改索引前先用
 `EXPLAIN QUERY PLAN` 验证列表 SQL 仍然 `SEARCH persons USING INDEX ...` 且没有 `TEMP B-TREE`。
@@ -72,7 +73,46 @@ node scripts/seed-scale.ts --persons=100000 --heavy-memories=1000 --db=/tmp/mnem
 
 ---
 
-## 3. 压测：`scripts/perf-persons.ts`
+## 3. 检索候选与延迟预算（v6.1）
+
+v6.1 的混合检索**不做全表扫描**：先取有上限的候选集，再在内存做 cosine 重排与权重融合。
+
+| 候选来源 | 上限 | 说明 |
+| --- | --- | --- |
+| FTS5 前缀/子串 | **300** | `memories_fts` 前缀命中（CJK 退化为子串 `LIKE`） |
+| 该人最近记忆 | **200** | `scope IN (person, session)`，`created_at DESC` 索引 |
+| 分区共享最近记忆 | **200** | `scope=partition`，`created_at DESC` 索引 |
+| 去重后总候选 | **≤700** | 按 memory id 去重；`mode=vector` 候选不足时补最近记忆 |
+
+融合：
+
+```
+score = w_vector·cosine + w_keyword·keyword + w_recency·recency
+      + w_importance·importance + w_entity·entity
+```
+
+默认权重 `0.45 / 0.3 / 0.15 / 0.1 / 0`，可在 `settings.retrieval_weights` 调整。
+
+延迟预算（单分区、单进程 SQLite，本机量级）：
+
+| 场景 | 预期/预算 |
+| --- | --- |
+| `top_k=8` hybrid（候选 ≤700） | p95 **< 50ms**（内存 cosine + 一次候选 SQL） |
+| `mode=keyword` | p95 **< 20ms**（复用 FTS 索引） |
+| `mode=vector` | p95 **< 50ms**（候选不足时补最近 500 条） |
+| 候选 SQL 本身 | 受 `LIMIT` 与索引约束，不随分区记忆总量线性增长 |
+
+> 以上是预算而非 SLA；实际值随候选数、正文长度、embedding 维度（384）与机器变化。
+> 排障时先看返回的 `took_ms` / `mode` / `strategy`，再用 `EXPLAIN QUERY PLAN` 确认候选 SQL 走
+> `idx_memories_*`，没有 `SCAN memories` 或临时 B-tree。
+
+**1M 人列表不受影响**：检索只作用于当前分区/人的记忆候选；人列表仍走 keyset 游标 +
+`partition_stats`，不做 `COUNT(*)`、不加载全量人，也不因检索新增索引而改变执行计划。
+v6.1 新增的 `memories` 索引只影响记忆写入/检索，不改变 `persons` 的 8 个列表索引。
+
+---
+
+## 4. 压测：`scripts/perf-persons.ts`
 
 对**运行中的服务**测 5 个场景（各 2 次预热 + N 次采样），输出 p50/p95/max 与预算是否达标。
 需要服务地址 + 有 `memories:read` 权限的 API Key（**org key 或该分区的 partition key**）。
@@ -139,7 +179,7 @@ node scripts/perf-persons.ts --base-url=... --partition=scale --key=... \
 
 ---
 
-## 4. 容量估算（单节点）
+## 5. 容量估算（单节点）
 
 以 10 万人种子库的 `dbstat` 实测外推：
 
@@ -157,7 +197,7 @@ node scripts/perf-persons.ts --base-url=... --partition=scale --key=... \
 
 ---
 
-## 5. 100 万人验收步骤（手动）
+## 6. 100 万人验收步骤（手动）
 
 1. **生成**：`node scripts/seed-scale.ts --persons=1000000 --db=/tmp/mnemos-scale-1m.db`
    → 检查 `stats.personsTotal = 1000000`、`countsMatch = true`。
@@ -185,7 +225,7 @@ node scripts/perf-persons.ts --base-url=... --partition=scale --key=... \
 
 ---
 
-## 6. 批量导入 / 迁移之后
+## 7. 批量导入 / 迁移之后
 
 - 计数可能因手工 SQL/导入工具绕过触发器而变化：调用
   `POST /api/partitions/:partition/reconcile`（控制台 admin+）重算 `partition_stats` 与人的计数。
@@ -198,11 +238,12 @@ node scripts/perf-persons.ts --base-url=... --partition=scale --key=... \
 
 ---
 
-## 7. 已知边界与排查
+## 8. 已知边界与排查
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| 搜索很慢 | `q` 含 CJK → 退化为 `LIKE '%q%'` 全分区扫描。缩短查询、加 `category/scope` 过滤，或改用拉丁 external_id 前缀。 |
+| 搜索很慢 | 先看 `took_ms`/`mode`：`keyword` 慢多为 CJK 子串回退；`vector` 慢看候选与 embedding 是否缺失。缩短查询、加 `category/scope` 过滤、降低 `top_k`。 |
+| 向量信号全 0 | 旧记忆未回填 embedding；`pnpm backfill:embeddings` 或等 `memory_jobs` worker。 |
 | 翻页结果重复/跳行 | 游标必须与当前 `sort` 配套；换了排序要丢弃旧游标（服务端返回 `400 INVALID_CURSOR`）。 |
 | 列表 p95 高 | 检查是否有人为加了 `COUNT(*)` / 逐行 stats 请求；确认 `partition_stats` 行存在（`reconcile` 可补）。 |
 | 人计数为 0 但记忆存在 | 绕过触发器写入；执行 `reconcile`。 |

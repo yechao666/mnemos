@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mnemos-langchain"
+version = "1.0.0"
+description = "Mnemos v6.1 的 LangChain BaseStore 适配器（namespace → partition/person）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Mnemos" }]
+keywords = ["mnemos", "langchain", "memory", "vectorstore", "store"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.2"]
+sdk = ["mnemos-sdk>=2.0.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mnemos_langchain*"]

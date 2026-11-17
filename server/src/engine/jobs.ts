@@ -1,7 +1,9 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { MemoryJob, MemoryJobStatus, MemoryJobType } from '../../../shared/src/types.ts';
-import { newId, nowIso, sha256 } from '../lib/ids.ts';
+import { newId, nowIso } from '../lib/ids.ts';
 import { blobToEmbedding, embedText, EMBEDDING_DIM, EMBEDDING_MODEL, embeddingToBlob } from './embed.ts';
+import { getPersonProfile } from './profile.ts';
+import { resolvePerson } from './persons.ts';
 import { parseJson } from './rows.ts';
 
 /**
@@ -161,19 +163,47 @@ const QUOTED_ENTITY_RE = /[「『“"'《]([^」』”"'》]{1,40})[」』”"'�
 const ASCII_ENTITY_RE = /[A-Za-z][A-Za-z0-9_.-]{2,}/g;
 const ENTITY_STOP = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'from', 'with', 'you', 'are']);
 
-function upsertEntity(db: DatabaseSync, partitionId: string, name: string, type = 'concept'): string {
+/**
+ * 找或建实体（不直接累加 mention_count）；mention_count 在实际新增 memory_entities
+ * 关联时 +1，保证同一记忆重复抽取不会把计数翻倍（幂等）。
+ */
+function findOrCreateEntity(db: DatabaseSync, partitionId: string, name: string, type = 'concept'): string {
   const normalized = name.trim().toLowerCase();
   const at = nowIso();
   db.prepare(
-    `INSERT INTO entities (id, partition_id, name, type, normalized, mention_count, created_at)
-     VALUES (?, ?, ?, ?, ?, 1, ?)
-     ON CONFLICT(partition_id, normalized, type)
-     DO UPDATE SET mention_count = mention_count + 1`,
+    `INSERT OR IGNORE INTO entities (id, partition_id, name, type, normalized, mention_count, created_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?)`,
   ).run(newId('ent'), partitionId, name.trim().slice(0, 120), type, normalized, at);
   const row = db
     .prepare('SELECT id FROM entities WHERE partition_id = ? AND normalized = ? AND type = ?')
     .get(partitionId, normalized, type) as unknown as { id: string } | undefined;
   return row?.id ?? '';
+}
+
+/**
+ * 同一记忆内实体两两写 co_occurs 关系（P2）；`UNIQUE(partition_id, source, target, relation)`
+ * 保证幂等：重复抽取 / 重复写入只会 INSERT OR IGNORE。source/target 按 id 排序，方向稳定。
+ */
+export function linkCoOccurringRelations(db: DatabaseSync, partitionId: string, memoryId: string): number {
+  const rows = db
+    .prepare('SELECT entity_id FROM memory_entities WHERE memory_id = ? ORDER BY entity_id ASC')
+    .all(memoryId) as unknown as { entity_id: string }[];
+  const entityIds = [...new Set(rows.map((row) => row.entity_id))];
+  if (entityIds.length < 2) return 0;
+  const at = nowIso();
+  const stmt = db.prepare(
+    `INSERT OR IGNORE INTO relations
+       (id, partition_id, source_entity_id, target_entity_id, relation, memory_id, weight, created_at)
+     VALUES (?, ?, ?, ?, 'co_occurs', ?, 1, ?)`,
+  );
+  let linked = 0;
+  for (let left = 0; left < entityIds.length; left += 1) {
+    for (let right = left + 1; right < entityIds.length; right += 1) {
+      const result = stmt.run(newId('rel'), partitionId, entityIds[left], entityIds[right], memoryId, at);
+      linked += Number(result.changes ?? 0);
+    }
+  }
+  return linked;
 }
 
 /** 规则实体抽取（P0 只求可用；P2 再引入词典/关系）。 */
@@ -192,13 +222,17 @@ export function extractEntities(db: DatabaseSync, partitionId: string, memoryId:
     if (name.length >= 3 && !ENTITY_STOP.has(name.toLowerCase())) names.add(name);
   }
   for (const name of names) {
-    const entityId = upsertEntity(db, partitionId, name);
+    const entityId = findOrCreateEntity(db, partitionId, name);
     if (!entityId) continue;
-    db.prepare('INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, salience) VALUES (?, ?, 1)').run(
-      memoryId,
-      entityId,
-    );
+    const link = db
+      .prepare('INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, salience) VALUES (?, ?, 1)')
+      .run(memoryId, entityId);
+    if (Number(link.changes ?? 0) > 0) {
+      db.prepare('UPDATE entities SET mention_count = mention_count + 1 WHERE id = ?').run(entityId);
+    }
   }
+  // P2：同一记忆内实体共现关系（幂等）。
+  linkCoOccurringRelations(db, partitionId, memoryId);
   return names.size;
 }
 
@@ -228,83 +262,18 @@ function personOfPayload(db: DatabaseSync, payload: Record<string, unknown>): st
 }
 
 /**
- * profile/summarize 任务：确定性画像摘要（不依赖 LLM），并把 fact_key 记忆同步到 person_facts。
- * P1 会在此基础上接入 LLM 摘要；P0 先保证任务可用、可重跑。
+ * profile / summarize 任务（v6.1 P1）：
+ *  - 把同 person 的 fact_key 记忆沉淀为 person_facts（版本化，幂等）；
+ *  - 生成确定性画像摘要并写入 person_profiles 缓存（sourceHash 未变则直接复用）。
+ *  - LLM 增强由 HTTP GET /persons/:ref/profile 的按需生成路径完成（jobs 保持同步）。
  */
 export function runProfileJob(db: DatabaseSync, partitionId: string, payload: Record<string, unknown>): void {
   const personId = personOfPayload(db, payload);
   if (!personId) throw new Error('profile 任务缺少 personId/memoryId');
-  const at = nowIso();
-
-  // fact_key 记忆 → person_facts（同 key 旧值置为失效）
-  const factRows = db
-    .prepare(
-      `SELECT id, fact_key, content, confidence FROM memories
-        WHERE partition_id = ? AND person_id = ? AND fact_key IS NOT NULL
-          AND status = 'active' AND valid_to IS NULL
-        ORDER BY updated_at DESC`,
-    )
-    .all(partitionId, personId) as unknown as {
-    id: string;
-    fact_key: string;
-    content: string;
-    confidence: number;
-  }[];
-  const seen = new Set<string>();
-  for (const fact of factRows) {
-    if (seen.has(fact.fact_key)) continue;
-    seen.add(fact.fact_key);
-    const current = db
-      .prepare(
-        `SELECT id, value FROM person_facts
-          WHERE partition_id = ? AND person_id = ? AND key = ? AND valid_to IS NULL
-          ORDER BY updated_at DESC LIMIT 1`,
-      )
-      .get(partitionId, personId, fact.fact_key) as unknown as { id: string; value: string } | undefined;
-    if (current?.value === fact.content) continue;
-    if (current) {
-      db.prepare('UPDATE person_facts SET valid_to = ?, updated_at = ? WHERE id = ?').run(at, at, current.id);
-    }
-    db.prepare(
-      `INSERT INTO person_facts
-         (id, partition_id, person_id, key, value, confidence, valid_from, valid_to, source_memory_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-    ).run(
-      newId('fact'),
-      partitionId,
-      personId,
-      fact.fact_key.slice(0, 120),
-      fact.content,
-      Math.min(1, Math.max(0, fact.confidence)),
-      at,
-      fact.id,
-      at,
-      at,
-    );
-  }
-
-  // 画像摘要：最近/最重要的 30 条有效记忆
-  const rows = db
-    .prepare(
-      `SELECT id, category, content, updated_at FROM memories
-        WHERE partition_id = ? AND person_id = ? AND status = 'active' AND valid_to IS NULL
-        ORDER BY importance DESC, updated_at DESC LIMIT 30`,
-    )
-    .all(partitionId, personId) as unknown as {
-    id: string;
-    category: string;
-    content: string;
-    updated_at: string;
-  }[];
-  const lines = rows.map((row) => `- [${row.category}] ${row.content.replace(/\s+/g, ' ').slice(0, 160)}`);
-  const summary = lines.join('\n');
-  const sourceHash = sha256(rows.map((row) => `${row.id}:${row.updated_at}`).join('|'));
-  db.prepare(
-    `INSERT INTO person_profiles (partition_id, person_id, summary, source_hash, generated_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(partition_id, person_id)
-     DO UPDATE SET summary = excluded.summary, source_hash = excluded.source_hash, generated_at = excluded.generated_at`,
-  ).run(partitionId, personId, summary, sourceHash, at);
+  // resolvePerson 跟随 merged_into：合并前入队的任务也能落到 canonical 人。
+  // getPersonProfile 内部会同步 factKey 记忆并写入摘要缓存（幂等）。
+  const person = resolvePerson(db, partitionId, personId);
+  getPersonProfile(db, partitionId, person.id);
 }
 
 /** 执行一个已领取的任务（成功后由 processJobs 落 done）。 */

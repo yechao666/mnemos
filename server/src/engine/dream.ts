@@ -19,7 +19,7 @@ import {
   pendingDreamMemories,
 } from './memories.ts';
 import { findPartitionById } from './partition.ts';
-import { findPersonRow, upsertPerson } from './persons.ts';
+import { resolvePersonRow, upsertPerson } from './persons.ts';
 import { parseSettings, toDreamRun, type DreamRunRow } from './rows.ts';
 
 const MAX_BATCH = 200;
@@ -140,7 +140,7 @@ export async function runDream(
   const partition = findPartitionById(db, input.partitionId);
   if (!partition) throw engineErrors.notFound('分区不存在');
   if (input.personId) {
-    const person = findPersonRow(db, input.partitionId, input.personId);
+    const person = resolvePersonRow(db, input.partitionId, input.personId);
     if (!person) throw engineErrors.notFound('人不存在');
   }
 

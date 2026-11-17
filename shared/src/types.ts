@@ -171,6 +171,9 @@ export interface PartitionSettings {
   dedupeThreshold: number;
   /** 写入后异步抽取实体 */
   autoExtractEntities: boolean;
+  /* --- v6.1 P2 合规 --- */
+  /** PII 脱敏：off=不处理；basic=写入时脱敏手机号/邮箱/身份证/银行卡（保留后四位） */
+  piiRedaction: 'off' | 'basic';
 }
 
 export interface RetrievalWeights {
@@ -243,6 +246,11 @@ export interface Person {
   lastSeenAt: string;
   createdAt: string;
   updatedAt: string;
+  /** 人合并后指向 canonical person */
+  mergedInto?: string;
+  /** 合规/同意标记（自由 JSON） */
+  consent?: Record<string, unknown>;
+  deletedAt?: string;
 }
 
 export interface PersonInput {
@@ -251,6 +259,58 @@ export interface PersonInput {
   displayName?: string;
   attributes?: Record<string, unknown>;
   status?: PersonStatus;
+  /** 合规/同意标记（自由 JSON）；PATCH 时整体覆盖 */
+  consent?: Record<string, unknown>;
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P1：结构化画像 / 生命周期                                       */
+/* ------------------------------------------------------------------ */
+
+export interface PersonFact {
+  id: string;
+  partitionId: string;
+  personId: string;
+  key: string;
+  value: string;
+  confidence: number;
+  validFrom: string;
+  validTo?: string;
+  sourceMemoryId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PersonFactInput {
+  key: string;
+  value: string;
+  confidence?: number;
+  sourceMemoryId?: string;
+}
+
+export interface PersonProfile {
+  person: Person;
+  facts: PersonFact[];
+  summary: string;
+  generatedAt?: string;
+  /** v6.1 P1：本次是否直接命中 person_profiles 缓存（未重新生成） */
+  cached?: boolean;
+}
+
+export interface PersonMergeResult {
+  person: Person;
+  mergedFrom: Person;
+  movedMemories: number;
+  movedFacts: number;
+}
+
+export interface PersonExport {
+  person: Person;
+  facts: PersonFact[];
+  memories: Memory[];
+  exportedAt: string;
+  /** 记忆超过上限（10000）时为 true；memories 只含前 10000 条 */
+  truncated?: boolean;
 }
 
 export interface PersonListQuery {
@@ -260,6 +320,8 @@ export interface PersonListQuery {
   sort?: PersonSort;
   cursor?: string;
   limit?: number;
+  /** 包含已合并（merged_into 非空）的人；默认排除 merged/deleted */
+  includeMerged?: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -280,6 +342,23 @@ export interface Session {
 /* ------------------------------------------------------------------ */
 /* 记忆                                                                */
 /* ------------------------------------------------------------------ */
+
+/** 多模态附件类型（P2）：媒体本体由调用方托管，这里只存 URL/元数据/描述。 */
+export type AttachmentKind = 'image' | 'audio' | 'video' | 'file';
+
+export interface MemoryAttachmentInput {
+  kind: AttachmentKind;
+  url: string;
+  mime?: string;
+  size?: number;
+  caption?: string;
+}
+
+export interface MemoryAttachment extends MemoryAttachmentInput {
+  id: string;
+  memoryId: string;
+  createdAt: string;
+}
 
 export interface Memory {
   id: string;
@@ -312,7 +391,10 @@ export interface Memory {
   factKey?: string;
   feedbackUp?: number;
   feedbackDown?: number;
+  /** 附件数量（列表按页批量统计，避免 N+1） */
   attachmentCount?: number;
+  /** 详情（GET 记忆）才返回附件明细；批量列表只带 attachmentCount */
+  attachments?: MemoryAttachment[];
 }
 
 export interface MemoryDetail {
@@ -362,6 +444,74 @@ export interface MemorySearchResponse {
   tookMs: number;
   mode: MemorySearchMode;
   strategy: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P2：实体 / 关系图                                               */
+/* ------------------------------------------------------------------ */
+
+export interface EntityGraphNode {
+  id: string;
+  label: string;
+  type: string;
+  /** 实体权重（分区内被提及次数 / 关联记忆累计 salience） */
+  weight: number;
+  /** 关联记忆数 */
+  memories: number;
+}
+
+export interface EntityGraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  relation: string;
+  weight: number;
+}
+
+export interface EntityGraphTypeCount {
+  type: string;
+  count: number;
+}
+
+export interface EntityGraphStats {
+  nodes: number;
+  edges: number;
+  topTypes: EntityGraphTypeCount[];
+}
+
+export interface EntityGraph {
+  nodes: EntityGraphNode[];
+  edges: EntityGraphEdge[];
+  stats: EntityGraphStats;
+}
+
+export interface EntityGraphQuery {
+  partitionId: string;
+  /** 内部 id 或 external_id；缺省为分区级图 */
+  personId?: string;
+  /** 节点上限（1–500，默认 100） */
+  limit?: number;
+}
+
+export interface EntitySummary {
+  id: string;
+  name: string;
+  type: string;
+  mentionCount: number;
+  memories: number;
+  createdAt: string;
+}
+
+export interface EntityListQuery {
+  partitionId: string;
+  personId?: string;
+  q?: string;
+  limit?: number;
+}
+
+export interface EntityList {
+  items: EntitySummary[];
+  nextCursor: string | null;
 }
 
 export type MemoryHistoryEvent =
@@ -415,6 +565,8 @@ export interface MemoryAddResult {
   memory: Memory;
   event: 'ADD' | 'MERGE' | 'NOOP' | 'SUPERSEDE';
   supersededId?: string;
+  /** v6.1 P2：本次写入是否触发 PII 脱敏（审计 memory.pii_redacted 用） */
+  piiRedacted?: boolean;
 }
 
 /** 写入记忆：person 必填（内部 id 或 external id + type）。 */
@@ -443,6 +595,8 @@ export interface AddMemoryInput {
   factKey?: string;
   /** v6.1：事实生效时间（默认 now） */
   validFrom?: string;
+  /** v6.1 P2：多模态附件（≤10，url≤2000） */
+  attachments?: MemoryAttachmentInput[];
   actor: Actor;
 }
 
@@ -799,6 +953,25 @@ export interface MemoryService {
   searchMemories(input: MemorySearchInput): MemorySearchResponse;
   memoryHistory(partitionId: string, id: string): MemoryHistoryEntry[];
   feedback(partitionId: string, id: string, input: MemoryFeedbackInput, actor: Actor): Memory;
+  /* --- v6.1 P2：实体 / 关系图 --- */
+  entityGraph(query: EntityGraphQuery): EntityGraph;
+  listEntities(query: EntityListQuery): EntityList;
+
+  /* --- v6.1 P1：画像 / 生命周期 --- */
+  personProfile(partitionId: string, personRef: string): PersonProfile;
+  /** 按需生成画像（可调用 LLM；HTTP GET /profile 使用；缺省时退化为确定性摘要） */
+  refreshPersonProfile?(
+    partitionId: string,
+    personRef: string,
+    options?: { force?: boolean },
+  ): Promise<PersonProfile>;
+  listPersonFacts(partitionId: string, personRef: string): PersonFact[];
+  upsertPersonFact(partitionId: string, personRef: string, input: PersonFactInput, actor: Actor): PersonFact;
+  removePersonFact(partitionId: string, personRef: string, factId: string, actor: Actor): void;
+  mergePersons(partitionId: string, personRef: string, targetRef: string, actor: Actor): PersonMergeResult;
+  archivePerson(partitionId: string, personRef: string, actor: Actor): Person;
+  deletePerson(partitionId: string, personRef: string, input: { hard?: boolean }, actor: Actor): void;
+  exportPerson(partitionId: string, personRef: string): PersonExport;
 
   /* --- 简报 / 上下文 / 做梦 --- */
   brief(input: BriefInput): Promise<MemoryBrief>;

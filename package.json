@@ -15,6 +15,7 @@
     "start": "node server/src/main.ts",
     "seed": "node server/src/seed/run-seed.ts --force",
     "test": "node --test 'server/src/**/*.test.ts'",
+    "eval": "node scripts/eval-memory.ts",
     "typecheck": "tsc -p server/tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
     "verify": "pnpm run typecheck && pnpm run test && pnpm run build",
     "seed:scale": "node scripts/seed-scale.ts",

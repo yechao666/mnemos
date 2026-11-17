@@ -32,6 +32,10 @@ export type PersonSort = 'recent' | 'new' | 'name';
 export type MemoryScope = 'person' | 'partition' | 'session';
 /** 记忆状态。 */
 export type MemoryStatus = 'active' | 'archived' | 'deleted';
+/** 检索模式：混合 / 仅关键词 / 仅向量。 */
+export type SearchMode = 'hybrid' | 'keyword' | 'vector';
+/** 多模态附件类型：图片 / 音频 / 视频 / 文件。 */
+export type AttachmentKind = 'image' | 'audio' | 'video' | 'file';
 /** 记忆来源。 */
 export type MemorySource = 'api' | 'conversation' | 'agent' | 'import' | 'playground' | 'dream';
 
@@ -73,6 +77,20 @@ export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 /* 分区（Partition）                                                   */
 /* ------------------------------------------------------------------ */
 
+/** 混合检索权重（未列出的信号按 0 处理）。 */
+export interface RetrievalWeights {
+  /** 向量（本地 hash-384 或外部 embedding）相似度。 */
+  vector: number;
+  /** 关键词（FTS + CJK 二元组覆盖率）。 */
+  keyword: number;
+  /** 时效（越新越高）。 */
+  recency: number;
+  /** 记忆重要度。 */
+  importance: number;
+  /** 实体命中（P2，默认 0）。 */
+  entity: number;
+}
+
 /** 分区设置（响应视图，snake_case）。 */
 export interface PartitionSettings {
   /** 新记忆缺省可见范围（消费类 App 用 person，协作分区用 partition）。 */
@@ -90,6 +108,21 @@ export interface PartitionSettings {
   /** 写入未知人时是否自动建档。 */
   person_auto_create: boolean;
   locale: string;
+  /* --- v6.1 检索与写管线 --- */
+  /** 检索模式：hybrid / keyword / vector（默认 hybrid）。 */
+  retrieval_mode: SearchMode;
+  /** 融合权重（默认 0.45 / 0.3 / 0.15 / 0.1 / 0）。 */
+  retrieval_weights: RetrievalWeights;
+  /** 本地 embedding 模型或外部模型名。 */
+  embedding_model: string;
+  /** 相似度 ≥ 该阈值时把新写入合并进已有记忆（0–1，默认 0.95）。 */
+  merge_threshold: number;
+  /** 相似度 ≥ 该阈值时视为重复、不再新增（0–1，默认 0.98）。 */
+  dedupe_threshold: number;
+  /** 写入后异步抽取实体（默认 true）。 */
+  auto_extract_entities: boolean;
+  /** PII 脱敏：off / basic（basic 保留后四位）。 */
+  pii_redaction: 'off' | 'basic';
 }
 
 /** 分区设置入参：camelCase 与 snake_case 均可。 */
@@ -111,6 +144,22 @@ export interface PartitionSettingsInput {
   personAutoCreate?: boolean;
   person_auto_create?: boolean;
   locale?: string;
+  /* --- v6.1 检索与写管线 --- */
+  retrievalMode?: SearchMode;
+  retrieval_mode?: SearchMode;
+  retrievalWeights?: Partial<RetrievalWeights>;
+  retrieval_weights?: Partial<RetrievalWeights>;
+  embeddingModel?: string;
+  embedding_model?: string;
+  mergeThreshold?: number;
+  merge_threshold?: number;
+  dedupeThreshold?: number;
+  dedupe_threshold?: number;
+  autoExtractEntities?: boolean;
+  auto_extract_entities?: boolean;
+  /** v6.1 P2：PII 脱敏开关。 */
+  piiRedaction?: 'off' | 'basic';
+  pii_redaction?: 'off' | 'basic';
 }
 
 /** 分区头部聚合：列表页直接读 `partition_stats`，绝不 COUNT(*)。 */
@@ -179,6 +228,13 @@ export interface Person {
   last_seen_at: string;
   created_at: string;
   updated_at: string;
+  /* --- v6.1 P1/P2 生命周期与合规 --- */
+  /** 合并后指向 canonical 人的内部 id；null=未合并。 */
+  merged_into: string | null;
+  /** 同意/合规标记（自由 JSON）；控制台与 v1 均可整体覆盖。 */
+  consent: Record<string, unknown>;
+  /** 软删除时间；null=未删除。 */
+  deleted_at: string | null;
 }
 
 /** 建档 / 更新人入参。 */
@@ -191,14 +247,17 @@ export interface PersonInput {
   display_name?: string;
   attributes?: Record<string, unknown>;
   status?: PersonStatus;
+  /** v6.1 P2：同意/合规标记（整体覆盖）。 */
+  consent?: Record<string, unknown>;
 }
 
-/** 局部更新人：只能更新展示名 / attributes / status。 */
+/** 局部更新人：只能更新展示名 / attributes / status / consent。 */
 export interface PersonUpdateInput {
   displayName?: string;
   display_name?: string;
   attributes?: Record<string, unknown>;
   status?: PersonStatus;
+  consent?: Record<string, unknown>;
 }
 
 /** 人列表查询（游标分页）。 */
@@ -211,6 +270,9 @@ export interface PersonListQuery {
   cursor?: string;
   /** 默认 50，最大 200。 */
   limit?: number;
+  /** 包含已合并（merged_into 非空）的人；默认排除 merged/deleted。 */
+  includeMerged?: boolean;
+  include_merged?: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -240,6 +302,24 @@ export interface ChatMessage {
   name?: string;
 }
 
+/** 多模态附件入参：媒体本体由调用方托管，这里只记录 URL 与元数据。 */
+export interface MemoryAttachmentInput {
+  kind: AttachmentKind;
+  /** ≤2000 字符；配置 MNEMOS_ENCRYPTION_KEY 时服务端加密落库。 */
+  url: string;
+  mime?: string;
+  size?: number;
+  /** 附件描述；参与轻量检索（caption 关键词）。 */
+  caption?: string;
+}
+
+/** 已落库的附件（读取视图）。 */
+export interface MemoryAttachment extends MemoryAttachmentInput {
+  id: string;
+  memory_id: string;
+  created_at: string;
+}
+
 /** 记忆实体。 */
 export interface Memory {
   id: string;
@@ -264,6 +344,26 @@ export interface Memory {
   updated_at: string;
   expires_at: string | null;
   dreamed_at: string | null;
+  /* --- v6.1 时序与演化 --- */
+  /** 事实生效时间（默认=created_at）。 */
+  valid_from: string | null;
+  /** 失效时间；null=当前有效。 */
+  valid_to: string | null;
+  /** 被哪条记忆取代（内部 id）。 */
+  superseded_by: string | null;
+  /** 取代了哪条记忆（内部 id）。 */
+  supersedes: string | null;
+  /** 槽位键（如 preference.language）；同 key 新写入会自动取代旧事实。 */
+  fact_key: string | null;
+  /** 有帮助反馈计数。 */
+  feedback_up: number;
+  /** 没帮助反馈计数。 */
+  feedback_down: number;
+  /* --- v6.1 P2 多模态 --- */
+  /** 附件数量（列表页按页批量统计，避免 N+1）。 */
+  attachment_count: number;
+  /** 附件明细（仅详情/写入响应返回）。 */
+  attachments?: MemoryAttachment[];
 }
 
 /** 写入记忆入参（`text` / `content` / `messages` 至少一个）。 */
@@ -286,6 +386,18 @@ export interface MemoryInput {
   metadata?: Record<string, unknown>;
   expiresAt?: string | null;
   expires_at?: string | null;
+  /* --- v6.1 写管线 --- */
+  /** 显式取代某条记忆（旧记忆 valid_to=now / superseded_by=new）。 */
+  supersedesId?: string;
+  supersedes_id?: string;
+  /** 事实槽位键；同 key 的新写入自动取代旧事实。 */
+  factKey?: string;
+  fact_key?: string;
+  /** 事实生效时间（ISO；缺省为服务端 now）。 */
+  validFrom?: string;
+  valid_from?: string;
+  /** 多模态附件（≤10；url ≤2000）。 */
+  attachments?: MemoryAttachmentInput[];
 }
 
 /** `MemoryInput` 的别名（与 shared 的 AddMemoryInput 语义一致）。 */
@@ -309,17 +421,31 @@ export interface MemoryListQuery {
   limit?: number;
 }
 
-/** 全文检索入参（`POST .../memories/search`）。 */
+/** 全文/混合检索入参（`POST .../memories/search`）。 */
 export interface MemorySearchInput {
   query: string;
   /** 按人（内部 id）过滤。 */
   personId?: string;
   person_id?: string;
+  /** 按人的外部 ID 过滤（与 personId 二选一）。 */
+  personExternalId?: string;
+  person_external_id?: string;
   scope?: MemoryScope;
   category?: MemoryCategory;
+  /** 检索模式，缺省取分区设置（默认 hybrid）。 */
+  mode?: SearchMode;
   /** 返回条数（1–50，默认 8）。 */
   topK?: number;
   top_k?: number;
+  /** 回看某个时间点有效的事实（ISO 8601）。 */
+  asOf?: string;
+  as_of?: string;
+  /** 包含已被取代/失效的记忆（默认 false）。 */
+  includeSuperseded?: boolean;
+  include_superseded?: boolean;
+  /** 人级视角：只看本人 + 分区共享；控制台/审计可设 true 看全部。 */
+  includePrivate?: boolean;
+  include_private?: boolean;
 }
 
 /** 更新记忆入参：只发送提供的字段。 */
@@ -343,7 +469,7 @@ export interface MemoryDetail {
 
 /** 写入记忆后返回的变更事件。 */
 export interface MemoryEvent {
-  type: 'ADD';
+  type: 'ADD' | 'MERGE' | 'NOOP' | 'SUPERSEDE';
   memory_id: string;
   at: string;
 }
@@ -351,23 +477,249 @@ export interface MemoryEvent {
 /** 写入记忆响应。 */
 export interface AddMemoryResponse {
   memory: Memory;
+  /** v6.1：本次写入触发的动作（ADD 新增 / MERGE 合并 / NOOP 重复 / SUPERSEDE 取代）。 */
+  event: 'ADD' | 'MERGE' | 'NOOP' | 'SUPERSEDE';
+  /** 被取代的旧记忆 id（仅 SUPERSEDE）。 */
+  superseded_id: string | null;
   events: MemoryEvent[];
 }
 
 /** 写入记忆响应的兼容别名。 */
 export type MemoryAddResponse = AddMemoryResponse;
 
-/** 全文检索响应（`POST .../memories/search`）。 */
+/** 单条命中的融合信号（0–1）。 */
+export interface MemorySearchSignals {
+  vector: number;
+  keyword: number;
+  recency: number;
+  importance: number;
+  entity: number;
+}
+
+/** 检索命中：记忆 + 融合分数 + 信号分解 + 命中来源。 */
+export interface MemorySearchHit extends Memory {
+  score: number;
+  signals: MemorySearchSignals;
+  /** 命中的信号/字段，如 `keyword` / `vector` / `caption`。 */
+  matched_on: string[];
+}
+
+/**
+ * 混合检索响应（`POST .../memories/search`）。
+ *
+ * v6.1 契约字段：`hits`（带 signals）/ `took_ms` / `mode` / `strategy`；
+ * `results` 是 v6 兼容别名（等价于 `hits` 去掉 signals），保留以兼容旧调用方。
+ */
 export interface SearchResponse {
+  hits: MemorySearchHit[];
+  /** @deprecated v6 兼容字段；请改用 `hits`。 */
   results: Memory[];
   took_ms: number;
+  mode: SearchMode;
+  /** 服务端实际采用的检索策略（如 `hybrid:vector+keyword+recency`）。 */
+  strategy: string;
   next_cursor: string | null;
   partition_stats?: PartitionStats;
 }
 
-/** 记忆更新响应（`PATCH` 返回 `{ memory }`）。 */
+/** 记忆更新 / 反馈响应（`PATCH` / `feedback` 返回 `{ memory }`）。 */
 export interface MemoryMutationResponse {
   memory: Memory;
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1：历史 / 反馈                                                    */
+/* ------------------------------------------------------------------ */
+
+/** 记忆变更事件类型。 */
+export type MemoryHistoryEvent =
+  | 'ADD'
+  | 'UPDATE'
+  | 'MERGE'
+  | 'SUPERSEDE'
+  | 'DELETE'
+  | 'NOOP'
+  | 'FEEDBACK'
+  | 'RESTORE';
+
+/** 逐条记忆的变更历史（`GET .../memories/:id/history`）。 */
+export interface MemoryHistoryEntry {
+  id: string;
+  partition_id: string;
+  memory_id: string;
+  person_id: string | null;
+  event: MemoryHistoryEvent;
+  old_content: string | null;
+  new_content: string | null;
+  actor: string | null;
+  reason: string | null;
+  meta: Record<string, unknown>;
+  created_at: string;
+}
+
+/** 检索反馈入参。 */
+export interface MemoryFeedbackInput {
+  /** true=有帮助（confidence +0.05）；false=没帮助（confidence -0.05）。 */
+  helpful: boolean;
+  /** 触发本次反馈的查询（可选，用于后续分析）。 */
+  query?: string;
+  reason?: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P1：结构化画像 / 生命周期                                       */
+/* ------------------------------------------------------------------ */
+
+/** 结构化画像中的一条事实槽位。 */
+export interface PersonFact {
+  id: string;
+  partition_id: string;
+  person_id: string;
+  /** 槽位键（如 identity.job / preference.language）。 */
+  key: string;
+  value: string;
+  /** 0–1，默认 0.7。 */
+  confidence: number;
+  valid_from: string;
+  /** null=当前有效；非空=已被新版本关闭。 */
+  valid_to: string | null;
+  source_memory_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 写入 / 更新单条 fact 的入参。 */
+export interface PersonFactInput {
+  key: string;
+  value: string;
+  confidence?: number;
+  sourceMemoryId?: string;
+  source_memory_id?: string;
+}
+
+/** 人的画像：资料 + 当前有效 facts + 摘要（异步生成，可缓存）。 */
+export interface PersonProfile {
+  person: Person;
+  facts: PersonFact[];
+  summary: string;
+  generated_at: string | null;
+  /** 本次是否直接命中 person_profiles 缓存。 */
+  cached?: boolean;
+}
+
+/** 画像查询：`force` / `refresh` 跳过缓存重新生成。 */
+export interface PersonProfileQuery {
+  force?: boolean;
+  refresh?: boolean;
+}
+
+/** 合并两个人后的结果。 */
+export interface PersonMergeResult {
+  /** canonical（目标）人。 */
+  person: Person;
+  /** 被合并（源）人，已归档且 merged_into 指向目标。 */
+  merged_from: Person;
+  moved_memories: number;
+  moved_facts: number;
+}
+
+/** 合并入参：目标可用内部 id 或 external id。 */
+export interface PersonMergeInput {
+  targetId?: string;
+  target_id?: string;
+  targetExternalId?: string;
+  target_external_id?: string;
+}
+
+/** 合规导出：人 + facts（含历史版本）+ 最近 10000 条记忆。 */
+export interface PersonExport {
+  person: Person;
+  facts: PersonFact[];
+  memories: Memory[];
+  exported_at: string;
+  /** 记忆超过 10000 条时为 true。 */
+  truncated: boolean;
+}
+
+/** 删除人：默认软删（记忆/facts 保留）；hard=true 级联物理删除（仅 owner/admin key）。 */
+export interface PersonRemoveOptions {
+  hard?: boolean;
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1 P2：实体 / 关系图                                               */
+/* ------------------------------------------------------------------ */
+
+/** 图节点（实体）。 */
+export interface EntityGraphNode {
+  id: string;
+  label: string;
+  type: string;
+  /** 实体权重（分区内被提及次数 / 关联记忆累计 salience）。 */
+  weight: number;
+  /** 关联记忆数。 */
+  memories: number;
+}
+
+/** 图边（关系）。 */
+export interface EntityGraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  relation: string;
+  weight: number;
+}
+
+/** 实体类型计数。 */
+export interface EntityGraphTypeCount {
+  type: string;
+  count: number;
+}
+
+/** 图统计。 */
+export interface EntityGraphStats {
+  nodes: number;
+  edges: number;
+  top_types: EntityGraphTypeCount[];
+}
+
+/** 分区/人的实体关系图。 */
+export interface EntityGraph {
+  nodes: EntityGraphNode[];
+  edges: EntityGraphEdge[];
+  stats: EntityGraphStats;
+}
+
+/** 图查询：personId 缺省为分区级图；limit 默认 100、最大 500。 */
+export interface EntityGraphQuery {
+  personId?: string;
+  person_id?: string;
+  limit?: number;
+}
+
+/** 实体列表项。 */
+export interface EntitySummary {
+  id: string;
+  name: string;
+  type: string;
+  mention_count: number;
+  memories: number;
+  created_at: string;
+}
+
+/** 实体列表查询。 */
+export interface EntityListQuery {
+  personId?: string;
+  person_id?: string;
+  q?: string;
+  /** 默认 50、最大 200。 */
+  limit?: number;
+}
+
+/** 实体列表响应（`{ items, next_cursor }`）。 */
+export interface EntityList {
+  items: EntitySummary[];
+  next_cursor: string | null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -647,9 +999,9 @@ export interface HealthResponse {
 /** 单个请求的可选参数。 */
 export interface RequestOptions {
   /**
-   * 幂等键（8–128 字符）。传入后随每次尝试发送同一个 `Idempotency-Key`，
-   * 便于调用方/网关去重。v6 服务端不持久化幂等记录，客户端也不会仅因
-   * 该 header 重试非只读 POST（避免重复写入）。
+   * 幂等键（8–128 字符）。v6.1 服务端会持久化 24 小时：
+   * 相同 key + 相同方法/路径/请求体直接回放首次响应，不同 body 返回 409。
+   * 传了该键后，非只读 POST（写记忆等）发生 429/5xx/网络错误时可安全自动重试。
    */
   idempotencyKey?: string;
   /** 外部取消信号（与超时信号自动合并）。 */

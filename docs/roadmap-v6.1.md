@@ -1,5 +1,8 @@
 # Mnemos v6.1 —— 记忆质量升级路线（P0/P1/P2）
 
+> **状态：已交付（2026-11-18，分支 `v6-rebuild`）**。P0 / P1 / P2 全部落地，测试 88/88、
+> eval 7/7、控制台截图见 [`screenshots/`](screenshots/)。
+>
 > 前提：**暂不更换数据库**（继续 SQLite 单节点）。目标：补齐与主流记忆系统的三项硬差距
 > （语义检索、记忆演化、结构化画像/评测），并完成 P2 的图/生态/多模态/合规。
 >
@@ -7,11 +10,35 @@
 
 ## 0. 总览
 
-| 阶段 | 能力 | 状态目标 |
+| 阶段 | 能力 | 状态目标 | 状态 |
+| --- | --- | --- | --- |
+| P0 | 混合检索（本地 embedding + FTS + 时效/重要度）、写入管线（去重/合并/取代/异步任务/幂等）、memory_history + feedback、schema v7 | 检索可解释、冲突可处理、历史可追溯 | ✅ 完成 |
+| P1 | 结构化画像（person_facts + profile 摘要）、人生命周期（merge/archive/export/delete）、时序查询（valid_from/valid_to/as_of）、评测 harness | 记忆可演进、可迁移、可度量 | ✅ 完成 |
+| P2 | 实体/关系图、Python SDK、MCP server、LangChain 适配、多模态附件、PII/合规 | 生态与治理补齐 | ✅ 完成 |
+
+### 0.1 验收证据（2026-11-18）
+
+| 证据 | 结果 | 命令 / 位置 |
 | --- | --- | --- |
-| P0 | 混合检索（本地 embedding + FTS + 时效/重要度）、写入管线（去重/合并/取代/异步任务/幂等）、memory_history + feedback、schema v7 | 检索可解释、冲突可处理、历史可追溯 |
-| P1 | 结构化画像（person_facts + profile 摘要）、人生命周期（merge/archive/export/delete）、时序查询（valid_from/valid_to/as_of）、评测 harness | 记忆可演进、可迁移、可度量 |
-| P2 | 实体/关系图、Python SDK、MCP server、LangChain 适配、多模态附件、PII/合规 | 生态与治理补齐 |
+| 服务端测试 | **88 tests / 88 pass / 0 fail**（P0 前 58 → P1 后 73 → P2/v6.1 收尾 88） | `pnpm test` |
+| 记忆质量评测 | **7/7 场景通过，38/38 checks**，exit 0（约 56ms） | `pnpm eval`；报告见 [`eval.md`](eval.md) |
+| 类型检查 | server + web 0 error | `pnpm typecheck` |
+| TS SDK | `tsc` 0 error；**33 tests / 33 pass** | `pnpm --dir sdk/typescript test` |
+| 控制台截图 | 分区 / 记忆（搜索信号）/ 记忆抽屉（历史+反馈+时序）/ 人列表 / 画像+生命周期 / 设置 / 图谱 | [`screenshots/v6.1-01-partitions.png`](screenshots/v6.1-01-partitions.png) … [`v6.1-07-graph.png`](screenshots/v6.1-07-graph.png) |
+| 迁移 | 空库建 schema v7；v6 库幂等升级（补列 + 回填 hash/valid_from） | `server/src/db/migration.test.ts` |
+| 生态冒烟 | Python SDK **12 tests**、MCP **17 tests**、LangChain 适配 **13 tests** 全部通过 | `sdk/python`、`integrations/mcp-mnemos`、`integrations/langchain-mnemos` |
+
+截图清单：
+
+| 截图 | 内容 |
+| --- | --- |
+| [`v6.1-01-partitions.png`](screenshots/v6.1-01-partitions.png) | 分区列表（读 `partition_stats`） |
+| [`v6.1-02-memories.png`](screenshots/v6.1-02-memories.png) | 记忆页：混合检索、模式切换、时间点、包含已失效、时效徽标 |
+| [`v6.1-03-memory-history.png`](screenshots/v6.1-03-memory-history.png) | 记忆抽屉：信号分解、时序状态、反馈按钮、历史时间线 |
+| [`v6.1-04-persons.png`](screenshots/v6.1-04-persons.png) | 人列表（百万级游标/虚拟滚动） |
+| [`v6.1-05-person-profile.png`](screenshots/v6.1-05-person-profile.png) | 人详情：画像 facts / 摘要 + 生命周期操作区 |
+| [`v6.1-06-settings.png`](screenshots/v6.1-06-settings.png) | 分区设置：检索模式/权重、阈值、实体抽取、PII |
+| [`v6.1-07-graph.png`](screenshots/v6.1-07-graph.png) | 实体关系图 + 实体/关系统计 |
 
 ## 1. schema v7（SQLite，不换库）
 
@@ -117,7 +144,7 @@ relations(id TEXT PRIMARY KEY, partition_id TEXT NOT NULL,
           UNIQUE(partition_id, source_entity_id, target_entity_id, relation));
 ```
 
-## 2. P0：混合检索 + 写入管线 + 历史/反馈
+## 2. P0：混合检索 + 写入管线 + 历史/反馈 ✅
 
 ### 2.1 检索
 
@@ -144,7 +171,7 @@ relations(id TEXT PRIMARY KEY, partition_id TEXT NOT NULL,
 - 控制台记忆抽屉展示历史时间线与反馈按钮。
 - **验收**：每次写/合并/取代/反馈都有 history；反馈后检索排序中 confidence/importance 生效。
 
-## 3. P1：画像 / 生命周期 / 时序 / 评测
+## 3. P1：画像 / 生命周期 / 时序 / 评测 ✅
 
 - **画像**：`person_facts`（key/value/validity/source）；`GET /persons/:id/profile` 返回当前 facts + 摘要（`person_profiles`，异步生成，LLM 可选）；`PUT /persons/:id/facts` 显式维护；记忆 metadata `factKey` 自动抽取为 fact。
 - **生命周期**：`POST /persons/:id/merge {targetId}`（迁移 memories/facts/feedback，源标记 merged_into）；`POST /persons/:id/archive`；`GET /persons/:id/export`（JSON）；`DELETE /persons/:id`（软删，可 `hard=true` 仅 owner）。
@@ -152,7 +179,7 @@ relations(id TEXT PRIMARY KEY, partition_id TEXT NOT NULL,
 - **评测**：`scripts/eval-memory.ts` 场景集：改写召回、时效更新、冲突取代、隔离、反馈调权、人合并；输出 recall@k/MRR/temporal accuracy/冲突准确率；`pnpm eval`；CI 阈值。
 - **验收**：eval 全部场景通过阈值；人合并后检索仍正确；as_of 查询返回历史事实。
 
-## 4. P2：图 / 生态 / 多模态 / 合规
+## 4. P2：图 / 生态 / 多模态 / 合规 ✅
 
 - **实体/关系**：规则抽取（CJK 词典 + 英文词 + 引号实体），写入 `entities/memory_entities/relations`；`GET /graph`、`GET /entities`；检索增加 entity 信号；控制台图谱页（人/分区维度）。
 - **Python SDK**：`sdk/python`（requests/urllib，零重依赖），覆盖 partitions/persons/memories/search/brief/context/dream/history/feedback；unittest。
@@ -170,7 +197,18 @@ relations(id TEXT PRIMARY KEY, partition_id TEXT NOT NULL,
 
 ## 6. 里程碑与验收
 
-1. **M1（P0）**：schema v7 + 混合检索 + 写管线 + history/feedback；`pnpm verify` 全绿；eval 召回用例通过；控制台可见信号/历史/反馈。
-2. **M2（P1）**：画像/生命周期/时序/评测 harness；eval 全场景通过；文档与 SDK 同步。
-3. **M3（P2）**：图/生态/多模态/合规；MCP 与 Python SDK 冒烟通过；控制台图谱与附件展示。
-4. 每个里程碑提交到 `v6-rebuild`（或后续 `v6.1` 分支）并推送；旧 v6 行为保持兼容（新增字段/端点，不破坏现有控制台与 DSH 插件）。
+1. **M1（P0）✅**：schema v7 + 混合检索 + 写管线 + history/feedback；`pnpm verify` 全绿；
+   eval 召回用例通过；控制台可见信号/历史/反馈（截图 `v6.1-03`）。
+2. **M2（P1）✅**：画像/生命周期/时序/评测 harness；eval 全场景通过；文档与 SDK 同步
+   （截图 `v6.1-05`）。
+3. **M3（P2）✅**：图/生态/多模态/合规；MCP 与 Python SDK 冒烟通过；控制台图谱与附件展示
+   （截图 `v6.1-07`）。
+4. 每个里程碑提交到 `v6-rebuild` 并推送；旧 v6 行为保持兼容（新增字段/端点，不破坏现有控制台与 DSH 插件）。
+
+### 6.1 与 v6 的兼容性
+
+- **只增不改**：v6 的端点、响应字段与错误码保持兼容；新增 `hits/signals/mode/strategy` 时保留
+  `results` 别名；写记忆响应新增 `event/superseded_id`，原 `events` 不变。
+- **迁移幂等**：v6 库启动自动升级 v7，补列与回填不阻塞；旧 `memories.content` 原样保留。
+- **控制台**：新页面（图谱、画像、生命周期）为增量路由；原分区/人/记忆路径不变。
+- **DSH 插件**：继续使用 v6 兼容字段（`results`、`{items,next_cursor,partition_stats}`），无需改动。

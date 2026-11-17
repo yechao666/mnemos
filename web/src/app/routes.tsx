@@ -9,6 +9,7 @@ import { PartitionOverviewPage } from '../pages/PartitionOverviewPage.tsx';
 import { PersonsPage } from '../pages/PersonsPage.tsx';
 import { PersonDetailPage } from '../pages/PersonDetailPage.tsx';
 import { MemoriesPage } from '../pages/MemoriesPage.tsx';
+import { PartitionGraphPage } from '../pages/PartitionGraphPage.tsx';
 import { KeysPage } from '../pages/KeysPage.tsx';
 import { UsagePage } from '../pages/UsagePage.tsx';
 import { AuditPage } from '../pages/AuditPage.tsx';
@@ -58,6 +59,7 @@ export function AppRoutes() {
           <Route path="persons" element={<PersonsPage />} />
           <Route path="persons/:personRef" element={<PersonDetailPage />} />
           <Route path="memories" element={<MemoriesPage />} />
+          <Route path="graph" element={<PartitionGraphPage />} />
           <Route path="keys" element={<KeysPage />} />
           <Route path="usage" element={<UsagePage />} />
           <Route path="audit" element={<AuditPage />} />

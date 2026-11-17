@@ -30,6 +30,7 @@ import {
   Segmented,
   Select,
   Skeleton,
+  Switch,
   useToast,
 } from '@ui';
 import { api } from '@lib/api.ts';
@@ -43,6 +44,7 @@ import {
 } from '../components/memories/shared.tsx';
 import { SearchHitInsight, SearchStrategyBadges } from '../components/memories/SearchSignals.tsx';
 import { MemoryDrawer } from '../components/memories/MemoryDrawer.tsx';
+import { MemoryCreateModal } from '../components/memories/MemoryCreateModal.tsx';
 
 const SCOPE_SELECT_OPTIONS = [
   { value: '', label: '全部范围' },
@@ -53,6 +55,23 @@ const MODE_OPTIONS = RETRIEVAL_MODES.map((item) => ({ value: item.value, label: 
 
 function isMode(value: string | null): value is MemorySearchMode {
   return value === 'hybrid' || value === 'keyword' || value === 'vector';
+}
+
+/** datetime-local 的值（YYYY-MM-DDTHH:mm）；URL 里若是完整 ISO 也转成本地时间显示。 */
+function toLocalInput(value: string): string {
+  if (!value) return '';
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) return value;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** 把 datetime-local 的本地时间转为 ISO（带时区），作为 as_of 传给检索。 */
+function localInputToIso(value: string): string | undefined {
+  if (!value) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
 /**
@@ -76,6 +95,11 @@ export function MemoriesPage() {
   const personParam = searchParams.get('person') ?? '';
   const scopeParam = (searchParams.get('scope') as MemoryScope | null) ?? '';
   const categoryParam = (searchParams.get('category') as MemoryCategory | null) ?? '';
+  // v6.1 时序：as_of 时间点（历史视图）与「包含已失效」开关。
+  const asOfParam = searchParams.get('asOf') ?? '';
+  const asOfInput = toLocalInput(asOfParam);
+  const asOfIso = localInputToIso(asOfInput);
+  const includeSuperseded = searchParams.get('superseded') === '1';
   const modeParamRaw = searchParams.get('mode');
   const settingsMode = partition?.settings?.retrievalMode;
   const mode: MemorySearchMode = isMode(modeParamRaw)
@@ -156,8 +180,11 @@ export function MemoriesPage() {
         category: categoryParam || undefined,
         mode,
         topK: PAGE_SIZE,
+        // v6.1 时序：as_of=历史时间点；includeSuperseded=包含已被取代/失效的记忆。
+        asOf: asOfIso,
+        includeSuperseded,
       }),
-    [partitionId, qParam, effectivePersonId, scopeParam, categoryParam, mode],
+    [partitionId, qParam, effectivePersonId, scopeParam, categoryParam, mode, asOfIso, includeSuperseded],
     Boolean(partitionId && qParam),
   );
 
@@ -188,13 +215,14 @@ export function MemoriesPage() {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [drawerMemory, setDrawerMemory] = useState<Memory | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
 
   // 列表刷新/筛选/检索模式变化后清理选择，避免误删不在当前结果里的记忆。
   useEffect(() => {
     setSelected(new Set());
-  }, [partitionId, qParam, personParam, scopeParam, categoryParam, mode]);
+  }, [partitionId, qParam, personParam, scopeParam, categoryParam, mode, asOfParam, includeSuperseded]);
 
-  const hasFilters = Boolean(qParam || personParam || scopeParam || categoryParam);
+  const hasFilters = Boolean(qParam || personParam || scopeParam || categoryParam || asOfParam || includeSuperseded);
   const selectedRows = useMemo(
     () => rows.filter((memory) => selected.has(memory.id)),
     [rows, selected],
@@ -265,6 +293,11 @@ export function MemoriesPage() {
         desc={`分区「${partition?.name ?? partitionId}」内的记忆：按人 / 可见范围 / 分类筛选；有关键词时走混合检索（向量 + 关键词 + 时效 + 重要度），并展示得分与信号分解。普通列表仍为游标分页，不返回 total。`}
         actions={
           <>
+            {canManage ? (
+              <Button variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>
+                写记忆
+              </Button>
+            ) : null}
             <Button icon="settings" onClick={() => navigate(`/partitions/${partitionId}/settings#retrieval`)}>
               检索设置
             </Button>
@@ -344,6 +377,29 @@ export function MemoriesPage() {
                 style={{ width: 124 }}
                 onChange={(event) => patchParams({ category: event.target.value || undefined })}
               />
+              <div className="hstack gap-6" title="时间点（as_of）：回看该时刻有效的事实；仅对检索生效。">
+                <span className="tiny dim nowrap">时间点</span>
+                <Input
+                  type="datetime-local"
+                  value={asOfInput}
+                  aria-label="检索时间点 as_of"
+                  style={{ width: 190 }}
+                  onChange={(event) => patchParams({ asOf: event.target.value || undefined })}
+                />
+                {asOfInput ? (
+                  <IconButton
+                    icon="x"
+                    label="清除检索时间点"
+                    size="sm"
+                    onClick={() => patchParams({ asOf: undefined })}
+                  />
+                ) : null}
+              </div>
+              <Switch
+                checked={includeSuperseded}
+                label="包含已失效"
+                onChange={(next) => patchParams({ superseded: next ? '1' : undefined })}
+              />
             </div>
             <div className="toolbar-right">
               {hasFilters ? (
@@ -365,8 +421,20 @@ export function MemoriesPage() {
                 tookMs={search.data ? search.data.tookMs : null}
                 strategy={search.data?.strategy}
               />
+              {asOfIso ? (
+                <Badge tone="amber" size="sm" dot>
+                  历史视图 · {fmtFullDateTime(asOfIso)}
+                </Badge>
+              ) : null}
+              {includeSuperseded ? (
+                <Badge tone="slate" size="sm" dot>
+                  含已失效 / 已被取代
+                </Badge>
+              ) : null}
               <span className="tiny dim">
                 检索结果按综合得分排序，最多 {PAGE_SIZE} 条（服务端候选集上限内）；清空关键词回到游标列表。
+                {asOfIso ? ' 时间点视图只返回该时刻有效的事实（as_of）。' : ''}
+                {includeSuperseded ? ' 已包含 validTo / supersededBy 的历史记忆，行内以徽标标注。' : ''}
               </span>
               <Button
                 size="sm"
@@ -383,6 +451,7 @@ export function MemoriesPage() {
           ) : (
             <div className="tiny dim mt-8">
               批量操作只作用于已加载的记忆（当前页），不提供「全选全部」；共享记忆与私有记忆都会按 scope 标注。
+              「时间点 / 包含已失效」是检索参数（as_of / include_superseded），输入关键词走检索后生效。
             </div>
           )}
         </div>
@@ -540,6 +609,18 @@ export function MemoriesPage() {
         description={`将删除 ${fmtInt(selected.size)} 条已加载的记忆，操作会记录到审计日志且不可撤销。`}
         confirmLabel="删除"
         loading={deleting}
+      />
+
+      <MemoryCreateModal
+        open={createOpen}
+        partitionId={partitionId}
+        defaultPersonRef={personParam}
+        defaultScope={partition?.settings?.defaultScope ?? 'partition'}
+        defaultCategory="fact"
+        onClose={() => setCreateOpen(false)}
+        onCreated={async () => {
+          await refreshActive();
+        }}
       />
     </div>
   );

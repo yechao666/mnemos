@@ -1,7 +1,8 @@
-# Mnemos v6 API 参考
+# Mnemos v6.1 API 参考
 
-> 契约：[`v6-architecture.md`](v6-architecture.md)。本文以 v6 代码为准
-> （`server/src/http/routes/*.ts`、`server/src/http/serialize.ts`、`server/src/http/schemas.ts`）。
+> 契约：[`v6-architecture.md`](v6-architecture.md) + [`roadmap-v6.1.md`](roadmap-v6.1.md)。
+> 本文以 v6.1 代码为准（`server/src/http/routes/*.ts`、`server/src/http/serialize.ts`、
+> `server/src/http/schemas.ts`、`shared/src/types.ts`）。
 >
 > 两套 JSON 命名约定，**不是两套能力**：
 >
@@ -24,6 +25,12 @@
 - **请求 ID**：每个响应带 `x-request-id`；错误体里也有 `requestId`，可与日志关联。
 - **大小/超时**：请求体至少 1MB（`MNEMOS_BODY_LIMIT_BYTES` 可调大），请求超时默认 30s。
 - **探针**：`GET /health`、`GET /api/health`、`GET /healthz`、`GET /readyz`、`GET /metrics`（详见第 8 节）。
+- **幂等键**（v6.1，写接口）：请求头 `Idempotency-Key: <8–128 字符>`。服务端在
+  `idempotency_keys` 表保留 **24 小时**：相同 key + 相同方法/路径/请求体直接回放首次响应
+  （含状态码与响应体）；同一 key 用于不同方法/路径或不同 body 返回 `409 CONFLICT`。
+- **检索信号**（v6.1）：`POST .../memories/search` 返回 `hits[]`，每项带
+  `score`、`signals {vector, keyword, recency, importance, entity}`、`matched_on[]`，
+  顶层带 `mode` / `strategy` / `took_ms`；`results` 保留为 v6 兼容别名。
 
 ### 错误体
 
@@ -168,7 +175,14 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
     "retention_days": 365,
     "monthly_quota": 0,
     "person_auto_create": true,
-    "locale": "zh-CN"
+    "locale": "zh-CN",
+    "retrieval_mode": "hybrid",
+    "retrieval_weights": { "vector": 0.45, "keyword": 0.3, "recency": 0.15, "importance": 0.1, "entity": 0 },
+    "embedding_model": "mnemos-hash-384",
+    "merge_threshold": 0.95,
+    "dedupe_threshold": 0.98,
+    "auto_extract_entities": true,
+    "pii_redaction": "off"
   },
   "created_at": "2026-11-17T16:00:44.840Z",
   "updated_at": "2026-11-17T16:00:44.840Z",
@@ -196,6 +210,13 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
 | `monthly_quota` | `monthlyQuota` | 0（不限） | 分区月度记忆 token 配额；超限写入 429 `QUOTA_EXCEEDED` |
 | `person_auto_create` | `personAutoCreate` | true | 仅影响引擎按 `person_external_id` 写入；v1 的人级写路径仍要求人已存在 |
 | `locale` | `locale` | `zh-CN` | 展示语言 |
+| `retrieval_mode` | `retrievalMode` | `hybrid` | 检索模式：`hybrid` / `keyword` / `vector` |
+| `retrieval_weights` | `retrievalWeights` | `0.45/0.3/0.15/0.1/0` | 融合权重：`vector` / `keyword` / `recency` / `importance` / `entity`（0–1） |
+| `embedding_model` | `embeddingModel` | `mnemos-hash-384` | 本地 hash-384 或外部模型名；外部失败回退本地 |
+| `merge_threshold` | `mergeThreshold` | 0.95 | 余弦 ≥ 该值时新写入 MERGE 进已有记忆（0–1） |
+| `dedupe_threshold` | `dedupeThreshold` | 0.98 | 余弦 ≥ 该值时视为重复，返回 NOOP（0–1） |
+| `auto_extract_entities` | `autoExtractEntities` | true | 写入后异步 `extract` 实体（图谱依赖） |
+| `pii_redaction` | `piiRedaction` | `off` | `basic`：写入时脱敏手机号（保留后四位）/ 邮箱（`a***@domain`）/ 身份证 / 银行卡；`metadata.piiRedacted=true` 并写审计 |
 
 ### 4.2 PartitionStats
 
@@ -228,11 +249,17 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
   "first_seen_at": "2026-11-17T16:01:02.397Z",
   "last_seen_at": "2026-11-17T16:01:05.801Z",
   "created_at": "2026-11-17T16:01:02.397Z",
-  "updated_at": "2026-11-17T16:01:05.801Z"
+  "updated_at": "2026-11-17T16:01:05.801Z",
+  "merged_into": null,
+  "consent": { "memory": true, "marketing": false },
+  "deleted_at": null
 }
 ```
 
 - `type`：`human` / `agent` / `service` / `other`；`status`：`active` / `archived` / `deleted`。
+- `merged_into`：合并后被指向的 canonical 人内部 id；引用已合并人时服务端会**自动跟随**到 canonical。
+- `consent`：同意/合规标记（自由 JSON，整体覆盖）；随导出返回，PATCH 写入审计 `person.consent`。
+- `deleted_at`：软删除时间；默认列表排除 `deleted` 与已合并的人（`include_merged=true` 可包含已合并）。
 - 唯一键是 `(partition_id, type, external_id)`：同 `external_id` 允许不同 `type` 各建一个人。
 - 按 `:person` 引用时支持**内部 id 或 external_id**；external_id 跨 type 重复时取最早创建的一条。
 - `memory_count` = 本人 `scope=person/session` 记忆数；`shared_memory_count` = 本人写的
@@ -260,7 +287,27 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
   "created_at": "2026-11-17T16:01:05.801Z",
   "updated_at": "2026-11-17T16:01:05.801Z",
   "expires_at": null,
-  "dreamed_at": null
+  "dreamed_at": null,
+  "valid_from": "2026-11-17T16:01:05.801Z",
+  "valid_to": null,
+  "superseded_by": null,
+  "supersedes": null,
+  "fact_key": "preference.language",
+  "feedback_up": 2,
+  "feedback_down": 0,
+  "attachment_count": 1,
+  "attachments": [
+    {
+      "id": "att_9a1c2f3d4e5b6a7c",
+      "memory_id": "mem_3238ae7e145445c0",
+      "kind": "image",
+      "url": "https://cdn.example.com/board.png",
+      "mime": "image/png",
+      "size": 20480,
+      "caption": "评审白板照片",
+      "created_at": "2026-11-17T16:01:05.801Z"
+    }
+  ]
 }
 ```
 
@@ -271,7 +318,17 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
 - `source`：`api` / `conversation` / `agent` / `import` / `playground` / `dream`。
 - `status`：`active` / `archived` / `deleted`；`importance`、`confidence` 为 0–1。
 - `person_id` 是**归属人**，`actor_person_id` 是**写入者**（可与人不同）。
-- v6 不做事实抽取：原文入库；`infer` / `mode` 字段被接受但忽略。
+- v6.1 原文入库（不做 LLM 事实抽取），但会做**确定性演化**：
+  - `normalized_hash` 完全重复 → `NOOP`；
+  - 余弦 ≥ `dedupe_threshold` → `NOOP`（近重复）；
+  - 余弦 ≥ `merge_threshold` → `MERGE`（更新内容/重要度/标签/metadata）；
+  - 显式 `supersedes_id` 或相同 `fact_key` → 旧记忆 `valid_to=now / superseded_by=新 id`，新记忆 `supersedes=旧 id`。
+- `valid_from` / `valid_to`：事实生效/失效时间；默认检索只返回 `valid_to IS NULL` 的记忆，
+  `as_of` 可回看某个时间点有效的事实，`include_superseded=true` 包含历史版本。
+- `fact_key`：槽位键（如 `preference.language`）；同 key 新写入自动取代旧事实。
+- `feedback_up/down`：检索反馈计数；帮助度会按 ±0.05 微调 `confidence`（夹在 0.05–1）。
+- `attachment_count`：列表页只给数量；`attachments` 明细只在**详情 / 写入响应 / 导出**返回。
+- `infer` / `mode` 字段被接受但忽略。
 
 ### 4.5 MemoryBrief / PersonContext / Dream
 
@@ -353,6 +410,237 @@ Brief（节选：`recent` 只列 1 条，实际最多 100 条）：
 
 `trigger`：`manual` / `schedule`；`status`：`running` / `completed` / `skipped` / `failed`。
 
+### 4.6 检索命中与信号（v6.1）
+
+`POST /v1/partitions/:p/memories/search` 返回：
+
+```json
+{
+  "hits": [
+    {
+      "id": "mem_3238ae7e145445c0",
+      "content": "文档校验：用户喜欢先看结论再看细节",
+      "scope": "person",
+      "category": "preference",
+      "importance": 0.9,
+      "confidence": 0.85,
+      "valid_from": "2026-11-17T16:01:05.801Z",
+      "valid_to": null,
+      "fact_key": "preference.tone",
+      "score": 0.834,
+      "signals": { "vector": 0.81, "keyword": 1, "recency": 0.66, "importance": 0.9, "entity": 0 },
+      "matched_on": ["keyword", "vector"]
+    }
+  ],
+  "took_ms": 4,
+  "mode": "hybrid",
+  "strategy": "hybrid:weighted",
+  "results": [ { "id": "mem_3238ae7e145445c0", "content": "…" } ],
+  "partition_stats": { "partition_id": "ptn_…", "memories_total": 14, "…": "…" }
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `hits[]` | v6.1 契约命中；每项是 `Memory` + `score` / `signals` / `matched_on` |
+| `score` | 融合分 `Σ w_i * normalized(signal_i)`，0–1 |
+| `signals.vector` | 与 query embedding 的余弦（候选未落 embedding 时为 0） |
+| `signals.keyword` | 关键词相关度：整句子串命中=1；否则 CJK 二元组/单字覆盖 + 英文词命中 |
+| `signals.recency` | 时效分（越新越高，按分区记忆时间分布归一化） |
+| `signals.importance` | 记忆重要度 |
+| `signals.entity` | 实体命中（P2；权重默认 0，可在 settings 调高） |
+| `matched_on` | 实际命中的信号/字段，如 `keyword` / `vector` / `caption` |
+| `mode` | 实际检索模式：`hybrid` / `keyword` / `vector` |
+| `strategy` | 服务端策略说明（便于排障与 A/B） |
+| `results` | **v6 兼容别名**，等价于 `hits` 去掉信号；旧客户端可继续使用 |
+
+- 候选集上限：FTS 前缀 **300** + 该人最近 **200** + 同分区 `scope=partition` 最近 **200**，
+  按 id 去重后做内存 cosine 重排（详见 [架构](architecture.md#42-检索v61)）。
+- 请求参数：`query`、`person_id` / `person_external_id`、`scope`、`category`、`mode`、
+  `top_k`（1–50，默认 8）、`as_of`（ISO）、`include_superseded`、`include_private`。
+- `as_of`：只看该时间点有效的事实（`valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)`）。
+- `include_superseded=true`：把已失效/被取代的记忆也纳入候选（结果带 `valid_to` / `superseded_by`）。
+
+### 4.7 记忆历史与反馈（v6.1）
+
+历史 `GET /v1/partitions/:p/memories/:id/history`：
+
+```json
+{
+  "items": [
+    {
+      "id": "hist_8f2c…",
+      "partition_id": "ptn_2c3dcb0f511c4c81",
+      "memory_id": "mem_3238ae7e145445c0",
+      "person_id": "prs_5ed57a3928ec4518",
+      "event": "SUPERSEDE",
+      "old_content": "用户喜欢先看细节",
+      "new_content": "用户喜欢先看结论再看细节",
+      "actor": "user:usr_3df6cf54dba0455a",
+      "reason": "superseded",
+      "meta": { "supersededBy": "mem_3238ae7e145445c0" },
+      "created_at": "2026-11-17T16:01:05.925Z"
+    }
+  ]
+}
+```
+
+- `event`：`ADD` / `UPDATE` / `MERGE` / `SUPERSEDE` / `DELETE` / `NOOP` / `FEEDBACK` / `RESTORE`。
+- 控制台 `GET /api/partitions/:p/memories/:id/history` 直接返回数组（无 `items` 包装）。
+
+反馈 `POST /v1/partitions/:p/memories/:id/feedback`：
+
+```bash
+curl -s -X POST "$BASE/v1/partitions/mnemos-dev/memories/mem_3238ae7e145445c0/feedback" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"helpful":true,"query":"评审偏好","reason":"命中正确"}'
+```
+
+```json
+{
+  "memory": {
+    "id": "mem_3238ae7e145445c0",
+    "confidence": 0.85,
+    "feedback_up": 3,
+    "feedback_down": 0,
+    "…": "…"
+  }
+}
+```
+
+- `helpful=true`：`feedback_up+1`、`confidence+0.05`；`false`：`feedback_down+1`、`confidence-0.05`；
+  夹在 0.05–1，并写一条 `FEEDBACK` 历史。
+- 反馈会改变后续检索排序中的 `importance/confidence` 信号。
+
+### 4.8 结构化画像（v6.1 P1）
+
+`GET /v1/partitions/:p/persons/:person/profile`（`?force=true` / `?refresh=true` 跳过缓存）：
+
+```json
+{
+  "person": { "id": "prs_5ed57a3928ec4518", "external_id": "docs-user", "display_name": "文档校验用户" },
+  "facts": [
+    {
+      "id": "fact_1a2b…",
+      "partition_id": "ptn_2c3dcb0f511c4c81",
+      "person_id": "prs_5ed57a3928ec4518",
+      "key": "identity.job",
+      "value": "产品经理",
+      "confidence": 0.9,
+      "valid_from": "2026-11-17T16:01:05.801Z",
+      "valid_to": null,
+      "source_memory_id": "mem_3238ae7e145445c0",
+      "created_at": "2026-11-17T16:01:05.801Z",
+      "updated_at": "2026-11-17T16:01:05.801Z"
+    }
+  ],
+  "summary": "产品经理；偏好先看结论；关注评审。",
+  "generated_at": "2026-11-17T16:01:08.954Z",
+  "cached": false
+}
+```
+
+- `facts` 为**当前有效**版本（`valid_to IS NULL`）；同 `key` 写入新值会关闭旧版本（保留历史）。
+- 记忆 `metadata.factKey` 会被 profile 任务/画像读取自动沉淀为 fact（同值幂等，新值版本化）。
+- `summary` 默认确定性拼接（≤800 字）；配置 `MNEMOS_LLM_*` 时优先 LLM，失败自动回退。
+
+facts 维护：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `.../persons/:person/facts` | `{ items: PersonFact[] }`（当前有效） |
+| `PUT` | `.../persons/:person/facts` | 单条 `{key,value,confidence?,source_memory_id?}` → `{fact}`；或 `{facts:[…]}`（≤100）→ `{items}` |
+| `DELETE` | `.../persons/:person/facts/:factId` | 软关闭（`valid_to=now`，保留历史），204 |
+
+### 4.9 实体关系图（v6.1 P2）
+
+`GET /v1/partitions/:p/graph?person_id=&limit=100`：
+
+```json
+{
+  "nodes": [
+    { "id": "ent_1", "label": "Mnemos", "type": "project", "weight": 3, "memories": 2 },
+    { "id": "ent_2", "label": "SQLite", "type": "tech", "weight": 1, "memories": 1 }
+  ],
+  "edges": [
+    { "id": "rel_1", "source": "ent_1", "target": "ent_2", "relation": "co_occurs", "weight": 1 }
+  ],
+  "stats": {
+    "nodes": 2,
+    "edges": 1,
+    "top_types": [{ "type": "project", "count": 1 }],
+    "topTypes": [{ "type": "project", "count": 1 }]
+  }
+}
+```
+
+- 数据来自异步 `extract` 任务：规则抽取实体写 `entities` / `memory_entities`，
+  同一记忆内的实体两两写 `relations(relation='co_occurs')`。
+- `limit` 默认 100、最大 500；边只保留两端都在节点集内的关系。
+- `topTypes` 是 `top_types` 的兼容别名（控制台使用）。
+
+`GET /v1/partitions/:p/entities?q=&person_id=&limit=50`：
+
+```json
+{
+  "items": [
+    {
+      "id": "ent_1",
+      "name": "Mnemos",
+      "type": "project",
+      "mention_count": 3,
+      "memories": 2,
+      "created_at": "2026-11-17T16:01:05.801Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+- `q` 为子串匹配；`person_id` 过滤该人关联的实体；`limit` 默认 50、最大 200。
+
+### 4.10 生命周期：合并 / 归档 / 导出 / 删除（v6.1 P1）
+
+| 方法 | 路径 | 权限（v1） | 说明 |
+| --- | --- | --- | --- |
+| `POST` | `.../persons/:person/merge` | `admin` | body `{target_id}` 或 `{target_external_id}` |
+| `POST` | `.../persons/:person/archive` | `memories:write` | 归档（`status=archived`，数据保留） |
+| `GET` | `.../persons/:person/export` | `memories:read` | 合规导出 JSON |
+| `DELETE` | `.../persons/:person?hard=true` | `admin` | 默认软删；`hard=true` 物理级联删除 |
+
+合并响应：
+
+```json
+{
+  "person": { "id": "prs_target", "external_id": "user-2", "…": "…" },
+  "merged_from": { "id": "prs_source", "external_id": "user-1", "merged_into": "prs_target", "status": "archived", "…": "…" },
+  "moved_memories": 12,
+  "moved_facts": 3
+}
+```
+
+- 合并迁移 `memories` / `person_facts` / `memory_feedback` / `memory_history` / `sessions`；
+  同 `fact_key` 的重复当前事实只保留最新一条；源人 `status=archived` + `merged_into=target`。
+- 之后用源人 id / external_id 读写会自动跟随到 canonical 人。
+- 默认人列表排除已合并/已删除的人；`include_merged=true` 可包含已合并。
+
+导出响应：
+
+```json
+{
+  "person": { "…": "…", "consent": { "memory": true } },
+  "facts": [ { "key": "identity.job", "value": "产品经理", "valid_to": null } ],
+  "memories": [ { "id": "mem_…", "content": "…" } ],
+  "exported_at": "2026-11-17T16:02:00.000Z",
+  "truncated": false
+}
+```
+
+- facts 含**历史版本**；memories 最多 **10000** 条，超出时 `truncated=true`。
+- 软删：`status=deleted` + `deleted_at=now`，记忆/facts 保留（仍可导出/审计）。
+- 硬删：级联删除该人的 memories（含 FTS/实体/历史/反馈）、facts、profile、sessions，再删人；
+  控制台要求 owner，v1 要求 `admin` 作用域 key。
+
 ---
 
 ## 5. 公开 v1 API（API Key）
@@ -387,7 +675,15 @@ curl -s -X POST "$BASE/v1/partitions" \
 | `GET` | `/v1/partitions/:p/persons` | `memories:read` | 游标列表；`cursor/limit/q/type/status/sort` |
 | `PUT` | `/v1/partitions/:p/persons/:externalId` | `memories:write` | 按 `(type, external_id)` 幂等建档/更新 |
 | `GET` | `/v1/partitions/:p/persons/:person` | `memories:read` | 详情；`person` = 内部 id 或 external_id |
-| `PATCH` | `/v1/partitions/:p/persons/:person` | `memories:write` | 更新 display_name/attributes/status/type |
+| `PATCH` | `/v1/partitions/:p/persons/:person` | `memories:write` | 更新 display_name/attributes/status/type/consent |
+| `GET` | `/v1/partitions/:p/persons/:person/profile` | `memories:read` | 画像 + 当前 facts + 摘要（`force` / `refresh`） |
+| `GET` | `/v1/partitions/:p/persons/:person/facts` | `memories:read` | 当前有效 facts |
+| `PUT` | `/v1/partitions/:p/persons/:person/facts` | `memories:write` | 单条或批量写 facts（版本化） |
+| `DELETE` | `/v1/partitions/:p/persons/:person/facts/:factId` | `memories:write` | 软关闭 fact（204） |
+| `POST` | `/v1/partitions/:p/persons/:person/merge` | `admin` | 合并到目标人（迁移 memories/facts/feedback） |
+| `POST` | `/v1/partitions/:p/persons/:person/archive` | `memories:write` | 归档（数据保留可读） |
+| `GET` | `/v1/partitions/:p/persons/:person/export` | `memories:read` | 合规导出（person + facts + ≤10000 记忆） |
+| `DELETE` | `/v1/partitions/:p/persons/:person` | `admin` | 默认软删；`?hard=true` 物理级联删除（204） |
 | `GET` | `/v1/partitions/:p/persons/:person/memories` | `memories:read` | 该人记忆：游标 + `scope/category/status/q` |
 | `POST` | `/v1/partitions/:p/persons/:person/memories` | `memories:write` | 写记忆（见 5.4） |
 | `GET` | `/v1/partitions/:p/persons/:person/brief` | `memories:read` | 人级简报（见 5.5） |
@@ -406,28 +702,32 @@ curl -s -X PUT "$BASE/v1/partitions/zhiwu-app/persons/user-123" \
 - 路径上的 `externalId` 优先；body 里 `external_id` 可省略。
 - `type` 默认 `human`；已存在同 `(type, external_id)` 时更新展示名/属性/状态并刷新 `last_seen_at`。
 - `PATCH` 允许改 `type`；改成已存在的 `(type, external_id)` 组合返回 `409 CONFLICT`。
+- v6.1：`PUT` / `PATCH` 均可写 `consent`（整体覆盖，写审计 `person.consent`）；列表查询新增
+  `include_merged=true`（默认排除已合并/已删除的人）。
 
 ### 5.3 记忆列表 / 详情 / 管理
 
 | 方法 | 路径 | 作用域 | 说明 |
 | --- | --- | --- | --- |
 | `GET` | `/v1/partitions/:p/memories` | `memories:read` | 分区记忆列表；`person_id`/`person_external_id`/`scope`/`category`/`status`/`q`/`cursor`/`limit` |
-| `POST` | `/v1/partitions/:p/memories/search` | `memories:read` | 兼容检索端点（body：`query`、`person_id`、`scope`、`category`、`top_k`） |
-| `GET` | `/v1/partitions/:p/memories/:id` | `memories:read` | 详情：`{ memory, person }` |
+| `POST` | `/v1/partitions/:p/memories/search` | `memories:read` | v6.1 混合检索（`hits`/`signals`/`mode`/`strategy`；`results` 兼容） |
+| `GET` | `/v1/partitions/:p/memories/:id/history` | `memories:read` | 变更历史时间线 |
+| `POST` | `/v1/partitions/:p/memories/:id/feedback` | `memories:write` | 检索反馈（`helpful`） |
+| `GET` | `/v1/partitions/:p/memories/:id` | `memories:read` | 详情：`{ memory, person }`（含附件明细） |
 | `PATCH` | `/v1/partitions/:p/memories/:id` | `memories:write` | 更新 content/category/importance/confidence/status/tags/metadata/expires_at |
 | `DELETE` | `/v1/partitions/:p/memories/:id` | `memories:write` | 删除，返回 `204`（无响应体） |
 
-检索（兼容端点）：
+检索（v6.1 混合检索）：
 
 ```bash
 curl -s -X POST "$BASE/v1/partitions/mnemos-dev/memories/search" \
   -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{"query":"data-v6","top_k":3}'
+  -d '{"query":"data-v6","mode":"hybrid","top_k":3,"as_of":"2026-11-17T00:00:00.000Z"}'
 ```
 
 ```json
 {
-  "results": [
+  "hits": [
     {
       "id": "mem_4b40fcd0833b4b63",
       "partition_id": "ptn_2c3dcb0f511c4c81",
@@ -438,11 +738,19 @@ curl -s -X POST "$BASE/v1/partitions/mnemos-dev/memories/search" \
       "content": "v6 使用 data-v6/ 作为数据目录，旧 data/ 不迁移。",
       "importance": 0.9,
       "source": "import",
-      "status": "active"
+      "status": "active",
+      "valid_from": "2026-11-17T16:01:05.801Z",
+      "valid_to": null,
+      "fact_key": null,
+      "score": 0.87,
+      "signals": { "vector": 0.8, "keyword": 1, "recency": 0.4, "importance": 0.9, "entity": 0 },
+      "matched_on": ["keyword", "vector"]
     }
   ],
-  "took_ms": 0,
-  "next_cursor": null,
+  "took_ms": 4,
+  "mode": "hybrid",
+  "strategy": "hybrid:weighted",
+  "results": [ { "id": "mem_4b40fcd0833b4b63", "content": "v6 使用 data-v6/ 作为数据目录，旧 data/ 不迁移。" } ],
   "partition_stats": {
     "partition_id": "ptn_2c3dcb0f511c4c81",
     "persons_total": 5,
@@ -457,8 +765,10 @@ curl -s -X POST "$BASE/v1/partitions/mnemos-dev/memories/search" \
 }
 ```
 
-- `query` 必填（1–2000 字符）；`top_k` 1–50，默认 8；`person_id` 是**作者过滤**。
-- 语义等价于 `GET /memories?q=…&limit=top_k`，只是响应包成 `{ results, took_ms }`（DSH 插件兼容）。
+- `query` 必填（1–2000 字符）；`top_k` 1–50，默认 8。
+- `person_id` / `person_external_id` 是**作者过滤**；`as_of` 做时序回看；`include_superseded`
+  控制是否包含已失效记忆；`include_private` 为人级视角（本人 + 分区共享）。
+- `results` 是 v6 兼容字段（DSH 插件旧版使用）；新代码请读 `hits`。
 
 ### 5.4 写入记忆
 
@@ -487,15 +797,50 @@ curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/memories" \
 | `tags` | string[]（≤20，每个≤64） | 默认 `[]` |
 | `metadata` | object | 默认 `{}` |
 | `expires_at` | ISO/null | 过期时间 |
-| `infer` / `mode` | — | **接受但忽略**（v6 不做事实抽取） |
+| `supersedes_id` | string(≤128) | **v6.1** 显式取代某条记忆（旧记忆 `valid_to=now`） |
+| `fact_key` | string(≤120) | **v6.1** 事实槽位键；同 key 新写入自动取代旧事实 |
+| `valid_from` | ISO | **v6.1** 事实生效时间（缺省=now） |
+| `attachments` | `[{kind,url,mime?,size?,caption?}]` | **v6.1 P2** 多模态附件（≤10；`url` ≤2000；`caption` ≤1000） |
+| `infer` / `mode` | — | **接受但忽略**（不做 LLM 事实抽取） |
 
-响应 `201`：
+写接口支持 `Idempotency-Key` 请求头（24h 幂等回放，见第 1 节）。同一 key 重放返回首次状态码；
+若首次是 `ADD`（201），重放仍是 201；`MERGE` / `NOOP` / `SUPERSEDE` 返回 200。
+
+响应 `ADD`（201）：
 
 ```json
 {
   "memory": { "…": "Memory" },
+  "event": "ADD",
+  "superseded_id": null,
   "events": [{ "type": "ADD", "memory_id": "mem_3238ae7e145445c0", "at": "2026-11-17T16:01:05.801Z" }]
 }
+```
+
+响应 `SUPERSEDE` / `MERGE` / `NOOP`（200）：
+
+```json
+{
+  "memory": { "id": "mem_new", "…": "Memory", "supersedes": "mem_old", "fact_key": "preference.tone" },
+  "event": "SUPERSEDE",
+  "superseded_id": "mem_old",
+  "events": [{ "type": "SUPERSEDE", "memory_id": "mem_new", "at": "2026-11-17T16:01:05.801Z" }]
+}
+```
+
+- `NOOP`：完全重复（`normalized_hash` 相同）或余弦 ≥ `dedupe_threshold`；返回已有记忆，不新增。
+- `MERGE`：余弦 ≥ `merge_threshold`；更新已有记忆的内容/重要度/标签/metadata，返回合并后的记忆。
+- `SUPERSEDE`：显式 `supersedes_id` 或相同 `fact_key`；旧记忆被关闭，新记忆记录 `supersedes`。
+- PII：分区 `settings.pii_redaction=basic` 时正文落库前脱敏，`metadata.piiRedacted=true`，
+  写审计 `memory.pii_redacted`。
+
+带附件与演化字段的写入示例：
+
+```bash
+curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/memories" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -H "Idempotency-Key: write-user-123-language-1" \
+  -d '{"text":"用户 123 偏好简洁的中文评审意见","scope":"person","category":"preference","fact_key":"preference.language","attachments":[{"kind":"image","url":"https://cdn.example.com/board.png","caption":"评审白板"}]}'
 ```
 
 校验失败示例（`scope=session` 缺 `session_id`，引擎错误码是 `VALIDATION`）：
@@ -539,6 +884,22 @@ curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/context" \
 - 没有待巩固记忆时返回 `status = "skipped"`，不产生洞见。
 - 分区级洞见归属系统人 `mnemos-dream`（`type=service`，不存在时自动创建）。
 
+### 5.6 实体 / 关系图（v6.1 P2）
+
+| 方法 | 路径 | 作用域 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/v1/partitions/:p/graph` | `memories:read` | `person_id`（可选）、`limit`（1–500，默认 100） |
+| `GET` | `/v1/partitions/:p/entities` | `memories:read` | `person_id`、`q`、`limit`（1–200，默认 50） |
+
+```bash
+curl -s "$BASE/v1/partitions/mnemos-dev/graph?limit=20" -H "authorization: Bearer $KEY"
+curl -s "$BASE/v1/partitions/mnemos-dev/entities?q=SQLite&limit=20" -H "authorization: Bearer $KEY"
+```
+
+- 数据由写入后的异步 `extract` 任务生成（`settings.auto_extract_entities` 开启时）；
+  刚写入的记忆可能短暂没有图数据，可等 1s worker tick 或 `POST /api/ops/jobs/tick`。
+- 响应形状与含义见 [4.9](#49-实体关系图v61-p2)。
+
 ---
 
 ## 6. 控制台 API（`/api`，会话鉴权）
@@ -579,11 +940,24 @@ owner 管理组织与组织级 Key。
 | `GET` | `/api/partitions/:partition/persons` | viewer | 人列表（游标，`q/type/status/sort`） |
 | `PUT` | `/api/partitions/:partition/persons/:externalId` | developer | 建档/更新人 |
 | `GET` | `/api/partitions/:partition/persons/:person` | viewer | 人详情 |
-| `PATCH` | `/api/partitions/:partition/persons/:person` | developer | 更新 `displayName/attributes/status`（**不能改 type/externalId**） |
+| `PATCH` | `/api/partitions/:partition/persons/:person` | developer | 更新 `displayName/attributes/status/consent`（**不能改 type/externalId**） |
+| `GET` | `/api/partitions/:p/persons/:person/profile` | viewer | 画像 + facts + 摘要（`force`/`refresh`） |
+| `GET` | `/api/partitions/:p/persons/:person/facts` | viewer | 当前有效 facts |
+| `PUT` | `/api/partitions/:p/persons/:person/facts` | developer | 单条 / 批量写 facts |
+| `DELETE` | `/api/partitions/:p/persons/:person/facts/:factId` | developer | 软关闭 fact（204） |
+| `POST` | `/api/partitions/:p/persons/:person/merge` | admin | 合并到目标人（body `targetId` / `targetExternalId`） |
+| `POST` | `/api/partitions/:p/persons/:person/archive` | developer | 归档 |
+| `GET` | `/api/partitions/:p/persons/:person/export` | viewer | 导出 JSON（含 facts 历史 + `truncated`） |
+| `DELETE` | `/api/partitions/:p/persons/:person` | admin（`hard=true` 需 owner） | 软删 / 硬删（204） |
+| `GET` | `/api/partitions/:p/graph` | viewer | 实体关系图（`personId`/`limit`） |
+| `GET` | `/api/partitions/:p/entities` | viewer | 实体列表（`personId`/`q`/`limit`） |
 | `GET` | `/api/partitions/:partition/persons/:person/memories` | viewer | 该人记忆（游标 + scope/category/q） |
 | `POST` | `/api/partitions/:partition/persons/:person/memories` | developer | 写记忆，返回 `{ memory }`（无 events） |
 | `GET` | `/api/partitions/:partition/memories` | viewer | 分区记忆（`personId`/`scope`/`category`/`q`/游标） |
-| `GET` | `/api/partitions/:partition/memories/:id` | viewer | `{ memory, person }` |
+| `POST` | `/api/partitions/:p/memories/search` | viewer | v6.1 检索：返回 `{hits,took_ms,mode,strategy,took_ms}`（camelCase 响应） |
+| `GET` | `/api/partitions/:p/memories/:id/history` | viewer | 历史数组（camelCase） |
+| `POST` | `/api/partitions/:p/memories/:id/feedback` | developer | `{helpful,query?,reason?}` → `{memory}` |
+| `GET` | `/api/partitions/:partition/memories/:id` | viewer | `{ memory, person }`（含附件明细） |
 | `PATCH` | `/api/partitions/:partition/memories/:id` | developer | `{ memory }` |
 | `DELETE` | `/api/partitions/:partition/memories/:id` | developer | 204 |
 
@@ -626,6 +1000,7 @@ owner 管理组织与组织级 Key。
 | `GET` | `/api/ops/status` | admin | 运行状态（版本/uptime/DB 文件与 WAL/schema/计数/配额/保留期/备份/维护/指标） |
 | `GET` | `/api/ops/maintenance` | admin | 维护历史 `?limit=20` |
 | `POST` | `/api/ops/maintenance` | admin | `{dryRun?,vacuum?}` |
+| `POST` | `/api/ops/jobs/tick` | admin | 手动跑一批异步任务 `{limit?}`（默认 10），返回 `{claimed,done,failed,at}` |
 | `POST` | `/api/ops/backup` | admin | 立即在线备份（`VACUUM INTO`） |
 | `GET` | `/api/ops/backups` | admin | 备份列表 |
 | `GET` | `/api/ops/backups/:file` | admin | 下载备份（文件名白名单） |
@@ -671,7 +1046,7 @@ owner 管理组织与组织级 Key。
 | 403 | `PARTITION_ARCHIVED` | 向已归档分区写入 |
 | 404 | `NOT_FOUND` | 分区/人/记忆不存在（跨组织统一 404） |
 | 405 | `METHOD_NOT_ALLOWED` | 路径存在但不支持该 HTTP 方法 |
-| 409 | `CONFLICT` | 唯一键冲突（如人的 type/external_id、session 跨分区） |
+| 409 | `CONFLICT` | 唯一键冲突（如人的 type/external_id、session 跨分区）；也用于 `Idempotency-Key` 复用到不同方法/路径/请求体 |
 | 409 | `DREAM_RUNNING` | 同一分区/人正在做梦 |
 | 413 | `PAYLOAD_TOO_LARGE` | 请求体超过上限 |
 | 423 | `account_locked` | 登录失败次数过多（带 `details.retryAfter`） |
@@ -694,7 +1069,8 @@ v6 是干净重建，**不兼容 v5 的端点与数据**：
 | `POST /v1/partitions/:p/memories`（顶层写记忆） | 人级 `POST .../persons/:person/memories`（人必填） |
 | 分页 `page/page_size` + `total` | 游标 `cursor/limit` + `next_cursor`，无 total |
 | `visibility`（project/agent/task） | `scope`（partition/person/session） |
-| 记忆向量/图谱/实体/词项/任务简报 | v6 不提供 |
+| 记忆向量/图谱/实体/词项/任务简报 | v6 不提供；**v6.1 重新以混合检索 / 实体图 / 画像提供**（详见第 4–5 节） |
+| 无历史 / 反馈 / 生命周期 | v6.1 新增 `history` / `feedback` / `profile` / `facts` / `merge` / `archive` / `export` / `delete` / `graph` / `entities` / `attachments` |
 | 数据目录 `data/`（v5） | `data-v6/`（v5 数据不迁移，保留在 `v5` 分支） |
 
 更完整的迁移说明见 [`v6-architecture.md`](v6-architecture.md)；v5 文档可从 `v5` 分支获取。

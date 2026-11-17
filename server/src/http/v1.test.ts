@@ -334,7 +334,7 @@ test('v1 旧的领域端点已移除（404）', async (t) => {
     '/v1/context',
     '/v1/partitions/alpha/agents',
     '/v1/partitions/alpha/tasks',
-    '/v1/partitions/alpha/graph',
+    // 注意：/v1/partitions/alpha/graph 在 v6.1 P2 已重新作为实体关系图端点（见 p2.test.ts）。
   ]) {
     const res = await request(fx.baseUrl, 'GET', path, { key: fx.orgKey });
     assert.equal(res.status, 404, `${path} 应返回 404`);

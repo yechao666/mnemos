@@ -523,3 +523,399 @@
     gap: 2px;
   }
 }
+
+/* ==========================================================================
+   v6.1 P1 — 人画像（facts / 摘要）与生命周期操作区
+   ========================================================================== */
+
+/* ------------------------------ 画像摘要 ------------------------------ */
+
+.profile-summary {
+  padding: 10px 12px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+/* ------------------------------ 事实槽位 ------------------------------ */
+
+.fact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fact-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.fact-row.is-editing {
+  display: block;
+  border-color: var(--primary-border);
+  background: rgba(139, 124, 255, 0.045);
+}
+
+.fact-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  max-width: 240px;
+  padding: 2px 7px;
+  border: 1px solid rgba(139, 124, 255, 0.28);
+  border-radius: var(--radius-full);
+  background: rgba(139, 124, 255, 0.09);
+  color: #c4bcff;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fact-value {
+  flex: 1 1 220px;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.fact-confidence {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.fact-confidence-track {
+  width: 56px;
+}
+
+.fact-source {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.fact-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.fact-editor {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(180px, 2fr) 104px auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.fact-add {
+  padding: 10px 11px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.01);
+}
+
+/* ------------------------------ 生命周期操作区 ------------------------------ */
+
+.lifecycle-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 12px;
+}
+
+.lifecycle-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.lifecycle-block.is-danger {
+  border-color: rgba(255, 107, 122, 0.28);
+  background: rgba(255, 107, 122, 0.04);
+}
+
+.lifecycle-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+
+@media (max-width: 760px) {
+  .fact-editor {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fact-actions {
+    margin-left: 0;
+  }
+
+  .fact-value {
+    flex-basis: 100%;
+  }
+}
+
+/* ==========================================================================
+   v6.1 P2 — 实体关系图 / 多模态附件 / PII 合规 / consent
+   ========================================================================== */
+
+/* ------------------------------ 关系图 ------------------------------ */
+.graph-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  touch-action: manipulation;
+}
+
+.graph-node { cursor: pointer; }
+.graph-node:focus { outline: none; }
+.graph-node:focus-visible circle {
+  stroke: #ffffff;
+  stroke-width: 2;
+}
+
+.graph-hint {
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-faint);
+  background: rgba(0, 0, 0, 0.12);
+}
+
+/* ------------------------------ 附件展示 ------------------------------ */
+.attachment-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 10px;
+}
+
+.attachment-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.attachment-thumb {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 92px;
+  height: 72px;
+  overflow: hidden;
+  border: 1px solid var(--border-faint);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text-dim);
+}
+
+.attachment-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.attachment-thumb.is-broken,
+.attachment-thumb-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px;
+  text-align: center;
+}
+
+.attachment-media {
+  flex: 0 0 auto;
+  max-width: 220px;
+}
+
+.attachment-media audio { width: 220px; max-width: 100%; height: 34px; }
+.attachment-media video { width: 190px; max-width: 100%; max-height: 110px; border-radius: 8px; background: #000; }
+
+.attachment-media.is-broken {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 92px;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+.attachment-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 190px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-faint);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.22);
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.attachment-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.attachment-caption {
+  font-size: 12.5px;
+  color: var(--text-soft);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.attachment-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.attachment-loading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 0;
+}
+
+/* ------------------------------ 附件编辑器 ------------------------------ */
+.attachment-editor {
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.01);
+}
+
+.attachment-editor-empty {
+  padding: 8px 0 2px;
+}
+
+.attachment-row {
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-faint);
+}
+
+.attachment-row:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.attachment-row-fields {
+  display: grid;
+  grid-template-columns: 104px minmax(200px, 1.7fr) minmax(150px, 1fr) 32px;
+  gap: 8px;
+  align-items: center;
+}
+
+.attachment-row-fields .input { min-width: 0; }
+
+/* ------------------------------ PII 合规 ------------------------------ */
+.pii-examples {
+  padding: 12px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+}
+
+.pii-example-table {
+  display: flex;
+  flex-direction: column;
+}
+
+.pii-example-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1.3fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-top: 1px solid var(--border-faint);
+}
+
+.pii-example-row.is-head {
+  border-top: none;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.pii-after { color: #6ee7b7; }
+
+/* ------------------------------ consent ------------------------------ */
+.consent-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.consent-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.8fr) minmax(180px, 1.4fr) 32px;
+  gap: 8px;
+  align-items: center;
+}
+
+.consent-row .input { min-width: 0; }
+
+@media (max-width: 760px) {
+  .attachment-row-fields {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .attachment-row-fields > .input:nth-child(2) {
+    grid-column: 1 / -1;
+  }
+
+  .consent-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .consent-row > :last-child {
+    grid-column: 2 / 3;
+    justify-self: end;
+  }
+
+  .pii-example-row {
+    grid-template-columns: 70px minmax(0, 1fr);
+  }
+
+  .pii-example-row > :last-child {
+    grid-column: 2 / 3;
+  }
+}

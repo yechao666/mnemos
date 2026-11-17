@@ -788,20 +788,14 @@ test('503：GET 指数退避重试', async () => {
   assert.equal(page.items.length, 0);
 });
 
-test('非幂等 POST 不重试（即使带 idempotencyKey）；只读检索 POST 可重试', async () => {
-  // 写记忆：服务端 503 时只尝试一次，避免重复写入。
+test('非幂等 POST：无幂等键不重试；带 idempotencyKey 可安全重试；检索 POST 总是可重试', async () => {
+  // 写记忆（无幂等键）：服务端 503 时只尝试一次，避免重复写入。
   const addMock = createFetchMock(() =>
     json({ error: { code: 'SERVICE_UNAVAILABLE', message: '稍后重试' } }, 503),
   );
   const addClient = clientFor(addMock, { maxRetries: 2 });
   await assert.rejects(
-    () =>
-      addClient.memories.add(
-        'ws-demo',
-        'user-1',
-        { text: '不会重试' },
-        { idempotencyKey: 'idem-key-12345678' },
-      ),
+    () => addClient.memories.add('ws-demo', 'user-1', { text: '不会重试' }),
     (error: unknown) => {
       assert.ok(error instanceof MnemosApiError);
       assert.equal(error.status, 503);
@@ -809,19 +803,51 @@ test('非幂等 POST 不重试（即使带 idempotencyKey）；只读检索 POST
     },
   );
   assert.equal(addMock.calls.length, 1);
-  assert.equal(addMock.calls[0]?.headers.get('idempotency-key'), 'idem-key-12345678');
+  assert.equal(addMock.calls[0]?.headers.get('idempotency-key'), null);
+
+  // 写记忆（带幂等键）：服务端 v6.1 持久化 24h 幂等记录，可安全重试并复用同一键。
+  const idempotentMock = createFetchMock((_call, index) => {
+    if (index === 0) {
+      return json({ error: { code: 'SERVICE_UNAVAILABLE', message: '稍后重试' } }, 503);
+    }
+    return json(
+      {
+        memory: memoryFixture,
+        event: 'ADD',
+        superseded_id: null,
+        events: [{ type: 'ADD', memory_id: 'mem_1', at: '2026-11-03T10:00:00.000Z' }],
+      },
+      201,
+    );
+  });
+  const idempotentClient = clientFor(idempotentMock, { maxRetries: 2 });
+  const added = await idempotentClient.memories.add(
+    'ws-demo',
+    'user-1',
+    { text: '可安全重试' },
+    { idempotencyKey: 'idem-key-12345678' },
+  );
+  assert.equal(idempotentMock.calls.length, 2);
+  assert.equal(idempotentMock.calls[0]?.headers.get('idempotency-key'), 'idem-key-12345678');
+  assert.equal(idempotentMock.calls[1]?.headers.get('idempotency-key'), 'idem-key-12345678');
+  assert.equal(added.event, 'ADD');
 
   // 检索是只读 POST，允许指数退避重试。
   const searchMock = createFetchMock((_call, index) => {
     if (index === 0) return json({ error: { code: 'SERVICE_UNAVAILABLE', message: '稍后重试' } }, 503);
-    return json({ results: [memoryFixture], took_ms: 2, next_cursor: null });
+    return json({
+      hits: [{ ...memoryFixture, score: 0.9, signals: {}, matched_on: ['keyword'] }],
+      took_ms: 2,
+      mode: 'hybrid',
+      strategy: 'hybrid',
+    });
   });
   const searchClient = clientFor(searchMock, { maxRetries: 2 });
   const response = await searchClient.memories.search('ws-demo', { query: '评审' });
 
   assert.equal(searchMock.calls.length, 2);
   assert.equal(searchMock.calls[0]?.headers.get('idempotency-key'), null);
-  assert.equal(response.results[0]?.id, 'mem_1');
+  assert.equal(response.hits[0]?.id, 'mem_1');
 });
 
 test('超时：单次尝试超时映射为 code=timeout', async () => {
@@ -871,6 +897,439 @@ test('取消：已 abort 的 signal 不发起请求', async () => {
     },
   );
   assert.equal(mock.calls.length, 0);
+});
+
+/* ------------------------------------------------------------------ */
+/* 8b. v6.1：settings / 写管线 / 检索信号 / 历史反馈                     */
+/* ------------------------------------------------------------------ */
+
+const v61Settings = {
+  default_scope: 'partition',
+  brief_max_chars: 1200,
+  brief_enabled: true,
+  dream_enabled: true,
+  dream_interval_minutes: 1440,
+  retention_days: 0,
+  monthly_quota: 0,
+  person_auto_create: true,
+  locale: 'zh-CN',
+  retrieval_mode: 'hybrid',
+  retrieval_weights: { vector: 0.5, keyword: 0.25, recency: 0.15, importance: 0.1, entity: 0 },
+  embedding_model: 'mnemos-hash-384',
+  merge_threshold: 0.93,
+  dedupe_threshold: 0.97,
+  auto_extract_entities: true,
+  pii_redaction: 'basic',
+};
+
+const memoryV61Fixture = {
+  ...memoryFixture,
+  valid_from: '2026-11-03T10:00:00.000Z',
+  valid_to: null,
+  superseded_by: null,
+  supersedes: null,
+  fact_key: 'preference.tone',
+  feedback_up: 2,
+  feedback_down: 0,
+  attachment_count: 1,
+  attachments: [
+    {
+      id: 'att_1',
+      memory_id: 'mem_1',
+      kind: 'image',
+      url: 'https://example.com/a.png',
+      mime: 'image/png',
+      size: 1024,
+      caption: '白板照片',
+      created_at: '2026-11-03T10:00:00.000Z',
+    },
+  ],
+};
+
+const personFactFixture = {
+  id: 'fact_1',
+  partition_id: 'prt_demo',
+  person_id: 'per_1',
+  key: 'identity.job',
+  value: '产品经理',
+  confidence: 0.9,
+  valid_from: '2026-11-03T10:00:00.000Z',
+  valid_to: null,
+  source_memory_id: 'mem_1',
+  created_at: '2026-11-03T10:00:00.000Z',
+  updated_at: '2026-11-03T10:00:00.000Z',
+};
+
+test('v6.1 settings：新字段归一化（camelCase 兼容）与 PATCH 序列化', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.method === 'PATCH') return json({ ...partitionFixture, settings: v61Settings });
+    return json({ ...partitionFixture, settings: { ...v61Settings, retrievalMode: 'keyword' } });
+  });
+  const client = clientFor(mock);
+
+  const partition = await client.partitions.get('ws-demo');
+  assert.equal(partition.settings.retrieval_mode, 'hybrid');
+  assert.equal(partition.settings.retrieval_weights.vector, 0.5);
+  assert.equal(partition.settings.embedding_model, 'mnemos-hash-384');
+  assert.equal(partition.settings.merge_threshold, 0.93);
+  assert.equal(partition.settings.dedupe_threshold, 0.97);
+  assert.equal(partition.settings.auto_extract_entities, true);
+  assert.equal(partition.settings.pii_redaction, 'basic');
+
+  await client.partitions.update('ws-demo', {
+    settings: {
+      retrievalMode: 'keyword',
+      retrievalWeights: { vector: 0.6, keyword: 0.4 },
+      embeddingModel: 'text-embedding-3-small',
+      mergeThreshold: 0.9,
+      dedupeThreshold: 0.95,
+      autoExtractEntities: false,
+      piiRedaction: 'off',
+    },
+  });
+  assert.deepEqual(mock.calls[1]?.body, {
+    settings: {
+      retrieval_mode: 'keyword',
+      retrieval_weights: { vector: 0.6, keyword: 0.4 },
+      embedding_model: 'text-embedding-3-small',
+      merge_threshold: 0.9,
+      dedupe_threshold: 0.95,
+      auto_extract_entities: false,
+      pii_redaction: 'off',
+    },
+  });
+});
+
+test('v6.1 写记忆：attachments / supersedesId / factKey / validFrom + Idempotency-Key', async () => {
+  const mock = createFetchMock(() =>
+    json(
+      {
+        memory: memoryV61Fixture,
+        event: 'SUPERSEDE',
+        superseded_id: 'mem_old',
+        events: [{ type: 'SUPERSEDE', memory_id: 'mem_1', at: '2026-11-03T10:00:00.000Z' }],
+      },
+      201,
+    ),
+  );
+  const client = clientFor(mock);
+
+  const result = await client.memories.add(
+    'ws-demo',
+    'user-1',
+    {
+      text: '周野偏好简洁的中文评审意见。',
+      scope: 'person',
+      category: 'preference',
+      supersedesId: 'mem_old',
+      factKey: 'preference.tone',
+      validFrom: '2026-11-03T10:00:00.000Z',
+      attachments: [{ kind: 'image', url: 'https://example.com/a.png', caption: '白板照片' }],
+    },
+    { idempotencyKey: 'idem-write-0001' },
+  );
+
+  const call = mock.calls[0] as CapturedCall;
+  assert.equal(call.headers.get('idempotency-key'), 'idem-write-0001');
+  assert.deepEqual(call.body, {
+    text: '周野偏好简洁的中文评审意见。',
+    scope: 'person',
+    category: 'preference',
+    supersedes_id: 'mem_old',
+    fact_key: 'preference.tone',
+    valid_from: '2026-11-03T10:00:00.000Z',
+    attachments: [{ kind: 'image', url: 'https://example.com/a.png', caption: '白板照片' }],
+  });
+  assert.equal(result.event, 'SUPERSEDE');
+  assert.equal(result.superseded_id, 'mem_old');
+  assert.equal(result.memory.valid_to, null);
+  assert.equal(result.memory.fact_key, 'preference.tone');
+  assert.equal(result.memory.feedback_up, 2);
+  assert.equal(result.memory.attachment_count, 1);
+  assert.equal(result.memory.attachments?.[0]?.caption, '白板照片');
+  assert.equal(result.events[0]?.type, 'SUPERSEDE');
+});
+
+test('memories.add：attachments 超过 10 个在客户端拒绝', async () => {
+  const mock = createFetchMock(() => json({ memory: memoryFixture }));
+  const client = clientFor(mock);
+  const attachments = Array.from({ length: 11 }, (_item, index) => ({
+    kind: 'file' as const,
+    url: `https://example.com/${index}.pdf`,
+  }));
+  await assert.rejects(
+    () => client.memories.add('ws-demo', 'user-1', { text: '附件过多', attachments }),
+    /attachments 最多 10 个/,
+  );
+  assert.equal(mock.calls.length, 0);
+});
+
+test('v6.1 memories.search：hits/signals/mode/strategy 与 mode/as_of/include_superseded 请求体', async () => {
+  const mock = createFetchMock(() =>
+    json({
+      hits: [
+        {
+          ...memoryV61Fixture,
+          score: 0.87,
+          signals: { vector: 0.8, keyword: 0.9, recency: 0.5, importance: 0.7, entity: 0 },
+          matched_on: ['keyword', 'vector'],
+        },
+      ],
+      took_ms: 7,
+      mode: 'hybrid',
+      strategy: 'hybrid:weighted',
+      results: [memoryV61Fixture],
+      partition_stats: partitionFixture.stats,
+    }),
+  );
+  const client = clientFor(mock);
+
+  const response = await client.memories.search('ws-demo', {
+    query: '评审偏好',
+    personExternalId: 'user-1',
+    mode: 'hybrid',
+    topK: 5,
+    asOf: '2026-11-01T00:00:00.000Z',
+    includeSuperseded: true,
+  });
+
+  assert.deepEqual(mock.calls[0]?.body, {
+    query: '评审偏好',
+    person_external_id: 'user-1',
+    mode: 'hybrid',
+    top_k: 5,
+    as_of: '2026-11-01T00:00:00.000Z',
+    include_superseded: true,
+  });
+  assert.equal(response.took_ms, 7);
+  assert.equal(response.mode, 'hybrid');
+  assert.equal(response.strategy, 'hybrid:weighted');
+  assert.equal(response.hits[0]?.score, 0.87);
+  assert.equal(response.hits[0]?.signals.keyword, 0.9);
+  assert.deepEqual(response.hits[0]?.matched_on, ['keyword', 'vector']);
+  assert.equal(response.results[0]?.id, 'mem_1');
+  assert.equal(response.partition_stats?.memories_total, 34);
+});
+
+test('v6.1 历史 / 反馈：history 数组与 feedback 归一化', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.path.endsWith('/history')) {
+      return json({
+        items: [
+          {
+            id: 'hist_1',
+            partition_id: 'prt_demo',
+            memory_id: 'mem_1',
+            person_id: 'per_1',
+            event: 'SUPERSEDE',
+            old_content: '旧内容',
+            new_content: '新内容',
+            actor: 'user:usr_1',
+            reason: 'superseded',
+            meta: { supersededBy: 'mem_2' },
+            created_at: '2026-11-03T10:00:00.000Z',
+          },
+        ],
+      });
+    }
+    return json({ memory: { ...memoryV61Fixture, confidence: 0.95, feedback_up: 3 } });
+  });
+  const client = clientFor(mock);
+
+  const history = await client.memories.history('ws-demo', 'mem_1');
+  assert.equal(mock.calls[0]?.path, '/v1/partitions/ws-demo/memories/mem_1/history');
+  assert.equal(history.length, 1);
+  assert.equal(history[0]?.event, 'SUPERSEDE');
+  assert.equal(history[0]?.old_content, '旧内容');
+  assert.equal(history[0]?.actor, 'user:usr_1');
+  assert.deepEqual(history[0]?.meta, { supersededBy: 'mem_2' });
+
+  const feedback = await client.memories.feedback('ws-demo', 'mem_1', {
+    helpful: true,
+    query: '评审偏好',
+    reason: '命中正确',
+  });
+  const feedbackCall = mock.calls[1] as CapturedCall;
+  assert.equal(feedbackCall.method, 'POST');
+  assert.equal(feedbackCall.path, '/v1/partitions/ws-demo/memories/mem_1/feedback');
+  assert.deepEqual(feedbackCall.body, { helpful: true, query: '评审偏好', reason: '命中正确' });
+  assert.equal(feedback.memory.feedback_up, 3);
+  assert.equal(feedback.memory.confidence, 0.95);
+});
+
+/* ------------------------------------------------------------------ */
+/* 8c. v6.1：画像 / facts / 生命周期                                    */
+/* ------------------------------------------------------------------ */
+
+test('persons.profile / listFacts / upsertFact / upsertFacts / removeFact', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.method === 'GET' && call.path.endsWith('/profile')) {
+      return json({
+        person: personFixture,
+        facts: [personFactFixture],
+        summary: '产品经理，关注评审。',
+        generated_at: '2026-11-04T00:00:00.000Z',
+        cached: false,
+      });
+    }
+    if (call.method === 'GET') return json({ items: [personFactFixture] });
+    if (call.method === 'PUT' && call.body && (call.body as { facts?: unknown[] }).facts) {
+      return json({ items: [personFactFixture] });
+    }
+    if (call.method === 'PUT') return json({ fact: personFactFixture });
+    return empty(204);
+  });
+  const client = clientFor(mock);
+
+  const profile = await client.persons.profile('ws-demo', 'user-1', { force: true });
+  assert.equal(mock.calls[0]?.path, '/v1/partitions/ws-demo/persons/user-1/profile');
+  assert.equal(queryOf(mock.calls[0] as CapturedCall).get('force'), 'true');
+  assert.equal(profile.summary, '产品经理，关注评审。');
+  assert.equal(profile.cached, false);
+  assert.equal(profile.facts[0]?.key, 'identity.job');
+
+  const facts = await client.persons.listFacts('ws-demo', 'user-1');
+  assert.equal(facts.length, 1);
+  assert.equal(facts[0]?.valid_to, null);
+
+  const fact = await client.persons.upsertFact('ws-demo', 'user-1', {
+    key: 'identity.job',
+    value: '产品经理',
+    confidence: 0.9,
+    sourceMemoryId: 'mem_1',
+  });
+  assert.deepEqual(mock.calls[2]?.body, {
+    key: 'identity.job',
+    value: '产品经理',
+    confidence: 0.9,
+    source_memory_id: 'mem_1',
+  });
+  assert.equal(fact.id, 'fact_1');
+
+  const items = await client.persons.upsertFacts('ws-demo', 'user-1', [
+    { key: 'identity.job', value: '产品经理' },
+    { key: 'preference.tone', value: '简洁' },
+  ]);
+  assert.equal(items.length, 1);
+  assert.equal((mock.calls[3]?.body as { facts: unknown[] }).facts.length, 2);
+
+  await client.persons.removeFact('ws-demo', 'user-1', 'fact_1');
+  assert.equal(mock.calls[4]?.method, 'DELETE');
+  assert.equal(mock.calls[4]?.path, '/v1/partitions/ws-demo/persons/user-1/facts/fact_1');
+});
+
+test('persons.merge / archive / export / remove(hard) 与 consent / include_merged', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.path.endsWith('/merge')) {
+      return json({
+        person: { ...personFixture, id: 'per_2', external_id: 'user-2' },
+        merged_from: personFixture,
+        moved_memories: 5,
+        moved_facts: 2,
+      });
+    }
+    if (call.path.endsWith('/archive')) {
+      return json({ ...personFixture, status: 'archived' });
+    }
+    if (call.path.endsWith('/export')) {
+      return json({
+        person: personFixture,
+        facts: [personFactFixture],
+        memories: [memoryV61Fixture],
+        exported_at: '2026-11-04T00:00:00.000Z',
+        truncated: false,
+      });
+    }
+    if (call.method === 'DELETE') return empty(204);
+    if (call.method === 'PUT') return json({ ...personFixture, consent: { marketing: true } });
+    if (call.method === 'PATCH') return json({ ...personFixture, consent: { marketing: false } });
+    return json({ items: [], next_cursor: null });
+  });
+  const client = clientFor(mock);
+
+  const merged = await client.persons.merge('ws-demo', 'user-1', { targetExternalId: 'user-2' });
+  assert.equal(mock.calls[0]?.method, 'POST');
+  assert.equal(mock.calls[0]?.path, '/v1/partitions/ws-demo/persons/user-1/merge');
+  assert.deepEqual(mock.calls[0]?.body, { target_external_id: 'user-2' });
+  assert.equal(merged.person.id, 'per_2');
+  assert.equal(merged.merged_from.external_id, 'user-1');
+  assert.equal(merged.moved_memories, 5);
+  assert.equal(merged.moved_facts, 2);
+
+  const archived = await client.persons.archive('ws-demo', 'user-1');
+  assert.equal(archived.status, 'archived');
+
+  const exported = await client.persons.export('ws-demo', 'user-1');
+  assert.equal(mock.calls[2]?.path, '/v1/partitions/ws-demo/persons/user-1/export');
+  assert.equal(exported.facts[0]?.key, 'identity.job');
+  assert.equal(exported.memories[0]?.id, 'mem_1');
+  assert.equal(exported.truncated, false);
+
+  await client.persons.remove('ws-demo', 'user-1');
+  assert.equal(queryOf(mock.calls[3] as CapturedCall).has('hard'), false);
+
+  await client.persons.remove('ws-demo', 'user-1', { hard: true });
+  assert.equal(mock.calls[4]?.method, 'DELETE');
+  assert.equal(queryOf(mock.calls[4] as CapturedCall).get('hard'), 'true');
+
+  const upserted = await client.persons.upsert('ws-demo', 'user-1', { consent: { marketing: true } });
+  assert.deepEqual(mock.calls[5]?.body, { consent: { marketing: true } });
+  assert.deepEqual(upserted.consent, { marketing: true });
+
+  const updated = await client.persons.update('ws-demo', 'user-1', { consent: { marketing: false } });
+  assert.deepEqual(mock.calls[6]?.body, { consent: { marketing: false } });
+  assert.deepEqual(updated.consent, { marketing: false });
+
+  await client.persons.list('ws-demo', { includeMerged: true });
+  assert.equal(queryOf(mock.calls[7] as CapturedCall).get('include_merged'), 'true');
+});
+
+test('persons.remove：空 body 的 DELETE 也返回 void', async () => {
+  const mock = createFetchMock(() => empty(204));
+  const client = clientFor(mock);
+  const result = await client.persons.remove('ws-demo', 'user-1', { hard: true });
+  assert.equal(result, undefined);
+});
+
+/* ------------------------------------------------------------------ */
+/* 8d. v6.1 P2：图谱 / 实体                                             */
+/* ------------------------------------------------------------------ */
+
+test('graph / entities：路径、查询、响应归一化', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.path.endsWith('/graph')) {
+      return json({
+        nodes: [
+          { id: 'ent_1', label: 'Mnemos', type: 'project', weight: 3, memories: 2 },
+          { id: 'ent_2', label: 'SQLite', type: 'tech', weight: 1, memories: 1 },
+        ],
+        edges: [{ id: 'rel_1', source: 'ent_1', target: 'ent_2', relation: 'co_occurs', weight: 1 }],
+        stats: { nodes: 2, edges: 1, top_types: [{ type: 'project', count: 1 }] },
+      });
+    }
+    return json({ items: [{ id: 'ent_1', name: 'Mnemos', type: 'project', mention_count: 3, memories: 2, created_at: '2026-11-01T00:00:00.000Z' }], next_cursor: null });
+  });
+  const client = clientFor(mock);
+
+  const graph = await client.graph('ws-demo', { personId: 'per_1', limit: 50 });
+  assert.equal(mock.calls[0]?.path, '/v1/partitions/ws-demo/graph');
+  const graphQuery = queryOf(mock.calls[0] as CapturedCall);
+  assert.equal(graphQuery.get('person_id'), 'per_1');
+  assert.equal(graphQuery.get('limit'), '50');
+  assert.equal(graph.nodes.length, 2);
+  assert.equal(graph.nodes[0]?.label, 'Mnemos');
+  assert.equal(graph.edges[0]?.relation, 'co_occurs');
+  assert.equal(graph.stats.top_types[0]?.type, 'project');
+
+  const entities = await client.entities('ws-demo', { q: 'Mne', personId: 'per_1', limit: 20 });
+  assert.equal(mock.calls[1]?.path, '/v1/partitions/ws-demo/entities');
+  const entityQuery = queryOf(mock.calls[1] as CapturedCall);
+  assert.equal(entityQuery.get('person_id'), 'per_1');
+  assert.equal(entityQuery.get('q'), 'Mne');
+  assert.equal(entityQuery.get('limit'), '20');
+  assert.equal(entities.items[0]?.name, 'Mnemos');
+  assert.equal(entities.items[0]?.mention_count, 3);
+  assert.equal(entities.next_cursor, null);
 });
 
 /* ------------------------------------------------------------------ */
