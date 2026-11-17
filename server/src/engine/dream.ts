@@ -198,7 +198,7 @@ export async function runDream(
       source: 'dream',
       metadata: { dreamRunId: runId, sourceCount: memories.length },
       actor,
-    });
+    }).memory;
 
     const finishedAt = nowIso();
     markDreamed(

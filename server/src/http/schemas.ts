@@ -48,6 +48,17 @@ export const cursorQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(CURSOR_LIMIT_MAX).default(CURSOR_LIMIT_DEFAULT),
 });
 
+export const retrievalModeSchema = z.enum(['hybrid', 'keyword', 'vector']);
+export const retrievalWeightsSchema = z
+  .object({
+    vector: z.coerce.number().min(0).max(1),
+    keyword: z.coerce.number().min(0).max(1),
+    recency: z.coerce.number().min(0).max(1),
+    importance: z.coerce.number().min(0).max(1),
+    entity: z.coerce.number().min(0).max(1),
+  })
+  .partial();
+
 export const partitionSettingsSchema = z
   .object({
     defaultScope: memoryScopeSchema,
@@ -59,6 +70,13 @@ export const partitionSettingsSchema = z
     monthlyQuota: z.coerce.number().int().min(0).max(1_000_000_000),
     personAutoCreate: z.boolean(),
     locale: z.string().trim().min(2).max(20),
+    /* v6.1 */
+    retrievalMode: retrievalModeSchema,
+    retrievalWeights: retrievalWeightsSchema,
+    embeddingModel: z.string().trim().min(1).max(80),
+    mergeThreshold: z.coerce.number().min(0).max(1),
+    dedupeThreshold: z.coerce.number().min(0).max(1),
+    autoExtractEntities: z.boolean(),
   })
   .partial();
 
@@ -120,6 +138,10 @@ export const memoryAddSchema = z.object({
   tags: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
   metadata: z.record(z.unknown()).optional(),
   expiresAt: z.string().trim().max(40).nullable().optional(),
+  /* v6.1 写管线 */
+  supersedesId: z.string().trim().max(128).optional(),
+  factKey: z.string().trim().max(120).optional(),
+  validFrom: z.string().trim().max(40).optional(),
 }).refine((value) => Boolean(value.text ?? value.content), {
   message: 'text 不能为空',
   path: ['text'],
@@ -137,6 +159,25 @@ export const memoryPatchSchema = z
     expiresAt: z.string().trim().max(40).nullable().optional(),
   })
   .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
+
+export const memorySearchSchema = z.object({
+  query: z.string().trim().min(1).max(2000),
+  personId: z.string().trim().max(128).optional(),
+  personExternalId: z.string().trim().max(128).optional(),
+  scope: memoryScopeSchema.optional(),
+  category: memoryCategorySchema.optional(),
+  mode: retrievalModeSchema.optional(),
+  topK: z.coerce.number().int().min(1).max(50).optional(),
+  asOf: z.string().trim().max(40).optional(),
+  includeSuperseded: z.boolean().optional(),
+  includePrivate: z.boolean().optional(),
+});
+
+export const memoryFeedbackSchema = z.object({
+  helpful: z.boolean(),
+  query: z.string().trim().max(2000).optional(),
+  reason: z.string().trim().max(500).optional(),
+});
 
 export const memoryListQuerySchema = cursorQuerySchema.extend({
   personId: z.string().trim().max(128).optional(),

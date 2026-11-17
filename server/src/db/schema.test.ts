@@ -16,7 +16,7 @@ function tableNames(db: DatabaseSync): Set<string> {
   return new Set(rows.map((row) => row.name));
 }
 
-test('schema v6：核心表存在、旧领域表不建、schema_version=6', () => {
+test('schema v7：核心表 + v6.1 新表存在、旧领域表不建、schema_version=7', () => {
   const db = fresh();
   const tables = tableNames(db);
 
@@ -37,6 +37,17 @@ test('schema v6：核心表存在、旧领域表不建、schema_version=6', () =
     'maintenance_runs',
     'persons_fts',
     'memories_fts',
+    /* v6.1 P0/P1/P2 */
+    'memory_history',
+    'memory_feedback',
+    'memory_jobs',
+    'person_facts',
+    'person_profiles',
+    'memory_attachments',
+    'idempotency_keys',
+    'entities',
+    'memory_entities',
+    'relations',
   ]) {
     assert.ok(tables.has(table), `缺少表 ${table}`);
   }
@@ -46,19 +57,14 @@ test('schema v6：核心表存在、旧领域表不建、schema_version=6', () =
     'project_members',
     'agents',
     'tasks',
-    'entities',
-    'relations',
-    'memory_entities',
     'memory_terms',
     'webhooks',
     'webhook_deliveries',
-    'memory_history',
-    'idempotency_keys',
   ]) {
     assert.ok(!tables.has(oldTable), `v6 不应存在旧表 ${oldTable}`);
   }
 
-  assert.equal(getSchemaVersion(db), 6);
+  assert.equal(getSchemaVersion(db), 7);
   db.close();
 });
 

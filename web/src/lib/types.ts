@@ -85,6 +85,19 @@ export interface PartitionStats {
   updatedAt?: string;
 }
 
+export type MemorySearchMode = 'hybrid' | 'keyword' | 'vector';
+
+/** 融合检索的 5 个信号。 */
+export interface RetrievalWeights {
+  vector: number;
+  keyword: number;
+  recency: number;
+  importance: number;
+  entity: number;
+}
+
+export type RetrievalSignal = keyof RetrievalWeights;
+
 export interface PartitionSettings {
   defaultScope?: MemoryScope;
   personAutoCreate?: boolean;
@@ -93,6 +106,19 @@ export interface PartitionSettings {
   dreamEnabled?: boolean;
   dreamIntervalMinutes?: number;
   monthlyQuota?: number;
+  /* --- v6.1 检索与写管线 --- */
+  /** 检索模式：混合 / 仅关键词 / 仅向量 */
+  retrievalMode?: MemorySearchMode;
+  /** 融合权重；缺省按服务端默认值（0.45/0.3/0.15/0.1/0） */
+  retrievalWeights?: Partial<RetrievalWeights>;
+  /** 本地 embedding 模型或外部模型名 */
+  embeddingModel?: string;
+  /** 相似度 >= 该值视为重复，走合并/去重 */
+  mergeThreshold?: number;
+  /** 高相似度去重阈值（>= 视为完全重复） */
+  dedupeThreshold?: number;
+  /** 写入后异步抽取实体 */
+  autoExtractEntities?: boolean;
   [key: string]: unknown;
 }
 
@@ -198,6 +224,77 @@ export interface Memory {
   updatedAt: string;
   expiresAt?: string;
   dreamedAt?: string;
+  /* --- v6.1 时序与演化 --- */
+  /** 事实生效时间（缺省 = createdAt） */
+  validFrom?: string;
+  /** 失效时间；为空表示当前有效 */
+  validTo?: string;
+  /** 被哪条记忆取代 */
+  supersededBy?: string;
+  /** 取代了哪条记忆 */
+  supersedes?: string;
+  /** 槽位键（如 preference.language） */
+  factKey?: string;
+  feedbackUp?: number;
+  feedbackDown?: number;
+  attachmentCount?: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1：检索 / 历史 / 反馈                                            */
+/* ------------------------------------------------------------------ */
+
+export interface MemorySearchSignals {
+  vector: number;
+  keyword: number;
+  recency: number;
+  importance: number;
+  entity: number;
+}
+
+/** 检索命中：综合得分 + 信号分解 + 命中来源（vector/keyword/recency…）。 */
+export interface MemorySearchHit extends Memory {
+  score: number;
+  signals: MemorySearchSignals;
+  matchedOn: string[];
+}
+
+export interface MemorySearchResponse {
+  hits: MemorySearchHit[];
+  tookMs: number;
+  mode: MemorySearchMode;
+  strategy: string;
+}
+
+export type MemoryHistoryEvent =
+  | 'ADD'
+  | 'UPDATE'
+  | 'MERGE'
+  | 'SUPERSEDE'
+  | 'DELETE'
+  | 'NOOP'
+  | 'FEEDBACK'
+  | 'RESTORE';
+
+/** 单条记忆的变更历史（控制台抽屉时间线）。 */
+export interface MemoryHistoryEntry {
+  id: string;
+  partitionId?: string;
+  memoryId: string;
+  personId?: string;
+  event: MemoryHistoryEvent;
+  oldContent?: string;
+  newContent?: string;
+  actor?: string;
+  reason?: string;
+  meta: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface MemoryFeedbackInput {
+  helpful: boolean;
+  query?: string;
+  reason?: string;
 }
 
 /* ------------------------------------------------------------------ */

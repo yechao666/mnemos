@@ -158,6 +158,27 @@ export interface PartitionSettings {
   /** 写入未知人时是否自动建档 */
   personAutoCreate: boolean;
   locale: string;
+  /* --- v6.1 检索与写管线 --- */
+  /** 检索模式：混合 / 仅关键词 / 仅向量 */
+  retrievalMode: 'hybrid' | 'keyword' | 'vector';
+  /** 融合权重；未列出的信号按 0 处理 */
+  retrievalWeights: RetrievalWeights;
+  /** 本地 embedding 模型或外部模型名 */
+  embeddingModel: string;
+  /** 完全重复判定（内容哈希）后仍合并的相似度阈值 */
+  mergeThreshold: number;
+  /** 高相似度去重阈值（>= 视为重复，不再新增） */
+  dedupeThreshold: number;
+  /** 写入后异步抽取实体 */
+  autoExtractEntities: boolean;
+}
+
+export interface RetrievalWeights {
+  vector: number;
+  keyword: number;
+  recency: number;
+  importance: number;
+  entity: number;
 }
 
 /** 分区：App / 项目 / 租户。取代 v5 的 projects，表名 partitions。 */
@@ -283,11 +304,117 @@ export interface Memory {
   updatedAt: string;
   expiresAt?: string;
   dreamedAt?: string;
+  /** v6.1 时序与演化 */
+  validFrom?: string;
+  validTo?: string;
+  supersededBy?: string;
+  supersedes?: string;
+  factKey?: string;
+  feedbackUp?: number;
+  feedbackDown?: number;
+  attachmentCount?: number;
 }
 
 export interface MemoryDetail {
   memory: Memory;
   person: Person | null;
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.1：检索 / 历史 / 反馈 / 异步任务                                  */
+/* ------------------------------------------------------------------ */
+
+export type MemorySearchMode = 'hybrid' | 'keyword' | 'vector';
+
+export interface MemorySearchInput {
+  partitionId: string;
+  query: string;
+  personId?: string;
+  personExternalId?: string;
+  scope?: MemoryScope;
+  category?: MemoryCategory;
+  /** 默认 hybrid */
+  mode?: MemorySearchMode;
+  topK?: number;
+  /** 回看某个时间点有效的事实（ISO） */
+  asOf?: string;
+  includeSuperseded?: boolean;
+  /** 人级视角（仅本人 + 分区共享）；控制台/审计可设 true 看全部 */
+  includePrivate?: boolean;
+}
+
+export interface MemorySearchSignals {
+  vector: number;
+  keyword: number;
+  recency: number;
+  importance: number;
+  entity: number;
+}
+
+export interface MemorySearchHit extends Memory {
+  score: number;
+  signals: MemorySearchSignals;
+  matchedOn: string[];
+}
+
+export interface MemorySearchResponse {
+  hits: MemorySearchHit[];
+  tookMs: number;
+  mode: MemorySearchMode;
+  strategy: string;
+}
+
+export type MemoryHistoryEvent =
+  | 'ADD'
+  | 'UPDATE'
+  | 'MERGE'
+  | 'SUPERSEDE'
+  | 'DELETE'
+  | 'NOOP'
+  | 'FEEDBACK'
+  | 'RESTORE';
+
+export interface MemoryHistoryEntry {
+  id: string;
+  partitionId: string;
+  memoryId: string;
+  personId?: string;
+  event: MemoryHistoryEvent;
+  oldContent?: string;
+  newContent?: string;
+  actor?: string;
+  reason?: string;
+  meta: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface MemoryFeedbackInput {
+  helpful: boolean;
+  query?: string;
+  reason?: string;
+}
+
+export type MemoryJobType = 'embed' | 'consolidate' | 'extract' | 'profile' | 'summarize';
+export type MemoryJobStatus = 'pending' | 'running' | 'done' | 'failed';
+
+export interface MemoryJob {
+  id: string;
+  partitionId: string;
+  type: MemoryJobType;
+  status: MemoryJobStatus;
+  payload: Record<string, unknown>;
+  attempts: number;
+  runAfter: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 写入返回：新增时 memory；重复/合并时 memory=已有或合并后的记忆，event 说明行为。 */
+export interface MemoryAddResult {
+  memory: Memory;
+  event: 'ADD' | 'MERGE' | 'NOOP' | 'SUPERSEDE';
+  supersededId?: string;
 }
 
 /** 写入记忆：person 必填（内部 id 或 external id + type）。 */
@@ -310,6 +437,12 @@ export interface AddMemoryInput {
   tags?: string[];
   metadata?: Record<string, unknown>;
   expiresAt?: string | null;
+  /** v6.1：显式取代某条记忆（同分区同人），旧记忆会被置为失效 */
+  supersedesId?: string;
+  /** v6.1：槽位键（如 preference.language）；同键旧记忆自动被取代 */
+  factKey?: string;
+  /** v6.1：事实生效时间（默认 now） */
+  validFrom?: string;
   actor: Actor;
 }
 
@@ -656,10 +789,16 @@ export interface MemoryService {
 
   /* --- 记忆 --- */
   addMemory(input: AddMemoryInput): Memory;
+  /** v6.1：带写管线事件（ADD/MERGE/NOOP/SUPERSEDE）的写入结果。 */
+  addMemoryResult(input: AddMemoryInput): MemoryAddResult;
   listMemories(query: MemoryListQuery): CursorPage<Memory>;
   getMemory(partitionId: string, id: string): MemoryDetail | null;
   updateMemory(partitionId: string, id: string, input: UpdateMemoryInput, actor: Actor): Memory;
   removeMemory(partitionId: string, id: string, actor: Actor): void;
+  /* --- v6.1：检索 / 历史 / 反馈 --- */
+  searchMemories(input: MemorySearchInput): MemorySearchResponse;
+  memoryHistory(partitionId: string, id: string): MemoryHistoryEntry[];
+  feedback(partitionId: string, id: string, input: MemoryFeedbackInput, actor: Actor): Memory;
 
   /* --- 简报 / 上下文 / 做梦 --- */
   brief(input: BriefInput): Promise<MemoryBrief>;

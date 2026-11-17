@@ -4,8 +4,11 @@ import type {
   Actor,
   CursorPage,
   Memory,
+  MemoryAddResult,
   MemoryCategory,
   MemoryDetail,
+  MemoryFeedbackInput,
+  MemoryHistoryEntry,
   MemoryListQuery,
   MemoryScope,
   MemorySource,
@@ -13,9 +16,14 @@ import type {
   PersonType,
   UpdateMemoryInput,
 } from '../../../shared/src/types.ts';
+import { tx } from '../db/index.ts';
 import { newId, nowIso } from '../lib/ids.ts';
+import { memoryContentHash } from '../lib/text.ts';
 import { decodeCursor, encodeCursor, normalizeLimit } from './cursor.ts';
+import { blobToEmbedding, cosine, embedText, EMBEDDING_DIM, EMBEDDING_MODEL, embeddingToBlob } from './embed.ts';
 import { engineErrors } from './errors.ts';
+import { listMemoryHistory, writeHistory } from './history.ts';
+import { enqueueMemoryJobs } from './jobs.ts';
 import { findPartitionById, loadStatsRow } from './partition.ts';
 import { findPersonRow, resolvePerson, upsertPerson } from './persons.ts';
 import {
@@ -140,7 +148,86 @@ function ensureSession(
   ).run(sessionId, partitionId, personId, title.slice(0, 200), at);
 }
 
-export function addMemory(db: DatabaseSync, input: AddMemoryInput): Memory {
+function normalizeIso(value: string | null | undefined): string | null {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) throw engineErrors.validation('时间必须是合法的 ISO 8601 字符串');
+  return new Date(parsed).toISOString();
+}
+
+function factKeyOf(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const key = value.trim();
+  return key ? key.slice(0, 120) : null;
+}
+
+function fetchMemoryRow(db: DatabaseSync, partitionId: string, id: string): MemoryRow | undefined {
+  return db
+    .prepare(
+      `SELECT m.*, p.external_id AS person_external_id
+         FROM memories m JOIN persons p ON p.id = m.person_id
+        WHERE m.partition_id = ? AND m.id = ?`,
+    )
+    .get(partitionId, id) as unknown as MemoryRow | undefined;
+}
+
+function memoryOf(db: DatabaseSync, partitionId: string, id: string): Memory {
+  const row = fetchMemoryRow(db, partitionId, id);
+  if (!row) throw engineErrors.notFound('记忆不存在');
+  return toMemory(row);
+}
+
+interface NearDuplicate {
+  row: MemoryRow;
+  similarity: number;
+}
+
+/** 同人同分区最近 200 条有效记忆中找余弦最高者（用于 NOOP / MERGE）。 */
+function findNearDuplicate(
+  db: DatabaseSync,
+  partitionId: string,
+  personId: string,
+  vector: Float32Array,
+): NearDuplicate | null {
+  const rows = db
+    .prepare(
+      `SELECT * FROM memories
+        WHERE partition_id = ? AND person_id = ? AND status = 'active'
+          AND valid_to IS NULL AND embedding IS NOT NULL
+        ORDER BY created_at DESC LIMIT 200`,
+    )
+    .all(partitionId, personId) as unknown as MemoryRow[];
+  let best: NearDuplicate | null = null;
+  for (const row of rows) {
+    const similarity = cosine(vector, blobToEmbedding(row.embedding));
+    if (!best || similarity > best.similarity) best = { row, similarity };
+  }
+  return best && best.similarity >= 0 ? best : null;
+}
+
+function unionTags(raw: string, tags: string[] | undefined): string {
+  const existing = (() => {
+    try {
+      const value = JSON.parse(raw) as unknown;
+      return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+    } catch {
+      return [];
+    }
+  })();
+  return JSON.stringify([...new Set([...existing, ...(tags ?? [])])]);
+}
+
+/**
+ * 写管线（v6.1 P0）：
+ *   归一化 hash 完全重复 → NOOP（返回已有 + history NOOP）
+ *   余弦 ≥ dedupeThreshold → NOOP（近重复）
+ *   余弦 ≥ mergeThreshold  → MERGE（更新内容/重要度/标签/metadata + history MERGE）
+ *   显式 supersedesId 或相同 factKey → 旧记忆 valid_to=now / superseded_by=新 id，新记忆 supersedes=旧 id
+ * 所有分支都在同一事务内写 memory_history 与入队异步任务。
+ */
+export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddResult {
   const partition = findPartitionById(db, input.partitionId);
   if (!partition) throw engineErrors.notFound('分区不存在');
   if (partition.status === 'archived') throw engineErrors.archivedPartition();
@@ -159,10 +246,8 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): Memory {
       throw engineErrors.validation('scope=session 时必须提供 session_id');
     }
     sessionId = input.sessionId.trim().slice(0, 128);
-    ensureSession(db, input.partitionId, person.id, sessionId, input.sessionTitle ?? '');
   } else if (input.sessionId) {
     sessionId = input.sessionId.trim().slice(0, 128);
-    ensureSession(db, input.partitionId, person.id, sessionId, input.sessionTitle ?? '');
   }
 
   let actorPersonId = person.id;
@@ -171,34 +256,229 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): Memory {
     actorPersonId = actorRow ? actorRow.id : person.id;
   }
 
-  const at = nowIso();
-  const id = newId('mem');
+  const now = nowIso();
+  const explicitValidFrom = normalizeIso(input.validFrom);
+  const validFrom = explicitValidFrom ?? now;
+  const normalizedHash = memoryContentHash(content);
+  const vector = embedText(content);
+  const factKey = factKeyOf(input.factKey);
+  const category = categoryOf(input.category);
+  const importance = clamp01(input.importance, 0.5);
+  const confidence = clamp01(input.confidence, 0.8);
+  const source = sourceOf(input.source);
+  const tags = JSON.stringify(input.tags ?? []);
+  const metadata = JSON.stringify(input.metadata ?? {});
   const expiresAt = input.expiresAt === null ? null : input.expiresAt ?? null;
-  db.prepare(
-    `INSERT INTO memories
-       (id, partition_id, person_id, actor_person_id, scope, session_id, category, content,
-        importance, confidence, source, status, tags, metadata, created_at, updated_at, expires_at, dreamed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL)`,
-  ).run(
-    id,
-    input.partitionId,
-    person.id,
-    actorPersonId,
-    scope,
-    sessionId,
-    categoryOf(input.category),
-    content,
-    clamp01(input.importance, 0.5),
-    clamp01(input.confidence, 0.8),
-    sourceOf(input.source),
-    JSON.stringify(input.tags ?? []),
-    JSON.stringify(input.metadata ?? {}),
-    at,
-    at,
-    expiresAt,
-  );
-  const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as unknown as MemoryRow;
-  return toMemory({ ...row, person_external_id: person.external_id });
+  const supersedesId = input.supersedesId?.trim() || null;
+
+  if (sessionId) ensureSession(db, input.partitionId, person.id, sessionId, input.sessionTitle ?? '');
+
+  return tx(db, (): MemoryAddResult => {
+    /* 1) 完全重复：内容 hash 相同 */
+    const duplicate = db
+      .prepare(
+        `SELECT * FROM memories
+          WHERE partition_id = ? AND person_id = ? AND normalized_hash = ? AND status = 'active'
+            AND valid_to IS NULL
+          ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(input.partitionId, person.id, normalizedHash) as unknown as MemoryRow | undefined;
+    if (duplicate) {
+      writeHistory(db, {
+        partitionId: input.partitionId,
+        personId: person.id,
+        memoryId: duplicate.id,
+        event: 'NOOP',
+        oldContent: duplicate.content,
+        newContent: content,
+        actor: input.actor,
+        reason: 'duplicate:hash',
+        meta: { normalizedHash, similarity: 1 },
+      });
+      return { memory: memoryOf(db, input.partitionId, duplicate.id), event: 'NOOP' };
+    }
+
+    /* 2) 近重复 / 合并：同人同分区余弦（显式取代 / factKey 优先，不做自动合并） */
+    const near = supersedesId || factKey ? null : findNearDuplicate(db, input.partitionId, person.id, vector);
+    if (near && near.similarity >= settings.dedupeThreshold) {
+      writeHistory(db, {
+        partitionId: input.partitionId,
+        personId: person.id,
+        memoryId: near.row.id,
+        event: 'NOOP',
+        oldContent: near.row.content,
+        newContent: content,
+        actor: input.actor,
+        reason: 'duplicate:similarity',
+        meta: { similarity: Number(near.similarity.toFixed(6)), threshold: settings.dedupeThreshold },
+      });
+      return { memory: memoryOf(db, input.partitionId, near.row.id), event: 'NOOP' };
+    }
+    if (near && near.similarity >= settings.mergeThreshold) {
+      const mergedTags = unionTags(near.row.tags, input.tags);
+      const mergedMetadata = JSON.stringify({
+        ...(() => {
+          try {
+            return JSON.parse(near.row.metadata) as Record<string, unknown>;
+          } catch {
+            return {};
+          }
+        })(),
+        ...(input.metadata ?? {}),
+      });
+      const mergedImportance = Math.max(near.row.importance, importance);
+      const mergedConfidence = Math.max(near.row.confidence, confidence);
+      db.prepare(
+        `UPDATE memories
+            SET content = ?, normalized_hash = ?, embedding = ?, embedding_model = ?, dim = ?,
+                importance = ?, confidence = ?, tags = ?, metadata = ?, category = ?, updated_at = ?
+          WHERE id = ?`,
+      ).run(
+        content,
+        normalizedHash,
+        embeddingToBlob(vector),
+        EMBEDDING_MODEL,
+        EMBEDDING_DIM,
+        mergedImportance,
+        mergedConfidence,
+        mergedTags,
+        mergedMetadata,
+        category,
+        now,
+        near.row.id,
+      );
+      writeHistory(db, {
+        partitionId: input.partitionId,
+        personId: person.id,
+        memoryId: near.row.id,
+        event: 'MERGE',
+        oldContent: near.row.content,
+        newContent: content,
+        actor: input.actor,
+        reason: 'merge:similarity',
+        meta: { similarity: Number(near.similarity.toFixed(6)), threshold: settings.mergeThreshold },
+      });
+      enqueueMemoryJobs(db, {
+        partitionId: input.partitionId,
+        personId: person.id,
+        memoryId: near.row.id,
+        hasEmbedding: true,
+        autoExtractEntities: settings.autoExtractEntities,
+        factKey,
+      });
+      return { memory: memoryOf(db, input.partitionId, near.row.id), event: 'MERGE' };
+    }
+
+    /* 3) 取代：显式 supersedesId 或同 factKey 的旧记忆 */
+    const supersedeIds: string[] = [];
+    const oldRows: MemoryRow[] = [];
+    const pushSupersede = (row: MemoryRow | undefined): void => {
+      if (!row) return;
+      if (supersedeIds.includes(row.id)) return;
+      supersedeIds.push(row.id);
+      oldRows.push(row);
+    };
+    if (supersedesId) {
+      const old = db
+        .prepare('SELECT * FROM memories WHERE partition_id = ? AND person_id = ? AND id = ?')
+        .get(input.partitionId, person.id, supersedesId) as unknown as MemoryRow | undefined;
+      if (!old) throw engineErrors.notFound('被取代的记忆不存在');
+      if (old.valid_to) throw engineErrors.conflict('被取代的记忆已失效');
+      pushSupersede(old);
+    }
+    if (factKey) {
+      const sameFact = db
+        .prepare(
+          `SELECT * FROM memories
+            WHERE partition_id = ? AND person_id = ? AND fact_key = ? AND status = 'active'
+              AND valid_to IS NULL
+            ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(input.partitionId, person.id, factKey) as unknown as MemoryRow | undefined;
+      if (sameFact && !supersedeIds.includes(sameFact.id)) pushSupersede(sameFact);
+    }
+
+    /* 4) 写入新记忆 */
+    const id = newId('mem');
+    db.prepare(
+      `INSERT INTO memories
+         (id, partition_id, person_id, actor_person_id, scope, session_id, category, content,
+          importance, confidence, source, status, tags, metadata, created_at, updated_at, expires_at, dreamed_at,
+          normalized_hash, embedding, embedding_model, dim, valid_from, valid_to, superseded_by, supersedes,
+          fact_key, feedback_up, feedback_down)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL,
+               ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 0, 0)`,
+    ).run(
+      id,
+      input.partitionId,
+      person.id,
+      actorPersonId,
+      scope,
+      sessionId,
+      category,
+      content,
+      importance,
+      confidence,
+      source,
+      tags,
+      metadata,
+      now,
+      now,
+      expiresAt,
+      normalizedHash,
+      embeddingToBlob(vector),
+      EMBEDDING_MODEL,
+      EMBEDDING_DIM,
+      validFrom,
+      oldRows[0]?.id ?? null,
+      factKey,
+    );
+
+    for (const old of oldRows) {
+      db.prepare(
+        'UPDATE memories SET valid_to = ?, superseded_by = ?, updated_at = ? WHERE id = ? AND valid_to IS NULL',
+      ).run(now, id, now, old.id);
+      writeHistory(db, {
+        partitionId: input.partitionId,
+        personId: person.id,
+        memoryId: old.id,
+        event: 'SUPERSEDE',
+        oldContent: old.content,
+        newContent: content,
+        actor: input.actor,
+        reason: 'superseded',
+        meta: { supersededBy: id, factKey: factKey ?? undefined },
+        createdAt: now,
+      });
+    }
+
+    writeHistory(db, {
+      partitionId: input.partitionId,
+      personId: person.id,
+      memoryId: id,
+      event: 'ADD',
+      newContent: content,
+      actor: input.actor,
+      reason: 'add',
+      meta: { scope, category, factKey: factKey ?? undefined, supersedes: oldRows[0]?.id ?? undefined },
+      createdAt: now,
+    });
+
+    enqueueMemoryJobs(db, {
+      partitionId: input.partitionId,
+      personId: person.id,
+      memoryId: id,
+      hasEmbedding: true,
+      autoExtractEntities: settings.autoExtractEntities,
+      factKey,
+    });
+
+    return {
+      memory: memoryOf(db, input.partitionId, id),
+      event: oldRows.length > 0 ? 'SUPERSEDE' : 'ADD',
+      supersededId: oldRows[0]?.id,
+    };
+  });
 }
 
 function memoryFromJoinedRow(row: MemoryRow): Memory {
@@ -308,74 +588,176 @@ export function updateMemory(
   partitionId: string,
   id: string,
   input: UpdateMemoryInput,
-  _actor: Actor,
+  actor: Actor,
 ): Memory {
-  const existing = db
-    .prepare('SELECT * FROM memories WHERE partition_id = ? AND id = ?')
-    .get(partitionId, id) as unknown as MemoryRow | undefined;
-  if (!existing) throw engineErrors.notFound('记忆不存在');
+  return tx(db, () => {
+    const existing = db
+      .prepare('SELECT * FROM memories WHERE partition_id = ? AND id = ?')
+      .get(partitionId, id) as unknown as MemoryRow | undefined;
+    if (!existing) throw engineErrors.notFound('记忆不存在');
 
-  const sets: string[] = [];
-  const params: (string | number | null)[] = [];
-  if (input.content !== undefined) {
-    const content = input.content.trim();
-    if (!content) throw engineErrors.validation('content 不能为空');
-    if (content.length > MAX_CONTENT_CHARS) throw engineErrors.validation('content 最长 20000 字符');
-    sets.push('content = ?');
-    params.push(content);
-  }
-  if (input.category !== undefined) {
-    if (!(MEMORY_CATEGORIES as string[]).includes(input.category)) throw engineErrors.validation('category 不合法');
-    sets.push('category = ?');
-    params.push(input.category);
-  }
-  if (input.importance !== undefined) {
-    sets.push('importance = ?');
-    params.push(clamp01(input.importance, existing.importance));
-  }
-  if (input.confidence !== undefined) {
-    sets.push('confidence = ?');
-    params.push(clamp01(input.confidence, existing.confidence));
-  }
-  if (input.status !== undefined) {
-    if (!(MEMORY_STATUSES as string[]).includes(input.status)) throw engineErrors.validation('status 不合法');
-    sets.push('status = ?');
-    params.push(input.status);
-  }
-  if (input.tags !== undefined) {
-    sets.push('tags = ?');
-    params.push(JSON.stringify(input.tags));
-  }
-  if (input.metadata !== undefined) {
-    sets.push('metadata = ?');
-    params.push(JSON.stringify(input.metadata));
-  }
-  if (input.expiresAt !== undefined) {
-    sets.push('expires_at = ?');
-    params.push(input.expiresAt);
-  }
-  if (sets.length === 0) throw engineErrors.validation('至少提供一个待更新字段');
+    const sets: string[] = [];
+    const params: (string | number | null | Uint8Array)[] = [];
+    let nextContent = existing.content;
+    if (input.content !== undefined) {
+      const content = input.content.trim();
+      if (!content) throw engineErrors.validation('content 不能为空');
+      if (content.length > MAX_CONTENT_CHARS) throw engineErrors.validation('content 最长 20000 字符');
+      nextContent = content;
+      sets.push('content = ?', 'normalized_hash = ?', 'embedding = ?', 'embedding_model = ?', 'dim = ?');
+      params.push(
+        content,
+        memoryContentHash(content),
+        embeddingToBlob(embedText(content)),
+        EMBEDDING_MODEL,
+        EMBEDDING_DIM,
+      );
+    }
+    if (input.category !== undefined) {
+      if (!(MEMORY_CATEGORIES as string[]).includes(input.category)) throw engineErrors.validation('category 不合法');
+      sets.push('category = ?');
+      params.push(input.category);
+    }
+    if (input.importance !== undefined) {
+      sets.push('importance = ?');
+      params.push(clamp01(input.importance, existing.importance));
+    }
+    if (input.confidence !== undefined) {
+      sets.push('confidence = ?');
+      params.push(clamp01(input.confidence, existing.confidence));
+    }
+    if (input.status !== undefined) {
+      if (!(MEMORY_STATUSES as string[]).includes(input.status)) throw engineErrors.validation('status 不合法');
+      sets.push('status = ?');
+      params.push(input.status);
+    }
+    if (input.tags !== undefined) {
+      sets.push('tags = ?');
+      params.push(JSON.stringify(input.tags));
+    }
+    if (input.metadata !== undefined) {
+      sets.push('metadata = ?');
+      params.push(JSON.stringify(input.metadata));
+    }
+    if (input.expiresAt !== undefined) {
+      sets.push('expires_at = ?');
+      params.push(input.expiresAt);
+    }
+    if (sets.length === 0) throw engineErrors.validation('至少提供一个待更新字段');
 
-  sets.push('updated_at = ?');
-  params.push(nowIso());
-  db.prepare(`UPDATE memories SET ${sets.join(', ')} WHERE partition_id = ? AND id = ?`).run(...params, partitionId, id);
+    const at = nowIso();
+    sets.push('updated_at = ?');
+    params.push(at);
+    db.prepare(`UPDATE memories SET ${sets.join(', ')} WHERE partition_id = ? AND id = ?`).run(...params, partitionId, id);
 
-  const row = db
-    .prepare(
-      `SELECT m.*, p.external_id AS person_external_id
-         FROM memories m JOIN persons p ON p.id = m.person_id
-        WHERE m.partition_id = ? AND m.id = ?`,
-    )
-    .get(partitionId, id) as unknown as MemoryRow;
-  return toMemory(row);
+    writeHistory(db, {
+      partitionId,
+      personId: existing.person_id,
+      memoryId: id,
+      event: 'UPDATE',
+      oldContent: existing.content,
+      newContent: nextContent,
+      actor,
+      reason: 'update',
+      meta: {
+        fields: Object.keys(input).filter((key) => (input as Record<string, unknown>)[key] !== undefined),
+        before: { importance: existing.importance, confidence: existing.confidence, status: existing.status },
+        after: {
+          importance: input.importance ?? existing.importance,
+          confidence: input.confidence ?? existing.confidence,
+          status: input.status ?? existing.status,
+        },
+        normalizedHash: nextContent === existing.content ? undefined : memoryContentHash(nextContent),
+      },
+      createdAt: at,
+    });
+
+    return memoryOf(db, partitionId, id);
+  });
 }
 
-export function removeMemory(db: DatabaseSync, partitionId: string, id: string): void {
+export function removeMemory(db: DatabaseSync, partitionId: string, id: string, actor?: Actor): void {
+  tx(db, () => {
+    const existing = db
+      .prepare('SELECT * FROM memories WHERE partition_id = ? AND id = ?')
+      .get(partitionId, id) as unknown as MemoryRow | undefined;
+    if (!existing) throw engineErrors.notFound('记忆不存在');
+    writeHistory(db, {
+      partitionId,
+      personId: existing.person_id,
+      memoryId: id,
+      event: 'DELETE',
+      oldContent: existing.content,
+      actor: actor ?? null,
+      reason: 'delete',
+      meta: { personId: existing.person_id, scope: existing.scope },
+    });
+    db.prepare('DELETE FROM memories WHERE partition_id = ? AND id = ?').run(partitionId, id);
+  });
+}
+
+/** 检索反馈：helpful 计数 + confidence ±0.05（夹在 0.05–1），写 FEEDBACK history。 */
+export function feedbackMemory(
+  db: DatabaseSync,
+  partitionId: string,
+  id: string,
+  input: MemoryFeedbackInput,
+  actor: Actor,
+): Memory {
+  return tx(db, () => {
+    const existing = db
+      .prepare('SELECT * FROM memories WHERE partition_id = ? AND id = ?')
+      .get(partitionId, id) as unknown as MemoryRow | undefined;
+    if (!existing) throw engineErrors.notFound('记忆不存在');
+    const helpful = input.helpful === true;
+    const before = existing.confidence;
+    const after = Math.round(Math.min(1, Math.max(0.05, before + (helpful ? 0.05 : -0.05))) * 10_000) / 10_000;
+    const at = nowIso();
+    db.prepare(
+      `INSERT INTO memory_feedback (id, partition_id, memory_id, person_id, helpful, query, actor, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      newId('fb'),
+      partitionId,
+      id,
+      existing.person_id,
+      helpful ? 1 : 0,
+      input.query ? input.query.slice(0, 2000) : null,
+      actor.label || `${actor.type}:${actor.id}`,
+      at,
+    );
+    if (helpful) {
+      db.prepare('UPDATE memories SET feedback_up = feedback_up + 1, confidence = ? WHERE id = ?').run(after, id);
+    } else {
+      db.prepare('UPDATE memories SET feedback_down = feedback_down + 1, confidence = ? WHERE id = ?').run(after, id);
+    }
+    writeHistory(db, {
+      partitionId,
+      personId: existing.person_id,
+      memoryId: id,
+      event: 'FEEDBACK',
+      oldContent: existing.content,
+      newContent: existing.content,
+      actor,
+      reason: input.reason ?? (helpful ? 'helpful' : 'not-helpful'),
+      meta: {
+        helpful,
+        query: input.query ?? undefined,
+        confidenceBefore: Number(before.toFixed(4)),
+        confidenceAfter: Number(after.toFixed(4)),
+      },
+      createdAt: at,
+    });
+    return memoryOf(db, partitionId, id);
+  });
+}
+
+export function memoryHistory(db: DatabaseSync, partitionId: string, id: string): MemoryHistoryEntry[] {
   const existing = db
     .prepare('SELECT id FROM memories WHERE partition_id = ? AND id = ?')
     .get(partitionId, id) as unknown as { id: string } | undefined;
   if (!existing) throw engineErrors.notFound('记忆不存在');
-  db.prepare('DELETE FROM memories WHERE partition_id = ? AND id = ?').run(partitionId, id);
+  return listMemoryHistory(db, partitionId, id);
 }
 
 /* ------------------------------------------------------------------ */
@@ -394,7 +776,7 @@ export function briefSourceMemories(
         .prepare(
           `SELECT m.*, p.external_id AS person_external_id
              FROM memories m JOIN persons p ON p.id = m.person_id
-            WHERE m.partition_id = ? AND m.status = 'active'
+            WHERE m.partition_id = ? AND m.status = 'active' AND m.valid_to IS NULL
               AND (m.person_id = ? OR m.scope = 'partition')
             ORDER BY m.importance DESC, m.created_at DESC, m.id DESC
             LIMIT ?`,
@@ -404,7 +786,7 @@ export function briefSourceMemories(
         .prepare(
           `SELECT m.*, p.external_id AS person_external_id
              FROM memories m JOIN persons p ON p.id = m.person_id
-            WHERE m.partition_id = ? AND m.status = 'active' AND m.scope = 'partition'
+            WHERE m.partition_id = ? AND m.status = 'active' AND m.valid_to IS NULL AND m.scope = 'partition'
             ORDER BY m.importance DESC, m.created_at DESC, m.id DESC
             LIMIT ?`,
         )
@@ -421,7 +803,13 @@ export function personMemories(
   limit: number,
 ): Memory[] {
   const q = (query ?? '').trim();
-  const where = ["m.partition_id = ?", 'm.person_id = ?', "m.status = 'active'", "m.scope IN ('person', 'session')"];
+  const where = [
+    'm.partition_id = ?',
+    'm.person_id = ?',
+    "m.status = 'active'",
+    'm.valid_to IS NULL',
+    "m.scope IN ('person', 'session')",
+  ];
   const params: (string | number)[] = [partitionId, personId];
   if (q) {
     const match = ftsQuery(q);
@@ -456,7 +844,7 @@ export function sharedMemories(
   limit: number,
 ): Memory[] {
   const q = (query ?? '').trim();
-  const where = ["m.partition_id = ?", "m.status = 'active'", "m.scope = 'partition'"];
+  const where = ["m.partition_id = ?", "m.status = 'active'", 'm.valid_to IS NULL', "m.scope = 'partition'"];
   const params: (string | number)[] = [partitionId];
   if (q) {
     const match = ftsQuery(q);
@@ -495,7 +883,7 @@ export function pendingDreamMemories(
         .prepare(
           `SELECT m.*, p.external_id AS person_external_id
              FROM memories m JOIN persons p ON p.id = m.person_id
-            WHERE m.partition_id = ? AND m.person_id = ? AND m.status = 'active'
+            WHERE m.partition_id = ? AND m.person_id = ? AND m.status = 'active' AND m.valid_to IS NULL
               AND m.scope IN ('person', 'session') AND m.dreamed_at IS NULL
             ORDER BY m.created_at ASC, m.id ASC
             LIMIT ?`,
@@ -505,7 +893,7 @@ export function pendingDreamMemories(
         .prepare(
           `SELECT m.*, p.external_id AS person_external_id
              FROM memories m JOIN persons p ON p.id = m.person_id
-            WHERE m.partition_id = ? AND m.status = 'active' AND m.scope = 'partition'
+            WHERE m.partition_id = ? AND m.status = 'active' AND m.valid_to IS NULL AND m.scope = 'partition'
               AND m.dreamed_at IS NULL
             ORDER BY m.created_at ASC, m.id ASC
             LIMIT ?`,
@@ -519,14 +907,14 @@ export function pendingDreamCount(db: DatabaseSync, partitionId: string, personI
     ? (db
         .prepare(
           `SELECT COUNT(*) AS c FROM memories
-            WHERE partition_id = ? AND person_id = ? AND status = 'active'
+            WHERE partition_id = ? AND person_id = ? AND status = 'active' AND valid_to IS NULL
               AND scope IN ('person', 'session') AND dreamed_at IS NULL`,
         )
         .get(partitionId, personId) as unknown as { c: number })
     : (db
         .prepare(
           `SELECT COUNT(*) AS c FROM memories
-            WHERE partition_id = ? AND status = 'active' AND scope = 'partition' AND dreamed_at IS NULL`,
+            WHERE partition_id = ? AND status = 'active' AND valid_to IS NULL AND scope = 'partition' AND dreamed_at IS NULL`,
         )
         .get(partitionId) as unknown as { c: number });
   return row?.c ?? 0;

@@ -23,5 +23,24 @@ export { dreamStatus, runDream, resetDreamLocks } from './dream.ts';
 export { startDreamScheduler } from './dream-scheduler.ts';
 export { reconcileCounts } from './partition.ts';
 export { ftsQuery } from './rows.ts';
+/* --- v6.1 P0 --- */
+export { searchMemories, keywordScore } from './retrieval.ts';
+export { memoryHistory, feedbackMemory } from './memories.ts';
+export { blobToEmbedding, cosine, embedText, embeddingToBlob, EMBEDDING_DIM, EMBEDDING_MODEL } from './embed.ts';
+export {
+  claimDueJobs,
+  enqueueJob,
+  enqueueMemoryJobs,
+  executeJob,
+  extractEntities,
+  MAX_JOB_ATTEMPTS,
+  processJobs,
+  requeueStaleJobs,
+  runEmbedJob,
+  runProfileJob,
+  startMemoryJobWorker,
+  toMemoryJob,
+} from './jobs.ts';
+export { writeHistory, listMemoryHistory } from './history.ts';
 export { llmText } from './llm.ts';
 export type { LlmConfig };

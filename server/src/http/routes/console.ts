@@ -1,4 +1,4 @@
-import type { ApiKey, MemoryScope, Partition, PersonType } from '../../../../shared/src/types.ts';
+import type { ApiKey, MemoryScope, Partition, PartitionSettings, PersonType } from '../../../../shared/src/types.ts';
 import { writeAudit } from '../../lib/audit.ts';
 import { newApiKeySecret, newId, nowIso } from '../../lib/ids.ts';
 import { listAudit, partitionUsage } from '../analytics.ts';
@@ -18,8 +18,10 @@ import {
   auditQuerySchema,
   dreamRunSchema,
   memoryAddSchema,
+  memoryFeedbackSchema,
   memoryListQuerySchema,
   memoryPatchSchema,
+  memorySearchSchema,
   partitionPatchSchema,
   partitionUpsertSchema,
   personBriefQuerySchema,
@@ -89,7 +91,11 @@ export function registerConsoleRoutes(router: Router): void {
     handler: async (rc: RequestContext) => {
       const auth = requireConsoleRole(rc, 'admin');
       const body = await rc.body(partitionUpsertSchema);
-      const partition = rc.app.engine.upsertPartition(auth.org.id, body, actorForUser(rc, auth.user));
+      const partition = rc.app.engine.upsertPartition(
+        auth.org.id,
+        { ...body, settings: body.settings as Partial<PartitionSettings> | undefined },
+        actorForUser(rc, auth.user),
+      );
       rc.json(withStats(rc, partition), 201);
     },
   });
@@ -114,7 +120,7 @@ export function registerConsoleRoutes(router: Router): void {
       const updated = rc.app.engine.updatePartition(
         partition.orgId,
         partition.id,
-        body,
+        { ...body, settings: body.settings as Partial<PartitionSettings> | undefined },
         actorForUser(rc, requireConsoleAuth(rc).user),
       );
       rc.json(withStats(rc, updated));
@@ -253,7 +259,7 @@ export function registerConsoleRoutes(router: Router): void {
       const body = await rc.body(memoryAddSchema);
       const content = (body.text ?? body.content ?? '').trim();
       if (!content) throw errors.validation(undefined, 'text 不能为空');
-      const memory = rc.app.engine.addMemory({
+      const result = rc.app.engine.addMemoryResult({
         partitionId: partition.id,
         personId: person.id,
         scope: body.scope as MemoryScope | undefined,
@@ -267,11 +273,14 @@ export function registerConsoleRoutes(router: Router): void {
         tags: body.tags,
         metadata: body.metadata,
         expiresAt: body.expiresAt,
+        supersedesId: body.supersedesId,
+        factKey: body.factKey,
+        validFrom: body.validFrom,
         actor: actorForUser(rc, auth.user),
       });
       rc.markUsage({ partitionId: partition.id, operation: 'add', channel: 'console' });
       rc.noteUsage(1);
-      rc.json({ memory }, 201);
+      rc.json({ memory: result.memory, event: result.event, supersededId: result.supersededId ?? null }, 201);
     },
   });
 
@@ -295,6 +304,60 @@ export function registerConsoleRoutes(router: Router): void {
       rc.markUsage({ partitionId: partition.id, operation: query.q ? 'search' : 'list', channel: 'console' });
       rc.noteUsage(page.items.length);
       rc.json(page);
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/partitions/:partition/memories/search',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const partition = partitionFor(rc);
+      const body = await rc.body(memorySearchSchema);
+      const response = rc.app.engine.searchMemories({
+        partitionId: partition.id,
+        query: body.query,
+        personId: body.personId,
+        personExternalId: body.personExternalId,
+        scope: body.scope as MemoryScope | undefined,
+        category: body.category,
+        mode: body.mode,
+        topK: body.topK,
+        asOf: body.asOf,
+        includeSuperseded: body.includeSuperseded,
+        includePrivate: body.includePrivate,
+      });
+      rc.markUsage({ partitionId: partition.id, operation: 'search', channel: 'console' });
+      rc.noteUsage(response.hits.length);
+      rc.json({ ...response, took_ms: response.tookMs });
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/api/partitions/:partition/memories/:id/history',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const partition = partitionFor(rc);
+      rc.json(rc.app.engine.memoryHistory(partition.id, rc.params.id ?? ''));
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/partitions/:partition/memories/:id/feedback',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const partition = partitionFor(rc, 'developer');
+      const auth = requireConsoleAuth(rc);
+      const body = await rc.body(memoryFeedbackSchema);
+      const memory = rc.app.engine.feedback(
+        partition.id,
+        rc.params.id ?? '',
+        { helpful: body.helpful, query: body.query, reason: body.reason },
+        actorForUser(rc, auth.user),
+      );
+      rc.json({ memory });
     },
   });
 

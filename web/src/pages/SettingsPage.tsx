@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useLocation, useParams } from 'react-router-dom';
 import type { MemoryScope, PartitionStatus } from '@lib/types.ts';
 import { MEMORY_SCOPES, PARTITION_STATUSES } from '@lib/constants.ts';
 import {
@@ -19,6 +19,11 @@ import {
 import { api } from '@lib/api.ts';
 import { usePartitionContext } from '@lib/partition-context.tsx';
 import { fmtFullDateTime } from '@lib/format.ts';
+import {
+  RetrievalSettingsCard,
+  retrievalFormDefaults,
+  type RetrievalFormValue,
+} from '../components/settings/RetrievalSettingsCard.tsx';
 
 interface FormState {
   name: string;
@@ -29,6 +34,7 @@ interface FormState {
   briefMaxChars: string;
   dreamEnabled: boolean;
   dreamIntervalMinutes: string;
+  retrieval: RetrievalFormValue;
 }
 
 function formFromPartition(partition: {
@@ -47,14 +53,20 @@ function formFromPartition(partition: {
     briefMaxChars: String(settings.briefMaxChars ?? 500),
     dreamEnabled: settings.dreamEnabled !== false,
     dreamIntervalMinutes: String(settings.dreamIntervalMinutes ?? 1440),
+    retrieval: retrievalFormDefaults(settings),
   };
 }
 
-/** 分区设置：名称/描述/状态 + 默认 scope、自动建档、简报与做梦参数。 */
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+/** 分区设置：名称/描述/状态 + 默认 scope、自动建档、简报与做梦参数 + v6.1 检索与写管线。 */
 export function SettingsPage() {
   const { partitionId = '' } = useParams<{ partitionId: string }>();
   const { partition, refresh } = usePartitionContext();
   const toast = useToast();
+  const location = useLocation();
 
   const initial = useMemo(() => (partition ? formFromPartition(partition) : null), [partition]);
   const [form, setForm] = useState<FormState | null>(initial);
@@ -66,7 +78,18 @@ export function SettingsPage() {
     setError(null);
   }, [initial]);
 
+  // 从记忆页「检索设置」跳转过来时滚动到检索卡片（#retrieval）。
+  useEffect(() => {
+    if (location.hash !== '#retrieval') return;
+    const target = document.getElementById('retrieval');
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [location.hash, partitionId, partition?.id, initial]);
+
   const patch = (next: Partial<FormState>) => setForm((current) => (current ? { ...current, ...next } : current));
+  const patchRetrieval = (next: Partial<RetrievalFormValue>) =>
+    setForm((current) =>
+      current ? { ...current, retrieval: { ...current.retrieval, ...next } } : current,
+    );
 
   const save = async () => {
     if (!form || saving) return;
@@ -74,6 +97,38 @@ export function SettingsPage() {
       setError('分区名称不能为空。');
       return;
     }
+
+    const weights = form.retrieval.weights;
+    const weightNumbers = {
+      vector: Number(weights.vector),
+      keyword: Number(weights.keyword),
+      recency: Number(weights.recency),
+      importance: Number(weights.importance),
+      entity: Number(weights.entity),
+    };
+    const badWeight = Object.values(weightNumbers).some(
+      (value) => !Number.isFinite(value) || value < 0 || value > 1,
+    );
+    if (badWeight) {
+      setError('检索权重必须是 0–1 之间的数字。');
+      return;
+    }
+    const mergeThreshold = Number(form.retrieval.mergeThreshold);
+    const dedupeThreshold = Number(form.retrieval.dedupeThreshold);
+    if (
+      !form.retrieval.mergeThreshold.trim() ||
+      !form.retrieval.dedupeThreshold.trim() ||
+      !Number.isFinite(mergeThreshold) ||
+      !Number.isFinite(dedupeThreshold) ||
+      mergeThreshold < 0 ||
+      mergeThreshold > 1 ||
+      dedupeThreshold < 0 ||
+      dedupeThreshold > 1
+    ) {
+      setError('去重 / 合并阈值必须是 0–1 之间的数字。');
+      return;
+    }
+
     setSaving(true);
     setError(null);
     try {
@@ -88,10 +143,23 @@ export function SettingsPage() {
           briefMaxChars: Number(form.briefMaxChars) || 500,
           dreamEnabled: form.dreamEnabled,
           dreamIntervalMinutes: Number(form.dreamIntervalMinutes) || 1440,
+          /* --- v6.1 检索与写管线 --- */
+          retrievalMode: form.retrieval.mode,
+          retrievalWeights: {
+            vector: clamp01(weightNumbers.vector),
+            keyword: clamp01(weightNumbers.keyword),
+            recency: clamp01(weightNumbers.recency),
+            importance: clamp01(weightNumbers.importance),
+            entity: clamp01(weightNumbers.entity),
+          },
+          embeddingModel: form.retrieval.embeddingModel.trim() || 'mnemos-hash-384',
+          mergeThreshold,
+          dedupeThreshold,
+          autoExtractEntities: form.retrieval.autoExtractEntities,
         },
       });
       await refresh();
-      toast.success('分区设置已保存');
+      toast.success('分区设置已保存，检索与写入将按新设置生效');
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : '保存失败';
       setError(message);
@@ -114,7 +182,7 @@ export function SettingsPage() {
       <PageHead
         eyebrow="设置"
         title="分区设置"
-        desc="分区内的默认行为：新记忆的可见范围、人的自动建档、简报字数与做梦周期。"
+        desc="分区内的默认行为：新记忆的可见范围、人的自动建档、简报字数与做梦周期，以及 v6.1 混合检索权重与写管线阈值。"
         actions={
           <Button variant="primary" icon="check" loading={saving} onClick={() => void save()}>
             保存设置
@@ -210,6 +278,8 @@ export function SettingsPage() {
           </div>
         </Card>
       </div>
+
+      <RetrievalSettingsCard value={form.retrieval} onChange={patchRetrieval} />
 
       <Card pad>
         <SectionHead

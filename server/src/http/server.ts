@@ -5,10 +5,11 @@ import { recordUsage } from '../lib/usage.ts';
 import { createRequestContext, type RequestContext } from './context.ts';
 import { assertScopes, authenticateApiKey, authenticateConsole } from './middleware/auth.ts';
 import { applyCors, handlePreflight } from './middleware/cors.ts';
+import { prepareIdempotency } from './middleware/idempotency.ts';
 import { createObservability, resolveRequestId, type Observability } from './middleware/observability.ts';
 import { applySecurityHeaders } from './middleware/security.ts';
 import { createRequestTimeout } from './middleware/timeout.ts';
-import { errors, normalizeError, sendError } from './respond.ts';
+import { errors, normalizeError, sendError, sendJson } from './respond.ts';
 import { normalizePath, Router, type RouteMatch } from './router.ts';
 import { registerRoutes } from './routes/index.ts';
 import { serveStatic } from './static.ts';
@@ -208,6 +209,26 @@ async function dispatch(
     }
 
     const context = rc;
+
+    // POST 写接口幂等：命中历史响应直接回放；成功后缓存首次响应。
+    let idempotency: Awaited<ReturnType<typeof prepareIdempotency>> = null;
+    let idempotencyCapture: { status: number; body: unknown } | null = null;
+    if (method === 'POST') {
+      idempotency = await prepareIdempotency(context);
+      if (idempotency?.replay) {
+        res.setHeader('idempotent-replayed', 'true');
+        sendJson(res, requestId, idempotency.replay.status, idempotency.replay.body);
+        return;
+      }
+      if (idempotency) {
+        const originalJson = context.json.bind(context);
+        context.json = (data: unknown, status = 200) => {
+          if (status < 400) idempotencyCapture = { status, body: data };
+          originalJson(data, status);
+        };
+      }
+    }
+
     await withSpan(
       `${method} ${meta.path}`,
       {
@@ -225,6 +246,10 @@ async function dispatch(
     );
     if (!res.headersSent && !res.writableEnded) {
       throw errors.internal('路由处理器未返回响应');
+    }
+    if (idempotency) {
+      if (idempotencyCapture) idempotency.commit(idempotencyCapture);
+      else if (res.statusCode < 400) idempotency.commit({ status: res.statusCode, body: null });
     }
   } catch (error) {
     logRequestFailure(app, requestId, method, pathname, error);

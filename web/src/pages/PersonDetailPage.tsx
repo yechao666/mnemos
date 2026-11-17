@@ -26,6 +26,7 @@ import { ROLE_RANK } from '@lib/constants.ts';
 import { BriefCard } from '../components/brief/BriefCard.tsx';
 import { DreamCard } from '../components/brief/DreamCard.tsx';
 import { MemoryContent, MemoryMeta } from '../components/memories/shared.tsx';
+import { MemoryDrawer } from '../components/memories/MemoryDrawer.tsx';
 import {
   PersonExternalIdChip,
   PersonStatusBadge,
@@ -83,7 +84,22 @@ export function PersonDetailPage() {
   );
 
   const [running, setRunning] = useState(false);
+  const [drawerMemory, setDrawerMemory] = useState<Memory | null>(null);
   const canManage = Boolean(user && ROLE_RANK[user.role] >= ROLE_RANK.admin);
+
+  const openMemoryById = async (id: string) => {
+    if (!id) return;
+    const known = memories.items.find((memory) => memory.id === id);
+    if (known) {
+      setDrawerMemory(known);
+      return;
+    }
+    try {
+      setDrawerMemory(await api.memories.get(partitionId, id));
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : '无法加载关联记忆');
+    }
+  };
 
   const refreshPerson = () => {
     void personQuery.refresh();
@@ -294,7 +310,19 @@ export function PersonDetailPage() {
             ) : (
               <div className="vstack gap-8 mt-12">
                 {memories.items.map((memory) => (
-                  <div key={memory.id} className="v6-memory-row">
+                  <div
+                    key={memory.id}
+                    className="v6-memory-row is-clickable"
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setDrawerMemory(memory)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        setDrawerMemory(memory);
+                      }
+                    }}
+                  >
                     <div className="between wrap gap-8">
                       <MemoryContent memory={memory} clamp />
                       <span className="tiny dim nowrap" title={fmtFullDateTime(memory.updatedAt)}>
@@ -302,7 +330,7 @@ export function PersonDetailPage() {
                       </span>
                     </div>
                     <div className="mt-4">
-                      <MemoryMeta memory={memory} />
+                      <MemoryMeta memory={memory} onOpenSuperseded={(id) => void openMemoryById(id)} />
                     </div>
                   </div>
                 ))}
@@ -415,6 +443,19 @@ export function PersonDetailPage() {
           </Card>
         </>
       ) : null}
+
+      <MemoryDrawer
+        open={Boolean(drawerMemory)}
+        partitionId={partitionId}
+        memory={drawerMemory}
+        canManage={canManage}
+        onClose={() => setDrawerMemory(null)}
+        onOpenMemory={(id) => void openMemoryById(id)}
+        onChanged={() => {
+          void memories.refresh();
+          void personQuery.refresh();
+        }}
+      />
     </div>
   );
 }

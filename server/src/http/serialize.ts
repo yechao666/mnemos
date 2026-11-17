@@ -5,6 +5,9 @@ import type {
   MemoryDreamResult,
   MemoryDreamRun,
   MemoryDreamStatus,
+  MemoryHistoryEntry,
+  MemorySearchHit,
+  MemorySearchResponse,
   Partition,
   PartitionSettings,
   PartitionStats,
@@ -30,6 +33,13 @@ export function settingsV1(settings: PartitionSettings): Json {
     monthly_quota: settings.monthlyQuota,
     person_auto_create: settings.personAutoCreate,
     locale: settings.locale,
+    /* --- v6.1 --- */
+    retrieval_mode: settings.retrievalMode,
+    retrieval_weights: { ...settings.retrievalWeights },
+    embedding_model: settings.embeddingModel,
+    merge_threshold: settings.mergeThreshold,
+    dedupe_threshold: settings.dedupeThreshold,
+    auto_extract_entities: settings.autoExtractEntities,
   };
 }
 
@@ -104,6 +114,48 @@ export function memoryV1(memory: Memory): Json {
     updated_at: memory.updatedAt,
     expires_at: memory.expiresAt ?? null,
     dreamed_at: memory.dreamedAt ?? null,
+    /* --- v6.1 --- */
+    valid_from: memory.validFrom ?? null,
+    valid_to: memory.validTo ?? null,
+    superseded_by: memory.supersededBy ?? null,
+    supersedes: memory.supersedes ?? null,
+    fact_key: memory.factKey ?? null,
+    feedback_up: memory.feedbackUp ?? 0,
+    feedback_down: memory.feedbackDown ?? 0,
+  };
+}
+
+export function historyV1(entry: MemoryHistoryEntry): Json {
+  return {
+    id: entry.id,
+    partition_id: entry.partitionId,
+    memory_id: entry.memoryId,
+    person_id: entry.personId ?? null,
+    event: entry.event,
+    old_content: entry.oldContent ?? null,
+    new_content: entry.newContent ?? null,
+    actor: entry.actor ?? null,
+    reason: entry.reason ?? null,
+    meta: entry.meta,
+    created_at: entry.createdAt,
+  };
+}
+
+export function searchHitV1(hit: MemorySearchHit): Json {
+  return {
+    ...memoryV1(hit),
+    score: hit.score,
+    signals: { ...hit.signals },
+    matched_on: hit.matchedOn,
+  };
+}
+
+export function searchResponseV1(response: MemorySearchResponse): Json {
+  return {
+    hits: response.hits.map(searchHitV1),
+    took_ms: response.tookMs,
+    mode: response.mode,
+    strategy: response.strategy,
   };
 }
 

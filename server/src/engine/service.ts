@@ -6,12 +6,17 @@ import type {
   ContextInput,
   CursorPage,
   Memory,
+  MemoryAddResult,
   MemoryBrief,
   MemoryDetail,
+  MemoryFeedbackInput,
+  MemoryHistoryEntry,
   MemoryDreamInput,
   MemoryDreamResult,
   MemoryDreamStatus,
   MemoryListQuery,
+  MemorySearchInput,
+  MemorySearchResponse,
   MemoryService,
   Partition,
   PartitionInput,
@@ -30,11 +35,14 @@ import { buildContext } from './context.ts';
 import { dreamStatus, runDream } from './dream.ts';
 import {
   addMemory,
+  feedbackMemory,
   getMemory,
   listMemories,
+  memoryHistory,
   removeMemory,
   updateMemory,
 } from './memories.ts';
+import { searchMemories } from './retrieval.ts';
 import {
   getPartition,
   listPartitions,
@@ -156,17 +164,26 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
 
     /* --- 记忆 --- */
     addMemory(input: AddMemoryInput): Memory {
-      const memory = addMemory(db, input);
+      return addMemory(db, input).memory;
+    },
+    addMemoryResult(input: AddMemoryInput): MemoryAddResult {
+      const result = addMemory(db, input);
       audit(db, {
         orgId: orgOfPartition(db, input.partitionId),
         partitionId: input.partitionId,
         actor: input.actor,
-        action: 'memory.add',
+        action: result.event === 'ADD' ? 'memory.add' : `memory.${result.event.toLowerCase()}`,
         resourceType: 'memory',
-        resourceId: memory.id,
-        detail: { personId: memory.personId, scope: memory.scope, category: memory.category },
+        resourceId: result.memory.id,
+        detail: {
+          event: result.event,
+          personId: result.memory.personId,
+          scope: result.memory.scope,
+          category: result.memory.category,
+          supersededId: result.supersededId,
+        },
       });
-      return memory;
+      return result;
     },
     listMemories(query: MemoryListQuery): CursorPage<Memory> {
       return listMemories(db, query);
@@ -188,7 +205,7 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
       return memory;
     },
     removeMemory(partitionId: string, id: string, actor: Actor): void {
-      removeMemory(db, partitionId, id);
+      removeMemory(db, partitionId, id, actor);
       audit(db, {
         orgId: orgOfPartition(db, partitionId),
         partitionId,
@@ -197,6 +214,27 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
         resourceType: 'memory',
         resourceId: id,
       });
+    },
+
+    /* --- v6.1：检索 / 历史 / 反馈 --- */
+    searchMemories(input: MemorySearchInput): MemorySearchResponse {
+      return searchMemories(db, input);
+    },
+    memoryHistory(partitionId: string, id: string): MemoryHistoryEntry[] {
+      return memoryHistory(db, partitionId, id);
+    },
+    feedback(partitionId: string, id: string, input: MemoryFeedbackInput, actor: Actor): Memory {
+      const memory = feedbackMemory(db, partitionId, id, input, actor);
+      audit(db, {
+        orgId: orgOfPartition(db, partitionId),
+        partitionId,
+        actor,
+        action: 'memory.feedback',
+        resourceType: 'memory',
+        resourceId: id,
+        detail: { helpful: input.helpful, confidence: memory.confidence, query: input.query },
+      });
+      return memory;
     },
 
     /* --- 简报 / 上下文 / 做梦 --- */

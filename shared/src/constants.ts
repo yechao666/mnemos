@@ -147,4 +147,22 @@ export const DEFAULT_PARTITION_SETTINGS: PartitionSettings = {
   monthlyQuota: 0,
   personAutoCreate: true,
   locale: 'zh-CN',
+  retrievalMode: 'hybrid',
+  retrievalWeights: { vector: 0.45, keyword: 0.3, recency: 0.15, importance: 0.1, entity: 0 },
+  embeddingModel: 'mnemos-hash-384',
+  mergeThreshold: 0.95,
+  dedupeThreshold: 0.98,
+  autoExtractEntities: true,
 };
+
+/** 检索模式选项（控制台/文档共用）。 */
+export const RETRIEVAL_MODES: { value: 'hybrid' | 'keyword' | 'vector'; label: string }[] = [
+  { value: 'hybrid', label: '混合检索' },
+  { value: 'keyword', label: '关键词' },
+  { value: 'vector', label: '语义向量' },
+];
+
+export const EMBEDDING_MODELS = [
+  { value: 'mnemos-hash-384', label: 'Mnemos Hash-384（本地、免密钥）' },
+  { value: 'text-embedding-3-small', label: 'OpenAI text-embedding-3-small（外部）' },
+];

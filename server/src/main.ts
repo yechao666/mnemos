@@ -3,6 +3,7 @@ import type { AppContext } from './contracts.ts';
 import { getSchemaVersion, migrate, openDatabase, tableCount } from './db/index.ts';
 import { createMemoryService } from './engine/index.ts';
 import { startDreamScheduler } from './engine/dream-scheduler.ts';
+import { startMemoryJobWorker } from './engine/jobs.ts';
 import { assertEnv, ensureDir, loadEnv } from './env.ts';
 import { createHttpServer, drainConnections } from './http/server.ts';
 import { initObservability } from './observability/otel.ts';
@@ -81,6 +82,8 @@ try {
 }
 
 const server = createHttpServer(context);
+const jobWorker = startMemoryJobWorker({ db, logger, tickMs: 1_000, batchSize: 10 });
+logger.info('memory_jobs.worker_started', { tickMs: 1_000, batchSize: 10 });
 let stopDreamScheduler: () => void = () => {};
 
 server.listen(env.port, env.host, () => {
@@ -118,6 +121,7 @@ async function shutdown(signal: string): Promise<void> {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await drain;
     stopDreamScheduler();
+    jobWorker.stop();
     await observability.shutdown();
     await platform.shutdown();
     try {

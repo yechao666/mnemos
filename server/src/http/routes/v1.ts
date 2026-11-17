@@ -7,6 +7,7 @@ import type { Router } from '../router.ts';
 import {
   booleanQuerySchema,
   cursorQuerySchema,
+  memoryFeedbackSchema,
   memoryCategorySchema,
   memoryScopeSchema,
   memorySourceSchema,
@@ -22,9 +23,11 @@ import {
   cursorV1,
   dreamResultV1,
   dreamStatusV1,
+  historyV1,
   memoryV1,
   partitionV1,
   personV1,
+  searchResponseV1,
   statsV1,
 } from '../serialize.ts';
 import { actorOf, enforceQuota, markUsage, partitionOfPathForWrite, partitionRefOf } from './shared.ts';
@@ -54,6 +57,22 @@ const settingsV1Schema = z
     monthly_quota: z.coerce.number().int().min(0).max(1_000_000_000).optional(),
     person_auto_create: z.boolean().optional(),
     locale: z.string().trim().min(2).max(20).optional(),
+    /* v6.1 */
+    retrieval_mode: z.enum(['hybrid', 'keyword', 'vector']).optional(),
+    retrieval_weights: z
+      .object({
+        vector: z.coerce.number().min(0).max(1).optional(),
+        keyword: z.coerce.number().min(0).max(1).optional(),
+        recency: z.coerce.number().min(0).max(1).optional(),
+        importance: z.coerce.number().min(0).max(1).optional(),
+        entity: z.coerce.number().min(0).max(1).optional(),
+      })
+      .passthrough()
+      .optional(),
+    embedding_model: z.string().trim().min(1).max(80).optional(),
+    merge_threshold: z.coerce.number().min(0).max(1).optional(),
+    dedupe_threshold: z.coerce.number().min(0).max(1).optional(),
+    auto_extract_entities: z.boolean().optional(),
   })
   .passthrough();
 
@@ -70,6 +89,14 @@ function settingsFromV1(raw: unknown): Partial<PartitionSettings> | undefined {
   if (input.monthly_quota !== undefined) out.monthlyQuota = Number(input.monthly_quota);
   if (input.person_auto_create !== undefined) out.personAutoCreate = Boolean(input.person_auto_create);
   if (input.locale !== undefined) out.locale = String(input.locale);
+  if (input.retrieval_mode !== undefined) out.retrievalMode = input.retrieval_mode as PartitionSettings['retrievalMode'];
+  if (input.retrieval_weights !== undefined && typeof input.retrieval_weights === 'object') {
+    out.retrievalWeights = input.retrieval_weights as PartitionSettings['retrievalWeights'];
+  }
+  if (input.embedding_model !== undefined) out.embeddingModel = String(input.embedding_model);
+  if (input.merge_threshold !== undefined) out.mergeThreshold = Number(input.merge_threshold);
+  if (input.dedupe_threshold !== undefined) out.dedupeThreshold = Number(input.dedupe_threshold);
+  if (input.auto_extract_entities !== undefined) out.autoExtractEntities = Boolean(input.auto_extract_entities);
   return out;
 }
 
@@ -137,6 +164,10 @@ const memoryAddV1Schema = z
     tags: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
     metadata: z.record(z.unknown()).optional(),
     expires_at: z.string().trim().max(40).nullable().optional(),
+    /* v6.1 写管线 */
+    supersedes_id: z.string().trim().max(128).optional(),
+    fact_key: z.string().trim().max(120).optional(),
+    valid_from: z.string().trim().max(40).optional(),
     infer: z.boolean().optional(),
     mode: z.enum(['additive', 'consolidate']).optional(),
   })
@@ -170,9 +201,14 @@ const memoryPatchV1Schema = z
 const memorySearchV1Schema = z.object({
   query: z.string().trim().min(1).max(2000),
   person_id: z.string().trim().max(128).optional(),
+  person_external_id: z.string().trim().max(128).optional(),
   scope: memoryScopeSchema.optional(),
   category: memoryCategorySchema.optional(),
+  mode: z.enum(['hybrid', 'keyword', 'vector']).optional(),
   top_k: z.coerce.number().int().min(1).max(50).optional(),
+  as_of: z.string().trim().max(40).optional(),
+  include_superseded: z.boolean().optional(),
+  include_private: z.boolean().optional(),
 });
 
 const briefQueryV1Schema = z.object({
@@ -423,7 +459,7 @@ export function registerV1Routes(router: Router): void {
       const body = await rc.body(memoryAddV1Schema);
       const content = contentFrom(body);
       if (!content) throw errors.validation(undefined, 'text 不能为空');
-      const memory = rc.app.engine.addMemory({
+      const result = rc.app.engine.addMemoryResult({
         partitionId: partition.id,
         personId: person.id,
         scope: body.scope as MemoryScope | undefined,
@@ -437,11 +473,22 @@ export function registerV1Routes(router: Router): void {
         tags: body.tags,
         metadata: body.metadata,
         expiresAt: body.expires_at,
+        supersedesId: body.supersedes_id,
+        factKey: body.fact_key,
+        validFrom: body.valid_from,
         actor: actorOf(rc),
       });
       rc.markUsage({ partitionId: partition.id, operation: 'add', channel: 'api', orgId: partition.orgId });
       rc.noteUsage(1);
-      rc.json({ memory: memoryV1(memory), events: [{ type: 'ADD', memory_id: memory.id, at: memory.createdAt }] }, 201);
+      rc.json(
+        {
+          memory: memoryV1(result.memory),
+          event: result.event,
+          superseded_id: result.supersededId ?? null,
+          events: [{ type: result.event, memory_id: result.memory.id, at: result.memory.createdAt }],
+        },
+        result.event === 'ADD' ? 201 : 200,
+      );
     },
   });
 
@@ -477,21 +524,25 @@ export function registerV1Routes(router: Router): void {
     handler: async (rc: RequestContext) => {
       const partition = partitionOfPathForWrite(rc);
       const body = await rc.body(memorySearchV1Schema);
-      const started = Date.now();
-      const page = rc.app.engine.listMemories({
+      const response = rc.app.engine.searchMemories({
         partitionId: partition.id,
+        query: body.query,
         personId: body.person_id,
-        scope: body.scope,
+        personExternalId: body.person_external_id,
+        scope: body.scope as MemoryScope | undefined,
         category: body.category,
-        q: body.query,
-        limit: body.top_k ?? 8,
+        mode: body.mode,
+        topK: body.top_k ?? 8,
+        asOf: body.as_of,
+        includeSuperseded: body.include_superseded,
+        includePrivate: body.include_private,
       });
-      markUsage(rc, partition, 'search', 'api', page.items.length);
+      markUsage(rc, partition, 'search', 'api', response.hits.length);
+      // hits 为 v6.1 契约；results 为 v6 插件兼容字段。
       rc.json({
-        results: page.items.map(memoryV1),
-        took_ms: Date.now() - started,
-        next_cursor: page.nextCursor,
-        partition_stats: page.partitionStats ? statsV1(page.partitionStats) : undefined,
+        ...searchResponseV1(response),
+        results: response.hits.map(memoryV1),
+        partition_stats: statsV1(rc.app.engine.partitionStats(partition.id)),
       });
     },
   });
@@ -507,6 +558,35 @@ export function registerV1Routes(router: Router): void {
       if (!detail) throw errors.notFound('记忆不存在');
       markUsage(rc, partition, 'get', 'api', 1);
       rc.json({ memory: memoryV1(detail.memory), person: detail.person ? personV1(detail.person) : null });
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/v1/partitions/:partition/memories/:id/history',
+    auth: 'apikey',
+    scopes: ['memories:read'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      rc.json({ items: rc.app.engine.memoryHistory(partition.id, rc.params.id ?? '').map(historyV1) });
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/v1/partitions/:partition/memories/:id/feedback',
+    auth: 'apikey',
+    scopes: ['memories:write'],
+    handler: async (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const body = await rc.body(memoryFeedbackSchema);
+      const memory = rc.app.engine.feedback(
+        partition.id,
+        rc.params.id ?? '',
+        { helpful: body.helpful, query: body.query, reason: body.reason },
+        actorOf(rc),
+      );
+      rc.json({ memory: memoryV1(memory) });
     },
   });
 

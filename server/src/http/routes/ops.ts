@@ -4,6 +4,7 @@ import { APP_VERSION, ROLE_RANK } from '../../../../shared/src/constants.ts';
 import type { OpsStatus } from '../../../../shared/src/types.ts';
 import { SCHEMA_VERSION, getSchemaVersion, tableCount } from '../../db/index.ts';
 import { parseSettings, type PartitionRow } from '../../engine/rows.ts';
+import { processJobs } from '../../engine/jobs.ts';
 import { requireConsoleAuth, type ConsoleAuth } from '../middleware/auth.ts';
 import { errors } from '../respond.ts';
 import type { RequestContext } from '../context.ts';
@@ -25,6 +26,10 @@ const maintenanceBodySchema = z.object({
 });
 
 const maintenanceQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+});
+
+const jobsTickSchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).optional(),
 });
 
@@ -199,6 +204,18 @@ export function registerOpsRoutes(router: Router): void {
       requireOpsAdmin(rc);
       const query = rc.query(maintenanceQuerySchema);
       rc.json(rc.app.platform.maintenance.history(query.limit ?? 20));
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/ops/jobs/tick',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      requireOpsAdmin(rc);
+      const body = await rc.body(jobsTickSchema);
+      const result = processJobs(rc.app.db, { limit: body.limit ?? 10 });
+      rc.json({ ...result, at: new Date().toISOString() });
     },
   });
 

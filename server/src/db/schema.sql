@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS persons (
   last_seen_at        TEXT NOT NULL,
   created_at          TEXT NOT NULL,
   updated_at          TEXT NOT NULL,
+  merged_into         TEXT,
+  consent             TEXT NOT NULL DEFAULT '{}',
+  deleted_at          TEXT,
   UNIQUE (partition_id, type, external_id)
 );
 
@@ -179,11 +182,25 @@ CREATE TABLE IF NOT EXISTS memories (
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
   expires_at      TEXT,
-  dreamed_at      TEXT
+  dreamed_at      TEXT,
+  normalized_hash TEXT,
+  embedding       BLOB,
+  embedding_model TEXT,
+  dim             INTEGER,
+  valid_from      TEXT,
+  valid_to        TEXT,
+  superseded_by   TEXT,
+  supersedes      TEXT,
+  fact_key        TEXT,
+  feedback_up     INTEGER NOT NULL DEFAULT 0,
+  feedback_down   INTEGER NOT NULL DEFAULT 0
 );
 -- 排序键放在 status 之前：列表默认不带 status 过滤，保证 ORDER BY created_at 可直接走索引。
 CREATE INDEX IF NOT EXISTS idx_memories_person ON memories(partition_id, person_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_scope  ON memories(partition_id, scope, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_valid  ON memories(partition_id, person_id, valid_to, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_fact   ON memories(partition_id, person_id, fact_key, valid_to);
+CREATE INDEX IF NOT EXISTS idx_memories_hash   ON memories(partition_id, person_id, normalized_hash);
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(partition_id, category, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(partition_id, status, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_recent ON memories(partition_id, created_at DESC, id DESC);
@@ -452,4 +469,134 @@ CREATE TABLE IF NOT EXISTS maintenance_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_maintenance_started ON maintenance_runs(started_at DESC);
 
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '6');
+/* ------------------------------------------------------------------ */
+/* v6.1：记忆质量（P0/P1/P2）                                          */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS memory_history (
+  id            TEXT PRIMARY KEY,
+  partition_id  TEXT NOT NULL,
+  person_id     TEXT,
+  memory_id     TEXT NOT NULL,
+  event         TEXT NOT NULL,
+  old_content   TEXT,
+  new_content   TEXT,
+  actor         TEXT,
+  reason        TEXT,
+  meta          TEXT NOT NULL DEFAULT '{}',
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_history_memory ON memory_history(memory_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_history_partition ON memory_history(partition_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS memory_feedback (
+  id          TEXT PRIMARY KEY,
+  partition_id TEXT NOT NULL,
+  memory_id   TEXT NOT NULL,
+  person_id   TEXT,
+  helpful     INTEGER NOT NULL,
+  query       TEXT,
+  actor       TEXT,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_memory ON memory_feedback(memory_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS memory_jobs (
+  id            TEXT PRIMARY KEY,
+  partition_id  TEXT NOT NULL,
+  type          TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'pending',
+  payload       TEXT NOT NULL DEFAULT '{}',
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  run_after     TEXT NOT NULL,
+  locked_at     TEXT,
+  error         TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_due ON memory_jobs(status, run_after);
+CREATE INDEX IF NOT EXISTS idx_jobs_partition ON memory_jobs(partition_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS person_facts (
+  id            TEXT PRIMARY KEY,
+  partition_id  TEXT NOT NULL,
+  person_id     TEXT NOT NULL,
+  key           TEXT NOT NULL,
+  value         TEXT NOT NULL,
+  confidence    REAL NOT NULL DEFAULT 0.7,
+  valid_from    TEXT NOT NULL,
+  valid_to      TEXT,
+  source_memory_id TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_facts_person ON person_facts(partition_id, person_id, valid_to);
+
+CREATE TABLE IF NOT EXISTS person_profiles (
+  partition_id  TEXT NOT NULL,
+  person_id     TEXT NOT NULL,
+  summary       TEXT NOT NULL DEFAULT '',
+  source_hash   TEXT NOT NULL DEFAULT '',
+  generated_at  TEXT NOT NULL,
+  PRIMARY KEY (partition_id, person_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_attachments (
+  id            TEXT PRIMARY KEY,
+  partition_id  TEXT NOT NULL,
+  memory_id     TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  url           TEXT NOT NULL,
+  mime          TEXT,
+  size          INTEGER,
+  caption       TEXT,
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_memory ON memory_attachments(memory_id);
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key           TEXT PRIMARY KEY,
+  partition_id  TEXT,
+  method        TEXT,
+  path          TEXT,
+  status        INTEGER,
+  body          TEXT,
+  created_at    TEXT NOT NULL,
+  expires_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_keys(expires_at);
+
+CREATE TABLE IF NOT EXISTS entities (
+  id            TEXT PRIMARY KEY,
+  partition_id  TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  type          TEXT NOT NULL DEFAULT 'concept',
+  normalized    TEXT NOT NULL,
+  mention_count INTEGER NOT NULL DEFAULT 1,
+  created_at    TEXT NOT NULL,
+  UNIQUE (partition_id, normalized, type)
+);
+CREATE INDEX IF NOT EXISTS idx_entities_partition ON entities(partition_id, mention_count DESC);
+
+CREATE TABLE IF NOT EXISTS memory_entities (
+  memory_id  TEXT NOT NULL,
+  entity_id  TEXT NOT NULL,
+  salience   REAL NOT NULL DEFAULT 1,
+  PRIMARY KEY (memory_id, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
+
+CREATE TABLE IF NOT EXISTS relations (
+  id               TEXT PRIMARY KEY,
+  partition_id     TEXT NOT NULL,
+  source_entity_id TEXT NOT NULL,
+  target_entity_id TEXT NOT NULL,
+  relation         TEXT NOT NULL,
+  memory_id        TEXT,
+  weight           REAL NOT NULL DEFAULT 1,
+  created_at       TEXT NOT NULL,
+  UNIQUE (partition_id, source_entity_id, target_entity_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_relations_partition ON relations(partition_id, weight DESC);
+
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '7');

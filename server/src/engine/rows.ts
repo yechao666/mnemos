@@ -14,6 +14,7 @@ import type {
   Person,
   PersonStatus,
   PersonType,
+  RetrievalWeights,
   Session,
 } from '../../../shared/src/types.ts';
 
@@ -82,6 +83,18 @@ export interface MemoryRow {
   updated_at: string;
   expires_at: string | null;
   dreamed_at: string | null;
+  /* --- v6.1 --- */
+  normalized_hash: string | null;
+  embedding: Uint8Array | null;
+  embedding_model: string | null;
+  dim: number | null;
+  valid_from: string | null;
+  valid_to: string | null;
+  superseded_by: string | null;
+  supersedes: string | null;
+  fact_key: string | null;
+  feedback_up: number;
+  feedback_down: number;
 }
 
 export interface SessionRow {
@@ -145,6 +158,32 @@ function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback
   return typeof value === 'string' && (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
 }
 
+function clampUnit(value: unknown, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(1, Math.max(0, n));
+}
+
+const RETRIEVAL_KEYS: (keyof RetrievalWeights)[] = ['vector', 'keyword', 'recency', 'importance', 'entity'];
+
+/**
+ * 合并检索权重：逐字段 clamp 到 0–1；全为 0 时回退默认权重（避免分数恒为 0）。
+ */
+export function parseRetrievalWeights(
+  raw: unknown,
+  fallback: RetrievalWeights = DEFAULT_PARTITION_SETTINGS.retrievalWeights,
+): RetrievalWeights {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const result = {} as RetrievalWeights;
+  let total = 0;
+  for (const key of RETRIEVAL_KEYS) {
+    const value = clampUnit(source[key], fallback[key]);
+    result[key] = value;
+    total += value;
+  }
+  return total > 0 ? result : { ...fallback };
+}
+
 /** 合并默认设置（容忍旧数据缺字段）。 */
 export function parseSettings(raw: string | null | undefined): PartitionSettings {
   const parsed = parseJson<Partial<PartitionSettings>>(raw, {});
@@ -168,6 +207,22 @@ export function parseSettings(raw: string | null | undefined): PartitionSettings
         ? parsed.personAutoCreate
         : DEFAULT_PARTITION_SETTINGS.personAutoCreate,
     locale: typeof parsed.locale === 'string' && parsed.locale.trim() ? parsed.locale.trim().slice(0, 20) : DEFAULT_PARTITION_SETTINGS.locale,
+    retrievalMode: oneOf<'hybrid' | 'keyword' | 'vector'>(
+      parsed.retrievalMode,
+      ['hybrid', 'keyword', 'vector'],
+      DEFAULT_PARTITION_SETTINGS.retrievalMode,
+    ),
+    retrievalWeights: parseRetrievalWeights(parsed.retrievalWeights),
+    embeddingModel:
+      typeof parsed.embeddingModel === 'string' && parsed.embeddingModel.trim()
+        ? parsed.embeddingModel.trim().slice(0, 80)
+        : DEFAULT_PARTITION_SETTINGS.embeddingModel,
+    mergeThreshold: clampUnit(parsed.mergeThreshold, DEFAULT_PARTITION_SETTINGS.mergeThreshold),
+    dedupeThreshold: clampUnit(parsed.dedupeThreshold, DEFAULT_PARTITION_SETTINGS.dedupeThreshold),
+    autoExtractEntities:
+      typeof parsed.autoExtractEntities === 'boolean'
+        ? parsed.autoExtractEntities
+        : DEFAULT_PARTITION_SETTINGS.autoExtractEntities,
   };
 }
 
@@ -183,6 +238,29 @@ export function mergeSettings(
   merged.retentionDays = clampInt(merged.retentionDays, base.retentionDays, 0, 3650);
   merged.monthlyQuota = clampInt(merged.monthlyQuota, base.monthlyQuota, 0, Number.MAX_SAFE_INTEGER);
   merged.locale = String(merged.locale || base.locale).slice(0, 20);
+  /* --- v6.1 --- */
+  merged.retrievalMode = oneOf<'hybrid' | 'keyword' | 'vector'>(
+    merged.retrievalMode,
+    ['hybrid', 'keyword', 'vector'],
+    base.retrievalMode,
+  );
+  // 权重支持局部 patch：只覆盖传入的键，其余沿用 base。
+  const patchWeights =
+    patch.retrievalWeights && typeof patch.retrievalWeights === 'object'
+      ? (patch.retrievalWeights as Partial<RetrievalWeights>)
+      : undefined;
+  merged.retrievalWeights = parseRetrievalWeights(
+    patchWeights ? { ...base.retrievalWeights, ...patchWeights } : merged.retrievalWeights,
+    base.retrievalWeights,
+  );
+  merged.embeddingModel =
+    typeof merged.embeddingModel === 'string' && merged.embeddingModel.trim()
+      ? merged.embeddingModel.trim().slice(0, 80)
+      : base.embeddingModel;
+  merged.mergeThreshold = clampUnit(merged.mergeThreshold, base.mergeThreshold);
+  merged.dedupeThreshold = clampUnit(merged.dedupeThreshold, base.dedupeThreshold);
+  merged.autoExtractEntities =
+    typeof merged.autoExtractEntities === 'boolean' ? merged.autoExtractEntities : base.autoExtractEntities;
   return merged;
 }
 
@@ -257,6 +335,13 @@ export function toMemory(row: MemoryRow): Memory {
     updatedAt: row.updated_at,
     expiresAt: row.expires_at ?? undefined,
     dreamedAt: row.dreamed_at ?? undefined,
+    validFrom: row.valid_from ?? undefined,
+    validTo: row.valid_to ?? undefined,
+    supersededBy: row.superseded_by ?? undefined,
+    supersedes: row.supersedes ?? undefined,
+    factKey: row.fact_key ?? undefined,
+    feedbackUp: row.feedback_up ?? 0,
+    feedbackDown: row.feedback_down ?? 0,
   };
 }
 

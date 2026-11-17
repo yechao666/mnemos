@@ -23,6 +23,13 @@ import type {
   Memory,
   MemoryBrief,
   MemoryCategory,
+  MemoryFeedbackInput,
+  MemoryHistoryEntry,
+  MemoryHistoryEvent,
+  MemorySearchHit,
+  MemorySearchMode,
+  MemorySearchResponse,
+  MemorySearchSignals,
   MemoryScope,
   MemoryStatus,
   Org,
@@ -205,8 +212,37 @@ export function adaptStats(value: unknown): PartitionStats {
   };
 }
 
+const DEFAULT_RETRIEVAL_WEIGHTS = {
+  vector: 0.45,
+  keyword: 0.3,
+  recency: 0.15,
+  importance: 0.1,
+  entity: 0,
+};
+
+/**
+ * 分区 settings 归一化：v6 旧分区没有 v6.1 字段，这里补默认值，
+ * 保证设置页表单（权重滑块/阈值）永远拿到数字，不会出现 NaN。
+ */
 function adaptSettings(value: unknown): Partition['settings'] {
-  return parseJsonRecord(value) as Partition['settings'];
+  const raw = parseJsonRecord(value);
+  const weights = asRecord(raw.retrievalWeights ?? raw.retrieval_weights);
+  const mode = raw.retrievalMode ?? raw.retrieval_mode;
+  return {
+    ...raw,
+    retrievalMode: mode === 'keyword' || mode === 'vector' ? mode : 'hybrid',
+    retrievalWeights: {
+      vector: num(weights.vector, DEFAULT_RETRIEVAL_WEIGHTS.vector),
+      keyword: num(weights.keyword, DEFAULT_RETRIEVAL_WEIGHTS.keyword),
+      recency: num(weights.recency, DEFAULT_RETRIEVAL_WEIGHTS.recency),
+      importance: num(weights.importance, DEFAULT_RETRIEVAL_WEIGHTS.importance),
+      entity: num(weights.entity, DEFAULT_RETRIEVAL_WEIGHTS.entity),
+    },
+    embeddingModel: str(raw.embeddingModel ?? raw.embedding_model, 'mnemos-hash-384'),
+    mergeThreshold: num(raw.mergeThreshold ?? raw.merge_threshold, 0.95),
+    dedupeThreshold: num(raw.dedupeThreshold ?? raw.dedupe_threshold, 0.98),
+    autoExtractEntities: bool(raw.autoExtractEntities ?? raw.auto_extract_entities, true),
+  };
 }
 
 export function adaptPartition(value: unknown): Partition {
@@ -293,6 +329,95 @@ export function adaptMemory(value: unknown): Memory {
     updatedAt: str(raw.updatedAt ?? raw.updated_at),
     expiresAt: optStr(raw.expiresAt ?? raw.expires_at),
     dreamedAt: optStr(raw.dreamedAt ?? raw.dreamed_at),
+    validFrom: optStr(raw.validFrom ?? raw.valid_from),
+    validTo: optStr(raw.validTo ?? raw.valid_to),
+    supersededBy: optStr(raw.supersededBy ?? raw.superseded_by),
+    supersedes: optStr(raw.supersedes),
+    factKey: optStr(raw.factKey ?? raw.fact_key),
+    feedbackUp: num(raw.feedbackUp ?? raw.feedback_up),
+    feedbackDown: num(raw.feedbackDown ?? raw.feedback_down),
+    attachmentCount: num(raw.attachmentCount ?? raw.attachment_count) || undefined,
+  };
+}
+
+function adaptSignals(value: unknown): MemorySearchSignals {
+  const raw = asRecord(value);
+  return {
+    vector: num(raw.vector),
+    keyword: num(raw.keyword),
+    recency: num(raw.recency),
+    importance: num(raw.importance),
+    entity: num(raw.entity),
+  };
+}
+
+/** 检索命中：兼容 camelCase / snake_case 与 v1 的 `results` 形状。 */
+function adaptSearchHit(value: unknown): MemorySearchHit {
+  const raw = asRecord(value);
+  return {
+    ...adaptMemory(raw),
+    score: num(raw.score ?? raw.finalScore ?? raw.final_score),
+    // 后端可能把信号平铺在命中对象上（v1 兼容），也可能包在 signals 里。
+    signals: adaptSignals(raw.signals ?? raw.signalScores ?? raw.signal_scores ?? raw),
+    matchedOn: (() => {
+      const value = raw.matchedOn ?? raw.matched_on ?? raw.signalsMatched;
+      if (typeof value === 'string') {
+        return value.split(',').map((item) => item.trim()).filter(Boolean);
+      }
+      return pickStringArray(value);
+    })(),
+  };
+}
+
+function adaptSearchResponse(value: unknown): MemorySearchResponse {
+  const raw = asRecord(value);
+  const list = Array.isArray(raw.hits)
+    ? raw.hits
+    : Array.isArray(raw.results)
+      ? raw.results
+      : Array.isArray(raw.items)
+        ? raw.items
+        : [];
+  const modeRaw = raw.mode;
+  const mode: MemorySearchMode =
+    modeRaw === 'keyword' || modeRaw === 'vector' ? modeRaw : 'hybrid';
+  return {
+    hits: list.map(adaptSearchHit),
+    tookMs: num(raw.tookMs ?? raw.took_ms),
+    mode,
+    strategy: str(raw.strategy),
+  };
+}
+
+const MEMORY_HISTORY_EVENTS: MemoryHistoryEvent[] = [
+  'ADD',
+  'UPDATE',
+  'MERGE',
+  'SUPERSEDE',
+  'DELETE',
+  'NOOP',
+  'FEEDBACK',
+  'RESTORE',
+];
+
+function adaptHistoryEntry(value: unknown): MemoryHistoryEntry {
+  const raw = asRecord(value);
+  const eventRaw = str(raw.event).toUpperCase();
+  const event = (MEMORY_HISTORY_EVENTS as string[]).includes(eventRaw)
+    ? (eventRaw as MemoryHistoryEvent)
+    : 'UPDATE';
+  return {
+    id: str(raw.id),
+    partitionId: optStr(raw.partitionId ?? raw.partition_id),
+    memoryId: str(raw.memoryId ?? raw.memory_id),
+    personId: optStr(raw.personId ?? raw.person_id),
+    event,
+    oldContent: optStr(raw.oldContent ?? raw.old_content),
+    newContent: optStr(raw.newContent ?? raw.new_content),
+    actor: optStr(raw.actor),
+    reason: optStr(raw.reason),
+    meta: parseJsonRecord(raw.meta),
+    createdAt: str(raw.createdAt ?? raw.created_at),
   };
 }
 
@@ -499,6 +624,20 @@ export interface MemoryListParams {
   limit?: number;
 }
 
+/** v6.1 混合检索入参（控制台已是 camelCase；请求体同时带 snake_case 兼容 v1 契约）。 */
+export interface MemorySearchParams {
+  query: string;
+  personId?: string;
+  personExternalId?: string;
+  scope?: MemoryScope | '';
+  category?: MemoryCategory | '';
+  mode?: MemorySearchMode;
+  topK?: number;
+  asOf?: string;
+  includeSuperseded?: boolean;
+  includePrivate?: boolean;
+}
+
 export interface BriefParams {
   force?: boolean;
   maxChars?: number;
@@ -523,6 +662,15 @@ export interface MemoryCreateInput {
   tags?: string[];
   sessionId?: string;
   infer?: boolean;
+  /* --- v6.1 写管线 --- */
+  /** 显式取代某条记忆（旧记忆 valid_to=now / superseded_by=新记忆） */
+  supersedesId?: string;
+  /** 事实槽位键（如 preference.language） */
+  factKey?: string;
+  /** 事实生效时间（ISO） */
+  validFrom?: string;
+  /** 幂等键：相同 key + body 24h 内返回首次响应 */
+  idempotencyKey?: string;
 }
 
 export interface KeyCreateInput {
@@ -698,9 +846,26 @@ export const api = {
       personRef: string,
       input: MemoryCreateInput,
     ): Promise<Memory> => {
+      const headers: Record<string, string> = {};
+      if (input.idempotencyKey) headers['Idempotency-Key'] = input.idempotencyKey;
       const raw = await request<unknown>(`${personPath(partitionId, personRef)}/memories`, {
         method: 'POST',
-        body: JSON.stringify(input),
+        headers,
+        body: JSON.stringify({
+          text: input.text,
+          scope: input.scope,
+          category: input.category,
+          tags: input.tags,
+          sessionId: input.sessionId,
+          infer: input.infer,
+          // v6.1：显式取代 / 事实槽位 / 生效时间（camelCase 控制台 + snake_case v1 兼容）
+          supersedesId: input.supersedesId,
+          supersedes_id: input.supersedesId,
+          factKey: input.factKey,
+          fact_key: input.factKey,
+          validFrom: input.validFrom,
+          valid_from: input.validFrom,
+        }),
       });
       // 控制台写入返回 { memory }；适配裸 Memory 与包裹两种形状。
       return adaptMemory(asRecord(raw).memory ?? raw);
@@ -742,6 +907,69 @@ export const api = {
         await request<unknown>(`${partitionPath(partitionId)}/memories${qs({ ...params })}`),
         adaptMemory,
       ),
+    /**
+     * v6.1 混合检索：POST /api/partitions/:p/memories/search。
+     * 返回 hits（score + signals + matchedOn）、tookMs、mode、strategy；
+     * 无游标分页（服务端候选集上限 + top_k），普通浏览仍走 list。
+     */
+    search: async (partitionId: string, params: MemorySearchParams): Promise<MemorySearchResponse> => {
+      const { query, ...rest } = params;
+      const raw = await request<unknown>(`${partitionPath(partitionId)}/memories/search`, {
+        method: 'POST',
+        body: JSON.stringify({
+          query,
+          // camelCase（控制台契约）与 snake_case（v1 / roadmap 契约）同时携带，兼容并行实现。
+          personId: rest.personId,
+          person_id: rest.personId,
+          personExternalId: rest.personExternalId,
+          person_external_id: rest.personExternalId,
+          scope: rest.scope || undefined,
+          category: rest.category || undefined,
+          mode: rest.mode,
+          topK: rest.topK,
+          top_k: rest.topK,
+          asOf: rest.asOf,
+          as_of: rest.asOf,
+          includeSuperseded: rest.includeSuperseded,
+          include_superseded: rest.includeSuperseded,
+          includePrivate: rest.includePrivate,
+          include_private: rest.includePrivate,
+        }),
+      });
+      return adaptSearchResponse(raw);
+    },
+    /** 单条记忆的变更历史（ADD/UPDATE/MERGE/SUPERSEDE/FEEDBACK…）。 */
+    history: async (partitionId: string, memoryId: string): Promise<MemoryHistoryEntry[]> => {
+      const raw = await request<unknown>(
+        `${partitionPath(partitionId)}/memories/${encodeURIComponent(memoryId)}/history`,
+      );
+      const record = asRecord(raw);
+      const list = Array.isArray(raw)
+        ? raw
+        : Array.isArray(record.items)
+          ? record.items
+          : Array.isArray(record.history)
+            ? record.history
+            : Array.isArray(record.entries)
+              ? record.entries
+              : [];
+      return list.map(adaptHistoryEntry);
+    },
+    /** 检索反馈：有帮助/没帮助，服务端会按比例微调 confidence/重要度。 */
+    feedback: async (
+      partitionId: string,
+      memoryId: string,
+      input: MemoryFeedbackInput,
+    ): Promise<Memory | null> => {
+      const raw = await request<unknown>(
+        `${partitionPath(partitionId)}/memories/${encodeURIComponent(memoryId)}/feedback`,
+        { method: 'POST', body: JSON.stringify(input) },
+      );
+      const record = asRecord(raw);
+      const memory = asRecord(record.memory ?? raw);
+      // 部分实现只回 { ok: true }：此时由调用方刷新详情。
+      return memory.id ? adaptMemory(memory) : null;
+    },
     get: async (partitionId: string, memoryId: string): Promise<Memory> => {
       const raw = await request<unknown>(`${partitionPath(partitionId)}/memories/${encodeURIComponent(memoryId)}`);
       // MemoryDetail = { memory, person }
