@@ -1,102 +1,68 @@
-import { ROLE_RANK, TONE_COLORS } from '../../../../shared/src/constants.ts';
-import type { ConsoleAuth, RequestContext } from '../context.ts';
-import type { OrgUser, Role } from '../../../../shared/src/types.ts';
+import { ROLE_RANK } from '../../../../shared/src/constants.ts';
+import type { ApiKey, OrgUser } from '../../../../shared/src/types.ts';
 import { writeAudit } from '../../lib/audit.ts';
-import { newId, nowIso, randomToken, sha256 } from '../../lib/ids.ts';
+import { newApiKeySecret, newId, nowIso, randomToken } from '../../lib/ids.ts';
 import { hashPassword } from '../../lib/password.ts';
-import { actorForUser } from '../context.ts';
-import { toUser, type UserRow } from '../mappers.ts';
-import { requireConsoleAuth } from '../middleware/auth.ts';
+import { actorForUser, type RequestContext } from '../context.ts';
+import { requireConsoleAuth, requireConsoleRole } from '../middleware/auth.ts';
+import { toApiKey, toOrg, toUser, type ApiKeyRow, type OrgRow, type UserRow } from '../mappers.ts';
 import { errors } from '../respond.ts';
 import type { Router } from '../router.ts';
-import { orgUserCreateSchema, orgUserUpdateSchema } from '../schemas.ts';
+import { apiKeyCreateSchema, orgUserCreateSchema, orgUserUpdateSchema } from '../schemas.ts';
 
-/**
- * 组织成员管理（控制台）。
- *  - 列表 / 创建 / 重置密码：admin+
- *  - 角色变更 / 禁用 / 删除：仅 owner
- *  - owner 唯一性：任何时刻至少保留一名启用的 owner
- */
+/** 组织设置：账号、组织级 API Key（控制台 /api）。 */
 
-interface OrgUserRow extends UserRow {
-  project_count?: number;
-  active_sessions?: number;
-}
-
-const USER_SELECT = `
-  SELECT u.*,
-    (SELECT COUNT(*) FROM project_members pm WHERE pm.user_id = u.id) AS project_count,
-    (SELECT COUNT(*) FROM sessions s
-      WHERE s.user_id = u.id AND s.revoked_at IS NULL AND s.expires_at > ?) AS active_sessions
-  FROM users u`;
-
-function toOrgUser(row: OrgUserRow): OrgUser {
-  return {
-    ...toUser(row),
-    projectCount: Number(row.project_count ?? 0),
-    activeSessions: Number(row.active_sessions ?? 0),
-  };
-}
-
-function loadOrgUsers(rc: RequestContext, orgId: string): OrgUser[] {
-  const rows = rc.app.db
-    .prepare(`${USER_SELECT} WHERE u.org_id = ? ORDER BY u.created_at ASC`)
-    .all(nowIso(), orgId) as unknown as OrgUserRow[];
-  return rows.map(toOrgUser);
-}
-
-function loadOrgUser(rc: RequestContext, orgId: string, userId: string): OrgUserRow | null {
-  const row = rc.app.db
-    .prepare(`${USER_SELECT} WHERE u.id = ? AND u.org_id = ?`)
-    .get(nowIso(), userId, orgId) as unknown as OrgUserRow | undefined;
-  return row ?? null;
-}
-
-function requireOrgAdmin(rc: RequestContext): ConsoleAuth {
+function orgRow(rc: RequestContext): OrgRow {
   const auth = requireConsoleAuth(rc);
-  if (ROLE_RANK[auth.user.role] < ROLE_RANK.admin) {
-    throw errors.forbidden('该操作需要组织管理员及以上角色');
-  }
-  return auth;
+  const row = rc.app.db.prepare('SELECT * FROM orgs WHERE id = ?').get(auth.org.id) as unknown as
+    | OrgRow
+    | undefined;
+  if (!row) throw errors.notFound('组织不存在');
+  return row;
 }
 
-function requireOrgOwner(auth: ConsoleAuth, action: string): void {
-  if (auth.user.role !== 'owner') throw errors.forbidden(`${action}仅组织所有者可执行`);
-}
-
-/** 目标用户之外仍处于启用状态的 owner 数量。 */
-function otherActiveOwners(rc: RequestContext, orgId: string, excludeUserId: string): number {
-  const row = rc.app.db
+function activeSessions(db: RequestContext['app']['db'], userId: string): number {
+  const row = db
     .prepare(
-      `SELECT COUNT(*) AS c FROM users
-        WHERE org_id = ? AND role = 'owner' AND status <> 'disabled' AND id <> ?`,
+      `SELECT COUNT(*) AS c FROM user_sessions
+        WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?`,
     )
-    .get(orgId, excludeUserId) as unknown as { c: number } | undefined;
-  return Number(row?.c ?? 0);
-}
-
-function avatarColorFor(email: string): string {
-  const index = Number.parseInt(sha256(email).slice(0, 8), 16) % TONE_COLORS.length;
-  return TONE_COLORS[index] ?? 'violet';
-}
-
-/** 16 位一次性临时密码（base64url：字母/数字/-/_）。 */
-function temporaryPassword(): string {
-  return randomToken(12);
-}
-
-function deleteSessions(rc: RequestContext, userId: string): void {
-  rc.app.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+    .get(userId, nowIso()) as unknown as { c: number };
+  return row?.c ?? 0;
 }
 
 export function registerOrgRoutes(router: Router): void {
   router.add({
     method: 'GET',
+    path: '/api/org',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const auth = requireConsoleAuth(rc);
+      const row = orgRow(rc);
+      const counts = rc.app.db
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM users WHERE org_id = ?) AS users,
+             (SELECT COUNT(*) FROM partitions WHERE org_id = ?) AS partitions`,
+        )
+        .get(auth.org.id, auth.org.id) as unknown as { users: number; partitions: number };
+      rc.json({ org: toOrg(row), counts });
+    },
+  });
+
+  router.add({
+    method: 'GET',
     path: '/api/org/users',
     auth: 'console',
     handler: (rc: RequestContext) => {
-      const auth = requireOrgAdmin(rc);
-      const users = loadOrgUsers(rc, auth.org.id);
+      const auth = requireConsoleRole(rc, 'admin');
+      const rows = rc.app.db
+        .prepare('SELECT * FROM users WHERE org_id = ? ORDER BY created_at ASC')
+        .all(auth.org.id) as unknown as UserRow[];
+      const users: OrgUser[] = rows.map((row) => ({
+        ...toUser(row),
+        activeSessions: activeSessions(rc.app.db, row.id),
+      }));
       rc.json(users);
     },
   });
@@ -106,61 +72,44 @@ export function registerOrgRoutes(router: Router): void {
     path: '/api/org/users',
     auth: 'console',
     handler: async (rc: RequestContext) => {
-      const auth = requireOrgAdmin(rc);
-      const input = await rc.body(orgUserCreateSchema);
-
-      if (auth.user.role !== 'owner' && (input.role === 'owner' || input.role === 'admin')) {
-        throw errors.forbidden('仅组织所有者可创建管理员或所有者账号');
+      const auth = requireConsoleRole(rc, 'admin');
+      const body = await rc.body(orgUserCreateSchema);
+      if (body.role === 'owner' && auth.user.role !== 'owner') {
+        throw errors.forbidden('只有组织所有者可以创建 owner 账号');
       }
-
-      const existing = rc.app.db
-        .prepare('SELECT id FROM users WHERE lower(email) = lower(?)')
-        .get(input.email) as unknown as { id: string } | undefined;
+      const existing = rc.app.db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(body.email);
       if (existing) throw errors.conflict('该邮箱已被使用');
-
       const id = newId('usr');
-      const createdAt = nowIso();
-      const password = input.password ?? temporaryPassword();
+      const at = nowIso();
+      const temporaryPassword = body.password ?? `${randomToken(9)}${Math.floor(Math.random() * 90 + 10)}`;
       rc.app.db
         .prepare(
           `INSERT INTO users
-             (id, org_id, email, name, role, title, avatar_color, password_hash,
-              status, password_changed_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+             (id, org_id, email, name, role, title, avatar_color, password_hash, status,
+              password_changed_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'violet', ?, 'active', ?, ?)`,
         )
         .run(
           id,
           auth.org.id,
-          input.email,
-          input.name,
-          input.role,
-          input.title ?? null,
-          avatarColorFor(input.email),
-          hashPassword(password),
-          createdAt,
-          createdAt,
+          body.email,
+          body.name,
+          body.role,
+          body.title ?? null,
+          hashPassword(temporaryPassword),
+          at,
+          at,
         );
-
-      const row = loadOrgUser(rc, auth.org.id, id);
-      if (!row) throw errors.internal('用户创建失败');
-      const user = toOrgUser(row);
-
       writeAudit(rc.app.db, {
         orgId: auth.org.id,
         actor: actorForUser(rc, auth.user),
-        action: 'user.create',
+        action: 'org.user_create',
         resourceType: 'user',
-        resourceId: user.id,
-        detail: {
-          email: user.email,
-          name: user.name,
-          role: user.role,
-          title: user.title ?? null,
-          generatedPassword: input.password === undefined,
-        },
+        resourceId: id,
+        detail: { email: body.email, role: body.role },
       });
-
-      rc.json({ user, temporaryPassword: password }, 201);
+      const row = rc.app.db.prepare('SELECT * FROM users WHERE id = ?').get(id) as unknown as UserRow;
+      rc.json({ user: toUser(row), temporaryPassword }, 201);
     },
   });
 
@@ -169,81 +118,34 @@ export function registerOrgRoutes(router: Router): void {
     path: '/api/org/users/:id',
     auth: 'console',
     handler: async (rc: RequestContext) => {
-      const auth = requireOrgAdmin(rc);
-      const userId = rc.params.id ?? '';
-      const input = await rc.body(orgUserUpdateSchema);
-      const target = loadOrgUser(rc, auth.org.id, userId);
-      if (!target) throw errors.notFound('用户不存在');
-
-      const previousRole = target.role as Role;
-      const previousStatus = target.status === 'disabled' ? 'disabled' : 'active';
-      const roleChanged = input.role !== undefined && input.role !== previousRole;
-      const statusChanged = input.status !== undefined && input.status !== previousStatus;
-
-      if (roleChanged) {
-        requireOrgOwner(auth, '修改成员角色');
-        if (target.id === auth.user.id) throw errors.forbidden('不能修改自己的角色');
-        if (previousRole === 'owner' && otherActiveOwners(rc, auth.org.id, target.id) === 0) {
-          throw errors.conflict('至少需要保留一名启用的 owner');
-        }
+      const auth = requireConsoleRole(rc, 'admin');
+      const target = rc.app.db.prepare('SELECT * FROM users WHERE id = ? AND org_id = ?').get(
+        rc.params.id ?? '',
+        auth.org.id,
+      ) as unknown as UserRow | undefined;
+      if (!target) throw errors.notFound('账号不存在');
+      const body = await rc.body(orgUserUpdateSchema);
+      if (target.role === 'owner' && body.role && body.role !== 'owner' && auth.user.role !== 'owner') {
+        throw errors.forbidden('只有组织所有者可以变更 owner 角色');
       }
-
-      if (statusChanged) {
-        requireOrgOwner(auth, '启用或禁用成员');
-        if (target.id === auth.user.id && input.status === 'disabled') {
-          throw errors.forbidden('不能禁用自己的账号');
-        }
-        if (input.status === 'disabled' && previousRole === 'owner' && otherActiveOwners(rc, auth.org.id, target.id) === 0) {
-          throw errors.conflict('至少需要保留一名启用的 owner');
-        }
+      if (body.role === 'owner' && auth.user.role !== 'owner') {
+        throw errors.forbidden('只有组织所有者可以授予 owner 角色');
       }
-
-      const fields: string[] = [];
-      const args: (string | null)[] = [];
-      if (input.name !== undefined) {
-        fields.push('name = ?');
-        args.push(input.name);
+      if (target.id === auth.user.id && body.status === 'disabled') {
+        throw errors.badRequest('不能禁用当前登录账号');
       }
-      if (input.title !== undefined) {
-        fields.push('title = ?');
-        args.push(input.title);
+      const role = body.role ?? target.role;
+      const status = body.status ?? target.status ?? 'active';
+      const name = body.name ?? target.name;
+      const title = body.title !== undefined ? body.title : target.title;
+      rc.app.db
+        .prepare('UPDATE users SET role = ?, status = ?, name = ?, title = ? WHERE id = ?')
+        .run(role, status, name, title, target.id);
+      if (status === 'disabled') {
+        rc.app.db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(target.id);
       }
-      if (input.role !== undefined) {
-        fields.push('role = ?');
-        args.push(input.role);
-      }
-      if (input.status !== undefined) {
-        fields.push('status = ?');
-        args.push(input.status);
-      }
-
-      if (fields.length > 0) {
-        rc.app.db
-          .prepare(`UPDATE users SET ${fields.join(', ')} WHERE id = ? AND org_id = ?`)
-          .run(...args, target.id, auth.org.id);
-      }
-      if (input.status === 'disabled') deleteSessions(rc, target.id);
-
-      const row = loadOrgUser(rc, auth.org.id, target.id);
-      if (!row) throw errors.internal('用户更新失败');
-      const user = toOrgUser(row);
-
-      writeAudit(rc.app.db, {
-        orgId: auth.org.id,
-        actor: actorForUser(rc, auth.user),
-        action: 'user.update',
-        resourceType: 'user',
-        resourceId: user.id,
-        detail: {
-          email: user.email,
-          fields: Object.keys(input),
-          role: { from: previousRole, to: user.role },
-          status: { from: previousStatus, to: user.status },
-          sessionsRevoked: input.status === 'disabled',
-        },
-      });
-
-      rc.json(user);
+      const row = rc.app.db.prepare('SELECT * FROM users WHERE id = ?').get(target.id) as unknown as UserRow;
+      rc.json(toUser(row));
     },
   });
 
@@ -252,58 +154,120 @@ export function registerOrgRoutes(router: Router): void {
     path: '/api/org/users/:id/reset-password',
     auth: 'console',
     handler: (rc: RequestContext) => {
-      const auth = requireOrgAdmin(rc);
-      const userId = rc.params.id ?? '';
-      const target = loadOrgUser(rc, auth.org.id, userId);
-      if (!target) throw errors.notFound('用户不存在');
-      if ((target.role as Role) === 'owner' && auth.user.role !== 'owner') {
-        throw errors.forbidden('仅组织所有者可重置 owner 的密码');
+      const auth = requireConsoleRole(rc, 'admin');
+      const target = rc.app.db.prepare('SELECT * FROM users WHERE id = ? AND org_id = ?').get(
+        rc.params.id ?? '',
+        auth.org.id,
+      ) as unknown as UserRow | undefined;
+      if (!target) throw errors.notFound('账号不存在');
+      if (ROLE_RANK[target.role as keyof typeof ROLE_RANK] > ROLE_RANK[auth.user.role]) {
+        throw errors.forbidden('不能重置更高权限账号的密码');
       }
-
-      const password = temporaryPassword();
+      const temporaryPassword = `${randomToken(9)}${Math.floor(Math.random() * 90 + 10)}`;
       rc.app.db
-        .prepare('UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ? AND org_id = ?')
-        .run(hashPassword(password), nowIso(), target.id, auth.org.id);
-      deleteSessions(rc, target.id);
-
+        .prepare(
+          `UPDATE users SET password_hash = ?, password_changed_at = ?, failed_login_attempts = 0, locked_until = NULL
+            WHERE id = ?`,
+        )
+        .run(hashPassword(temporaryPassword), nowIso(), target.id);
+      rc.app.db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(target.id);
       writeAudit(rc.app.db, {
         orgId: auth.org.id,
         actor: actorForUser(rc, auth.user),
-        action: 'user.reset_password',
+        action: 'org.user_reset_password',
         resourceType: 'user',
         resourceId: target.id,
-        detail: { email: target.email, role: target.role },
+        detail: { email: target.email },
       });
+      rc.json({ userId: target.id, temporaryPassword });
+    },
+  });
 
-      rc.json({ userId: target.id, temporaryPassword: password });
+  /* --- 组织级 API Key（owner） --- */
+  router.add({
+    method: 'GET',
+    path: '/api/org/keys',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const auth = requireConsoleAuth(rc);
+      if (auth.user.role !== 'owner') throw errors.forbidden('组织级 API Key 仅组织所有者可管理');
+      const rows = rc.app.db
+        .prepare(
+          `SELECT * FROM api_keys WHERE org_id = ? AND kind = 'org'
+            ORDER BY (revoked_at IS NULL) DESC, created_at DESC`,
+        )
+        .all(auth.org.id) as unknown as ApiKeyRow[];
+      rc.json(rows.map(toApiKey) satisfies ApiKey[]);
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/org/keys',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const auth = requireConsoleAuth(rc);
+      if (auth.user.role !== 'owner') throw errors.forbidden('组织级 API Key 仅组织所有者可管理');
+      const body = await rc.body(apiKeyCreateSchema);
+      const { secret, prefix, hash } = newApiKeySecret();
+      const id = newId('key');
+      const at = nowIso();
+      rc.app.db
+        .prepare(
+          `INSERT INTO api_keys
+             (id, partition_id, org_id, kind, name, prefix, key_hash, scopes, created_by, created_at,
+              rate_limit_per_min, expires_at, allowed_ips)
+           VALUES (?, NULL, ?, 'org', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          auth.org.id,
+          body.name,
+          prefix,
+          hash,
+          JSON.stringify([...new Set(body.scopes)]),
+          auth.user.id,
+          at,
+          body.rateLimitPerMin ?? 600,
+          body.expiresAt ? new Date(Date.parse(body.expiresAt)).toISOString() : null,
+          JSON.stringify([...new Set(body.allowedIps ?? [])]),
+        );
+      writeAudit(rc.app.db, {
+        orgId: auth.org.id,
+        actor: actorForUser(rc, auth.user),
+        action: 'org.key_create',
+        resourceType: 'api_key',
+        resourceId: id,
+        detail: { name: body.name, scopes: body.scopes },
+      });
+      const row = rc.app.db.prepare('SELECT * FROM api_keys WHERE id = ?').get(id) as unknown as ApiKeyRow;
+      rc.json({ ...toApiKey(row), secret }, 201);
     },
   });
 
   router.add({
     method: 'DELETE',
-    path: '/api/org/users/:id',
+    path: '/api/org/keys/:id',
     auth: 'console',
     handler: (rc: RequestContext) => {
-      const auth = requireOrgAdmin(rc);
-      requireOrgOwner(auth, '删除成员');
-      const userId = rc.params.id ?? '';
-      const target = loadOrgUser(rc, auth.org.id, userId);
-      if (!target) throw errors.notFound('用户不存在');
-      if (target.id === auth.user.id) throw errors.forbidden('不能删除自己的账号');
-      if ((target.role as Role) === 'owner' && otherActiveOwners(rc, auth.org.id, target.id) === 0) {
-        throw errors.conflict('至少需要保留一名启用的 owner');
+      const auth = requireConsoleAuth(rc);
+      if (auth.user.role !== 'owner') throw errors.forbidden('组织级 API Key 仅组织所有者可管理');
+      const row = rc.app.db
+        .prepare("SELECT * FROM api_keys WHERE id = ? AND org_id = ? AND kind = 'org'")
+        .get(rc.params.id ?? '', auth.org.id) as unknown as ApiKeyRow | undefined;
+      if (!row) throw errors.notFound('API Key 不存在');
+      if (!row.revoked_at) {
+        rc.app.db.prepare('UPDATE api_keys SET revoked_at = ? WHERE id = ?').run(nowIso(), row.id);
+        writeAudit(rc.app.db, {
+          orgId: auth.org.id,
+          actor: actorForUser(rc, auth.user),
+          action: 'org.key_revoke',
+          resourceType: 'api_key',
+          resourceId: row.id,
+        });
       }
-
-      writeAudit(rc.app.db, {
-        orgId: auth.org.id,
-        actor: actorForUser(rc, auth.user),
-        action: 'user.delete',
-        resourceType: 'user',
-        resourceId: target.id,
-        detail: { email: target.email, role: target.role },
-      });
-      rc.app.db.prepare('DELETE FROM users WHERE id = ? AND org_id = ?').run(target.id, auth.org.id);
-      rc.json({ ok: true });
+      rc.res.statusCode = 204;
+      rc.res.end();
     },
   });
 }

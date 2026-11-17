@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { DEMO_ACCOUNTS } from '../../../../shared/src/constants.ts';
 import type { AuthResponse } from '../../../../shared/src/types.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { writeAudit } from '../../lib/audit.ts';
@@ -8,7 +7,7 @@ import { hashPassword, verifyPassword } from '../../lib/password.ts';
 import { actorForUser } from '../context.ts';
 import type { RequestContext } from '../context.ts';
 import { toOrg, toUser, type OrgRow, type UserRow } from '../mappers.ts';
-import { requireConsoleAuth, visibleProjects } from '../middleware/auth.ts';
+import { requireConsoleAuth, visiblePartitions } from '../middleware/auth.ts';
 import { HttpError, errors } from '../respond.ts';
 import type { Router } from '../router.ts';
 import type { Env } from '../../env.ts';
@@ -246,7 +245,7 @@ export function registerAuthRoutes(router: Router): void {
 
       rc.app.db
         .prepare(
-          `INSERT INTO sessions (token_hash, user_id, created_at, expires_at, ip, user_agent, last_seen_at)
+          `INSERT INTO user_sessions (token_hash, user_id, created_at, expires_at, ip, user_agent, last_seen_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(sha256(token), row.id, createdAt, expiresAt, rc.ip || null, rc.userAgent || null, createdAt);
@@ -304,10 +303,10 @@ export function registerAuthRoutes(router: Router): void {
 
       if (auth.token && auth.token !== 'auth-disabled') {
         rc.app.db
-          .prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?')
+          .prepare('DELETE FROM user_sessions WHERE user_id = ? AND token_hash <> ?')
           .run(row.id, sha256(auth.token));
       } else {
-        rc.app.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
+        rc.app.db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(row.id);
       }
 
       writeAudit(rc.app.db, {
@@ -330,7 +329,7 @@ export function registerAuthRoutes(router: Router): void {
     handler: (rc: RequestContext) => {
       const auth = rc.auth;
       if (auth && auth.kind === 'user' && auth.token !== 'auth-disabled') {
-        rc.app.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(auth.token));
+        rc.app.db.prepare('DELETE FROM user_sessions WHERE token_hash = ?').run(sha256(auth.token));
         const user = auth.user;
         writeAudit(rc.app.db, {
           orgId: user.orgId,
@@ -354,17 +353,9 @@ export function registerAuthRoutes(router: Router): void {
       rc.json({
         user: auth.user,
         org: auth.org,
-        projects: visibleProjects(rc.app, auth.user),
+        partitions: visiblePartitions(rc.app, auth.user),
       });
     },
   });
 
-  router.add({
-    method: 'GET',
-    path: '/api/auth/demo-accounts',
-    auth: 'none',
-    handler: (rc: RequestContext) => {
-      rc.json(DEMO_ACCOUNTS);
-    },
-  });
 }

@@ -24,7 +24,7 @@ export function resolveRequestId(req: IncomingMessage): string {
 }
 
 export interface RequestTrace {
-  /** 路由模板（如 /api/projects/:id/memories），未匹配时由调用方设为 unmatched/static。 */
+  /** 路由模板（如 /api/partitions/:partition/persons），未匹配时由调用方设为 unmatched/static。 */
   setRoute(route: string): void;
   setActor(actor: string | undefined): void;
   /** SSE 建立后调用：计入 sseClients 仪表，断连时由 close 事件回减。 */

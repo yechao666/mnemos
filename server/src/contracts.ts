@@ -7,11 +7,10 @@ import type {
   OpsMaintenanceResult,
 } from '../../shared/src/types.ts';
 import type { Env } from './env.ts';
-import type { EventBus } from './lib/bus.ts';
 
 export type LogFields = Record<string, unknown>;
 
-/** 结构化日志接口：T1 在 platform/logger.ts 实现。 */
+/** 结构化日志接口：platform/logger.ts 实现。 */
 export interface Logger {
   debug(message: string, fields?: LogFields): void;
   info(message: string, fields?: LogFields): void;
@@ -57,33 +56,23 @@ export interface Platform {
   metrics: Metrics;
   maintenance: MaintenanceController;
   backups: BackupController;
-  /** 关闭定时器、排空 SSE、flush 日志。 */
+  /** 关闭定时器、flush 日志。 */
   shutdown(): Promise<void>;
-}
-
-/** Webhook 投递调度器：由 T1 在 webhooks/ 中实现，main 负责启停。 */
-export interface WebhookDispatcher {
-  start(): void;
-  stop(): void;
-  /** 立即执行一轮（测试/运维用）。 */
-  tickNow(): Promise<void>;
 }
 
 export interface PlatformDeps {
   db: DatabaseSync;
   env: Env;
-  bus: EventBus;
 }
 
 /**
- * 应用上下文：所有传输层（HTTP / SSE / CLI / seed）共享的依赖注入容器。
+ * 应用上下文：所有传输层（HTTP / CLI / seed）共享的依赖注入容器。
  * 由 main.ts 构造，http/server.ts 只消费不构造。
  */
 export interface AppContext {
   db: DatabaseSync;
   engine: MemoryService;
   env: Env;
-  bus: EventBus;
   startedAt: number;
   logger: Logger;
   metrics: Metrics;

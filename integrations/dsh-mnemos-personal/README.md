@@ -1,7 +1,7 @@
 # dsh-mnemos-personal
 
-把本仓库的**新版 Mnemos（中立记忆服务 v5）**接入 [DeepSeek Harness（dsh）](https://github.com/deepseek-ai/deepseek-harness)：
-**以工作区作为分区（Partition）**、**记忆按人（Person）组织**。
+把本仓库的 **Mnemos v6（中立记忆服务）** 接入 [DeepSeek Harness（dsh）](https://github.com/deepseek-ai/deepseek-harness)：
+**以工作区作为分区（Partition）**、**记忆按人（Person）组织**，人 / 记忆列表使用 v6 游标分页。
 
 - **host-only**：没有浏览器半端，设置页用 dsh 的自动表单（导出 `Config` + `.volatile()` 字段）。
 - **8 个 Agent 工具**：工作区绑定、写入、检索、读取、简报、人物上下文、人管理、自检。
@@ -9,7 +9,8 @@
 - **热插拔**：`dsh plugin --profile <name> add link:<本目录>`，不改 dsh 源码。
 - **旧插件不动**：`integrations/dsh-mnemos`（项目级共享记忆 + 任务）保持可用，两者可同时安装（行 id 不同：`dsh-mnemos` / `dsh-mnemos-personal`）。
 
-> 契约来源：`docs/neutral-memory-model.md` 第 5 节（v1 中立 API）、第 8 节（DSH 插件）。
+> 契约来源：`docs/v6-architecture.md` 第 3 节（v6 API）与第 6 节（DSH 插件）。
+> 旧领域（agents / tasks / 任务简报 / 项目记录 / 复盘 / 报告 / webhooks / 图谱）在 v6 已删除，本插件不再调用。
 
 ---
 
@@ -24,14 +25,16 @@
 
 - 工作区解析优先级：会话头 `header.cwd`（创建会话时的原始项目目录，回放稳定、不随 `cd` 漂移）→ `workingDirectory` 服务的当前目录 → 进程启动目录。
 - 首次调用会 `POST /v1/partitions {slug, name}` **幂等建分区**；客户端进程内缓存分区 id，并发调用只发一次 POST；服务端返回 409 时退化为 `GET /v1/partitions/:slug`。
+- 所有 `/v1/partitions/:partition/...` 调用都接受**分区 id 或 slug**（客户端原样使用，服务端两者都支持）。
 - `readOnly=true` 时**不**自动建分区，直接按 slug 直连（读接口仍可用）。
 
 ### 1.2 人 = 记忆主体
 
 - 默认人由配置 `personId`（默认 `dsh-agent`）+ `personType`（默认 `agent`）决定；工具可显式传 `person_id` 读写其他人（App 用户 `human`、智能体 `agent`、服务 `service`）。
 - 写路径（`mnemos_add` / `mnemos_workspace` / `mnemos_person action=upsert`）会先 `PUT /v1/partitions/:p/persons/:externalId` 建档（服务端 lazy upsert）；读路径不产生写副作用。
-- 记忆的 `person_id` 优先写人的**内部 id**（服务端返回 `prs_*`），避免同一 external_id 在不同 type 下的歧义。
+- 写记忆走 v6 人级端点 `POST /v1/partitions/:p/persons/:person/memories`，路径里的人优先用**内部 id**（服务端支持 id 或 external），避免同一 external_id 在不同 type 下的歧义。
 - `scope` 语义：`person`=仅该人；`partition`=分区共享（协作知识）；`session`=仅当前会话（必须带 `session_id`，缺省用当前 DSH 会话 id）。
+- 计数读 **persons 行上的反规范化字段**（`memory_count` / `shared_memory_count` / `session_count` / `last_memory_at`），不逐行查 stats、不做 `COUNT(*)`。
 
 ---
 
@@ -56,14 +59,19 @@
 
 | 工具 | 作用 | 关键参数 | 会写入？ |
 | --- | --- | --- | --- |
-| `mnemos_workspace` | 确保分区 + 默认人存在，返回分区 / 人 / 统计 | 无 | 首次会（建分区 / 建档） |
-| `mnemos_add` | 写记忆（默认原文入库；`infer=true` 走事实抽取） | `text` 或 `messages`、`person_id`（默认 self）、`scope`、`session_id`、`category`、`tags`、`metadata`、`infer` | 是 |
-| `mnemos_search` | 混合检索（默认按人；`scope=partition` 只看分区共享） | `query`、`person_id`、`scope`、`category`、`top_k` | 否 |
-| `mnemos_get` | 传 `id` 取详情；否则按人 / scope / category / page 分页列表 | `id`、`person_id`、`scope`、`category`、`page` | 否 |
-| `mnemos_brief` | 人的简报（最近 person 记忆 + 相关分区共享，压缩文本） | `person_id`（默认 self） | 否 |
+| `mnemos_workspace` | 确保分区 + 默认人存在，返回分区 / 人 / `partition_stats` | 无 | 首次会（建分区 / 建档） |
+| `mnemos_add` | 给默认人（或指定人）写记忆（v6 按原文入库，不做事实抽取） | `text` 或 `messages`、`person_id`（默认 self）、`scope`、`session_id`、`category`、`tags`、`metadata` | 是 |
+| `mnemos_search` | 检索（默认按人；`scope=partition` 只看分区共享），返回带分数结果 | `query`、`person_id`、`scope`、`category`、`top_k` | 否 |
+| `mnemos_get` | 传 `id` 取详情；否则按人 / scope / category 用**游标**列记忆 | `id`、`person_id`、`scope`、`category`、`cursor`、`limit` | 否 |
+| `mnemos_brief` | 人的简报（v6 人级；最近 person 记忆 + 相关分区共享，压缩文本） | `person_id`（默认 self） | 否 |
 | `mnemos_context` | 人的上下文（资料 + 简报 + 相关记忆 + 共享知识），返回可直接注入的 `prompt` | `person_id`（默认 self）、`query` | 否 |
-| `mnemos_person` | `list` / `get` / `upsert` 人 | `action`、`person_id`、`type`、`display_name`、`attributes`、`status`、`q`、`page` | upsert 是 |
+| `mnemos_person` | `list`（**游标**分页）/ `get` / `upsert` 人 | `action`、`person_id`、`type`、`display_name`、`attributes`、`status`、`q`、`cursor`、`limit` | upsert 是 |
 | `mnemos_status` | 连接自检：可达性、分区是否存在、默认人是否存在、key 是否配置（不打印密钥） | 无 | 否 |
+
+**v6 分页协议**：人 / 记忆列表返回 `{ items, next_cursor, partition_stats }`；工具输出里对应
+`results` / `people`、`count`、`next_cursor`、`partition_stats`。要翻页时把上一页的
+`next_cursor` 原样传给下一次调用的 `cursor`；`limit` 默认 50、最大 200。服务端不返回 total
+（百万级不 `COUNT(*)`），头部统计从 `partition_stats` 读。
 
 所有工具的 `execute()` 都**不抛异常**：失败返回 `{ ok: false, error, action }`，`action` 是可直接照着做的下一步
 （检查 orgApiKey / 作用域、先 `mnemos_workspace`、换 `person_id` 等）。
@@ -76,7 +84,7 @@
 Mnemos 记忆系统（dsh-mnemos-personal）：本工作区已绑定分区 ws-demo-1a2b3c4d，记忆按人组织；默认人 dsh-agent（type=agent）。
 使用时机：
 - 开始任务前先调 mnemos_context 取默认人的上下文……
-- ……
+- 想快速了解「关于这个人已知什么」用 mnemos_brief；……用游标翻页列表用 mnemos_get……
 硬性限制：readOnly 模式会拦截记忆写入与人变更；orgApiKey 不要出现在回复里……
 ```
 
@@ -92,16 +100,17 @@ Mnemos 记忆系统（dsh-mnemos-personal）：本工作区已绑定分区 ws-de
 ```bash
 cd /Volumes/wd2025/devel/aiworker/mnemos/integrations/dsh-mnemos-personal
 pnpm install --ignore-workspace   # 独立安装：本目录不在仓库根 pnpm-workspace 里
-pnpm test                         # = pnpm build + node --test test/*.test.mjs
+pnpm build                        # tsc 产出 lib/ + 类型检查
+node --test test/*.test.mjs       # 或 pnpm test（= build + 测试）
 ```
 
 - `pnpm build`：`tsc -p tsconfig.build.json` 产出 `lib/`，再 `tsc -p tsconfig.json --noEmit` 类型检查。
-- `pnpm test`：`node --test` + 本地 `http.createServer` 假 Mnemos（实现 partitions / persons / memories / brief / context 最小响应），**不依赖真实后端**。
-- 测试覆盖：slug 稳定性与不同路径隔离、fixed 模式、默认人、按人隔离、`scope=session` 缺省会话 id、readOnly 拦截、错误归一、brief / context prompt、系统提示文案、设置热更新。
+- 测试：`node --test` + 本地 `http.createServer` **假 Mnemos v6**（实现 partitions / stats / persons 游标列表 / 人级 memories / brief / context / dream / 全局 memories / search），**不依赖真实后端**。
+- 测试覆盖：slug 稳定性与不同路径隔离、fixed 模式、默认人、按人隔离、v6 游标分页（persons / memories）、人级写入路径、分区 id 作为引用、检索主路径与 `GET memories?q=` 退化、`scope=session` 缺省会话 id、readOnly 拦截、错误归一、brief / context prompt、系统提示文案、设置热更新。
 
 ### 5.2 安装到 dsh profile
 
-> 本轮只交付插件包，**尚未安装到任何 profile**（联调安装由 lead 下一轮安排）。
+> 本轮只交付插件包；**尚未安装到 desktop**（统一重装 / 重载由 lead 执行）。
 
 ```bash
 dsh plugin --profile desktop add link:/Volumes/wd2025/devel/aiworker/mnemos/integrations/dsh-mnemos-personal
@@ -114,24 +123,46 @@ dsh plugin --profile desktop add link:/Volumes/wd2025/devel/aiworker/mnemos/inte
 dsh plugin --profile desktop remove dsh-mnemos-personal
 ```
 
+**重载**：本插件是 host-only；重装 / 更新 `lib/` 后在 dsh 里停用再启用该插件（或重启应用）即生效，
+不需要刷新浏览器页面。
+
 ---
 
-## 6. 与 v5 契约的对齐与未验证项
+## 6. 与 v6 契约的对齐与兼容点
 
-已按 `docs/neutral-memory-model.md` 实现：
+已按 `docs/v6-architecture.md` 实现：
 
-- 端点：`POST /v1/partitions`、`GET /v1/partitions/:p`、`PUT/GET /v1/partitions/:p/persons/:externalId`、`GET /v1/partitions/:p/persons`、`GET .../persons/:person`、`GET .../persons/:person/brief`、`POST .../persons/:person/context`、`POST/GET .../memories`、`POST .../memories/search`、`GET .../memories/:id`。
-- 鉴权：`Authorization: Bearer <orgApiKey>`；参数 snake_case；错误体 `{ error: { code, message } }`。
-- 分区 slug 规则、幂等建分区、按人组织、scope/session 语义、readOnly、系统提示。
+- 端点：`POST /v1/partitions`（幂等 upsert）、`GET /v1/partitions/:p`、`GET /v1/partitions/:p/stats`、
+  `GET /v1/partitions/:p/persons`（`cursor/limit/q/type/status/sort`）、`PUT/GET/PATCH .../persons/:person`、
+  `GET/POST .../persons/:person/memories`、`GET .../persons/:person/brief`、`POST .../persons/:person/context`、
+  `GET/POST .../persons/:person/dream[/run]`、`GET/POST/GET-by-id .../memories`、`POST .../memories/search`。
+- 分页协议：所有人 / 记忆列表按 `{ items, next_cursor, partition_stats }` 解析；`limit` 默认 50、上限 200。
+- 计数：分区统计读 `partition_stats`（`/stats`）；人的计数读 persons 行的 `memory_count` 等。
+- 分区引用：`:partition` 支持内部 id 或 slug（客户端原样拼路径）。
+- 鉴权 / 参数：`Authorization: Bearer <orgApiKey>`；JSON snake_case；错误体 `{ error: { code, message } }`。
 
-**待真实后端联调确认**（本轮用假服务验证了插件侧行为，但没有跑真实 Mnemos）：
+**兼容 / 容错点**（对照 v6 后端的 `serialize.ts` / `routes/v1.ts` 实现，两侧都容错）：
 
-1. `POST /v1/partitions` 是否按 slug 幂等 upsert、是否返回 `{ partition: { id, slug, name } }` 形状；本插件同时容忍裸对象 / `partition` 包装 / `project` 包装，且响应缺 id 时补一次 GET。
-2. org key 的权限：建分区需要 admin；若后端对非 admin org key 直接 403，本插件对读工具会「按 slug 直连 + warning」降级，`mnemos_workspace` 则如实报错。
-3. `POST /v1/partitions/:p/memories/search` 的过滤字段：本插件按任务契约发顶层 `query / person_id / scope / category / top_k`；若 P2 后端实际用 `filters.category`，需要对齐一处。
-4. `POST .../memories` 的 `person_id` 是否同时接受内部 id 与 external_id；本插件写路径优先发内部 id、读路径发 external_id。
-5. `brief` / `context` 响应是否包在 `{ brief }` / `{ context }` 里；本插件两者都兼容。
-6. 设置页里 `partitionMode` / `personType` 的 union-of-const 是否渲染成下拉（校验已验证；表单外观未在 GUI 确认）。
+1. **响应形状**：v6 的 partition / person / stats / brief / context / dream 都是裸 snake_case 对象；
+   人级写记忆是 `{ memory, events }`，记忆详情是 `{ memory, person }`，检索是
+   `{ results, took_ms, next_cursor, partition_stats }`。插件同时容忍 `{ partition }` / `{ person }` /
+   `{ items }` / `{ memory }` / `{ stats }` 等包装，并兼容 `next_cursor: null`。
+2. **检索语义**：v6 的检索 = 记忆列表 + `q`（FTS 前缀），其中 `person_id` 是**作者过滤**；
+   `POST .../memories/search` 是 v6 提供的兼容端点，语义相同。因此默认检索（未指定 scope）会查两次
+   —— 本人记忆 + 分区共享 —— 再按 id 去重；`scope=partition` / `scope=person|session` 时单查该范围。
+   专用端点不存在（404 / 405）时自动退化为 `GET .../memories?q=`，两条路径都有测试。
+3. **分页**：`cursor` / `limit`（默认 50、最大 200）与 `sort=recent|new|name` 跟 v6 一致；
+   `next_cursor` 为 null 时不输出，工具只在还有下一页时提示继续翻页。
+4. **分区引用**：`:partition` 支持内部 id 或 slug（客户端原样拼路径，测试覆盖 id）。
+5. **写入人标识**：人级写记忆路径优先用内部 id，服务端同时支持 id 或 external。
+6. **分区统计降级**：`GET /stats` 若 404 / 405（旧服务），`mnemos_workspace` 仍返回分区 / 人并带 warning。
+7. **slug 长度**：v6 slug 上限 48 字符，`ws-<basename>-<hash8>` 的 basename 截断到 36（哈希仍唯一）。
+
+**待真实 v6 后端联调确认**（本轮用假 v6 服务 + 对照 v6 后端实现验证，但没有连真实服务）：
+
+1. 部署后的 v6 服务版本是否已包含 `GET /stats`、人级 memories、`POST .../memories/search` 兼容端点。
+2. org key 是否带 admin（自动建分区）；非 admin 时插件按 slug 直连并带 warning。
+3. 人级 brief 的 `brief_enabled` 设置 / LLM 润色是否可用（插件只读结果，不影响调用）。
 
 ---
 
@@ -147,12 +178,12 @@ integrations/dsh-mnemos-personal/
 ├── src/
 │   ├── config.ts         # Config schema + 默认值 + resolveConfig（解包 volatile）
 │   ├── workspace.ts      # 工作区路径规范化 / slug / 分区推导 / 会话工作区解析
-│   ├── mnemos-client.ts  # /v1/partitions/... 客户端（超时、错误归一、分区/人缓存）
+│   ├── mnemos-client.ts  # v6 `/v1/partitions/...` 客户端（游标分页、超时、错误归一、分区/人缓存）
 │   ├── tools.ts          # 8 个工具（execute 不抛，{ ok, error, action }）
 │   ├── index.ts          # apply：工具 + 动态系统提示 + 设置页
 │   └── dsh-types.d.ts    # 本地最小化 dsh 宿主类型（零 harness 运行时依赖）
 ├── lib/                  # pnpm build 产物（d.ts 声明 + js）
-└── test/                 # node --test（helpers.mjs 起假 Mnemos v5 服务）
+└── test/                 # node --test（helpers.mjs 起假 Mnemos v6 服务）
 ```
 
 ## 8. 已知限制
@@ -160,5 +191,7 @@ integrations/dsh-mnemos-personal/
 - 只支持「一个插件实例 = 一个默认人」；同一会话要读写多个人时显式传 `person_id`（不支持按会话自动切人）。
 - 分区 slug 由路径哈希决定，工作区目录**改名 / 移动**会得到新分区（旧分区数据不迁移）；需要稳定身份时用 `fixed` 模式。
 - 中文目录名的 basename 会被清洗成 `workspace` 兜底段（哈希仍唯一），slug 里看不到中文。
-- 不做「记忆更新 / 删除」（本插件只读 + 追加；v5 的 PATCH/DELETE 留给后续版本）。
+- 工具不暴露「记忆更新 / 删除」（v6 的 PATCH / DELETE 留给后续版本）；`mnemos_person` 也暂不暴露 `update` 动作，
+  但客户端已实现 `PATCH persons/:person`，后续加动作即可。
+- v6 不再做事实抽取：`mnemos_add` 的 `infer` 参数已移除，记忆按原文入库（仍可用 `messages` 多轮内容）。
 - 系统提示段按会话工作区动态求值，会随工作区不同而不同；单会话内 `cd` 不会改变分区（用会话头 cwd）。

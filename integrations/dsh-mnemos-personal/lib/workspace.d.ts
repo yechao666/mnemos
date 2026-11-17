@@ -1,7 +1,7 @@
 /**
  * 分区 = 工作区：把 DSH 会话工作区绝对路径规范化成稳定的 Mnemos 分区 slug。
  *
- * 规则（docs/neutral-memory-model.md §8）：
+ * 规则（docs/v6-architecture.md §6）：
  *   slug = `ws-<basename 小写、去非法字符>-<sha1(规范化绝对路径).slice(0, 8)>`
  *
  * - basename 只用于人可读与调试；唯一性由路径哈希保证（两个同名目录不会撞分区）。

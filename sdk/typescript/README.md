@@ -1,342 +1,248 @@
-# `@mnemos/sdk` — Mnemos TypeScript SDK
+# `@mnemos/sdk`（TypeScript）
 
-Mnemos 官方 TypeScript 客户端：记忆写入、混合检索、**分区 + 人（中立记忆服务 v5）**、Agent 注册表、任务会话与任务简报、记忆简报 / 做梦、图谱 / 统计、导入导出，以及 Webhook（beta）。
+Mnemos v6 官方 TypeScript SDK：**分区（Partition）+ 人（Person）+ 记忆（Memory）** 的中立记忆服务客户端。
 
-- **零运行时依赖**：只用全局 `fetch`、`URL`、`AbortSignal`；
-- **Node ≥18 与浏览器通用**（依赖全局 `fetch`）；
-- **TypeScript 优先**：类型手写在 `src/types.ts`，`dist/` 带 `.d.ts`；
-- 面向 `/v1/*` 公开 API（API Key 鉴权、snake_case 线上契约）；记忆简报 / 做梦 5 个方法走控制台 `/api/*`（会话令牌），入参为 camelCase、出参仍按 SDK 惯例归一化为 snake_case。
+- 面向 `/v1/partitions/:partition/...` 公开 API（API Key 鉴权）；
+- 人 / 记忆列表统一**游标分页**（`{ items, next_cursor, partition_stats }`，不返回 total）；
+- 零运行时依赖，Node ≥18（全局 `fetch`）与现代浏览器通用，ESM；
+- 入参接受 **camelCase 与 snake_case**，统一序列化为 snake_case；响应归一化为 snake_case；
+- 429 / 502 / 503 / 504 与网络错误指数退避重试，尊重 `Retry-After`。
 
-## 安装
+> v6 删除了 v5 的 Agent / 任务 / 任务简报 / Webhook / 图谱等领域，SDK 不再提供对应方法。
+
+---
+
+## 1. 安装
 
 ```bash
-# 发布后
-pnpm add @mnemos/sdk
-# 或 npm install @mnemos/sdk
-
-# 仓库内（SDK 不在 pnpm workspace 中，需要独立安装/链接）
-pnpm add ./sdk/typescript
+pnpm add @mnemos/sdk      # 发布后
+# 或
+pnpm add ./sdk/typescript # 仓库内
 ```
 
-要求 Node ≥18。
+默认服务地址 `http://127.0.0.1:4380`。
 
-## 快速开始
+## 2. 快速开始
 
 ```ts
-import { MnemosApiError, MnemosClient } from '@mnemos/sdk';
+import { MnemosClient } from '@mnemos/sdk';
 
 const client = new MnemosClient({
-  apiKey: 'mnemos_live_demo_atlas_ci', // 演示项目 Atlas
-  baseUrl: 'http://127.0.0.1:4380',    // 默认值
+  apiKey: process.env.MNEMOS_API_KEY!, // mnemos_live_…
+  baseUrl: 'http://127.0.0.1:4380',
 });
 
-// 1. 写入记忆
-const added = await client.memories.add({
-  messages: [{ role: 'user', content: '我是张倩，偏好企业微信联系。' }],
-  userId: 'cust-1042',
-  agentId: 'agent-support-l1',
-  infer: true,
+// 1) 建 / 幂等 upsert 分区（需要 org key + admin 权限）
+const partition = await client.partitions.create({
+  slug: 'ws-demo',
+  name: '演示分区',
+  settings: { defaultScope: 'partition' }, // 也接受 default_scope
 });
 
-// 2. 混合检索
-const hits = await client.memories.search({
-  query: '张倩的联系偏好',
-  userId: 'cust-1042',
-  topK: 5,
-  threshold: 0.2,
+// 2) 建档一个人（App 用户 / 员工 / 智能体都是「人」）
+const person = await client.persons.upsert(partition.slug, 'user-1', {
+  type: 'human',
+  displayName: '周野',
+  attributes: { team: 'core' },
 });
-for (const hit of hits.results) {
-  console.log(hit.score, hit.content); // content 与 memory 是同一个正文
-}
 
-// 3. 任务简报（可直接拼进 system prompt）
-const briefing = await client.context.build({
-  agentId: 'agent-support-l1',
-  query: '客户联系方式偏好',
+// 3) 写一条记忆（person 必填；scope 缺省取分区设置）
+const { memory } = await client.memories.add(partition.slug, person.external_id, {
+  text: '周野偏好用中文写评审意见。',
+  scope: 'partition', // person=仅本人 / partition=分区共享 / session=仅会话
+  category: 'preference',
+  tags: ['偏好'],
+});
+
+// 4) 取人的上下文（资料 + 简报 + 相关记忆 + 分区共享知识，附可注入 prompt）
+const context = await client.personContext(partition.slug, person.external_id, {
+  query: '评审关注点',
   budgetTokens: 800,
 });
-console.log(briefing.prompt);
+console.log(context.prompt);
+
+// 5) 检索
+const hits = await client.memories.search(partition.slug, {
+  query: '评审偏好',
+  personId: person.id,
+  topK: 5,
+});
+console.log(hits.results.map((item) => item.content));
 ```
 
-仓库内可运行示例：
+可运行示例：
 
 ```bash
-node sdk/typescript/examples/basic.ts
-# 可选：MNEMOS_API_KEY=... MNEMOS_BASE_URL=... node sdk/typescript/examples/basic.ts
+MNEMOS_API_KEY=mnemos_live_… node examples/basic.ts
 ```
 
-> 示例直接运行 `src/**/*.ts` 源码，需要 Node 24+ 的原生 TypeScript 支持；
-> Node 18–22 请先 `pnpm exec tsc -p sdk/typescript/tsconfig.json`，再运行 `dist/` 中的 JS。
+## 3. 核心模型
 
-## 客户端配置
+```text
+Partition（App / 项目 / 租户 / 工作区）
+  └── Person（human | agent | service | other）
+        ├── Memory（person_id NOT NULL；scope=person | partition | session）
+        ├── Session（可选分组）
+        └── Brief / Dream（人级）
+Partition 级：统计、密钥、用量、审计
+```
+
+- **记忆永远属于一个人**：写入时 `personId` / `personRef` 必填，没有「无人记忆」。
+- **共享由记忆级 `scope` 决定**：`partition` 分区共享、`person` 仅本人、`session` 仅该会话。
+- **人不是登录账号**：`external_id` 由调用方定义（App 的 user_id、Agent 的 id/name）。
+- 人群列表的计数已反规范化在 `persons` 行上（`memory_count` / `shared_memory_count` / `session_count`），列表页不逐条查统计。
+
+## 4. 客户端选项
 
 ```ts
 const client = new MnemosClient({
-  apiKey: 'mnemos_live_xxx', // 必填，非空
-  baseUrl: 'https://mnemos.example.com', // 默认 http://127.0.0.1:4380
-  timeoutMs: 30_000,         // 单次尝试超时，默认 30s
-  maxRetries: 2,             // 默认 2
-  fetchImpl: fetch,          // 测试/特殊运行时注入
+  apiKey: 'mnemos_live_…',      // 公开 v1：API Key；keys.*：控制台会话 token
+  baseUrl: 'http://127.0.0.1:4380',
+  timeoutMs: 30_000,             // 单次尝试超时
+  maxRetries: 2,                 // 429/5xx/网络错误的最大重试次数
+  fetchImpl: customFetch,        // 可选：测试或特殊运行时
 });
 ```
 
-`baseUrl` 允许带路径前缀（如 `https://host/mnemos`），SDK 保留前缀。
+## 5. API 一览
 
-## API 一览
+### 分区
 
-| 资源 | 方法 |
-| --- | --- |
-| `client.memories` | `add` / `search` / `list` / `get` / `update` / `delete` / `history` / `feedback`；入参可带 `partition` / `personId` / `scope` / `sessionId` 走中立分区端点 |
-| `client.partitions` | `create`（org key 按 slug 幂等建分区） / `get` |
-| `client.persons` | `list` / `get` / `upsert` / `update` / `brief` / `context` / `dream` / `dreamRun`（均以 `partition` + `personRef` 定位） |
-| `client` | `personBrief(partition, personRef, input?)` / `personContext(...)` / `personDream(...)` / `personDreamRun(...)` |
-| `client.tasks` | `list` / `create` / `get` / `finish` |
-| `client.context` | `build` |
-| `client` | `graph(limit?)` / `stats()` / `health()` / `export()` / `import(doc)` / `brief(projectId, params?)` / `updateBriefSettings(projectId, maxChars)` / `dream(projectId)` / `updateDreamSettings(projectId, input)` / `runDream(projectId)` |
-| `client.webhooks` | `list` / `create` / `update` / `delete` / `rotateSecret` / `deliveries` / `replay`（**beta**） |
+| 方法 | 端点 | 说明 |
+| --- | --- | --- |
+| `partitions.list()` | `GET /v1/partitions` | 本组织分区（需 org key） |
+| `partitions.create(input)` | `POST /v1/partitions` | 建 / 幂等 upsert（org key + admin） |
+| `partitions.get(ref)` | `GET /v1/partitions/:p` | 分区信息 + settings |
+| `partitions.update(ref, input)` | `PATCH /v1/partitions/:p` | 名称 / 描述 / 状态 / 设置 |
+| `partitions.stats(ref)` | `GET /v1/partitions/:p/stats` | 统计（直接读 `partition_stats`，O(1)） |
 
-写请求可传第二个参数：
+`:p` 支持内部 id 或 slug。
+
+### 人
+
+| 方法 | 端点 | 说明 |
+| --- | --- | --- |
+| `persons.list(p, query?)` | `GET .../persons` | 游标分页：`cursor` / `limit` / `q` / `type` / `status` / `sort` |
+| `persons.get(p, personRef)` | `GET .../persons/:person` | 详情（内部 id 或 external id） |
+| `persons.upsert(p, externalId, input?)` | `PUT .../persons/:externalId` | 建档 / 更新 |
+| `persons.update(p, personRef, input)` | `PATCH .../persons/:person` | 展示名 / attributes / status |
+
+### 记忆
+
+| 方法 | 端点 | 说明 |
+| --- | --- | --- |
+| `memories.list(p, query?)` | `GET .../memories` | 分区全局列表：`person_id` / `person_external_id` / scope / category / status / q / cursor / limit |
+| `memories.listByPerson(p, personRef, query?)` | `GET .../persons/:person/memories` | 某人的记忆 |
+| `memories.add(p, personRef, input)` | `POST .../persons/:person/memories` | 写入记忆，返回 `{ memory, events }` |
+| `memories.search(p, input)` | `POST .../memories/search` | FTS5 前缀检索，返回 `{ results, took_ms, next_cursor }` |
+| `memories.get(p, id)` | `GET .../memories/:id` | 详情（含 `person`） |
+| `memories.update(p, id, input)` | `PATCH .../memories/:id` | 更新，返回 `{ memory }` |
+| `memories.delete(p, id)` | `DELETE .../memories/:id` | 删除（204） |
+
+### 简报 / 上下文 / 做梦（人级）
+
+| 方法 | 端点 | 说明 |
+| --- | --- | --- |
+| `personBrief(p, personRef, query?)` | `GET .../persons/:person/brief` | 人级简报（`force` / `maxChars`） |
+| `personContext(p, personRef, input?)` | `POST .../persons/:person/context` | 资料 + 简报 + 记忆 + 共享知识 + prompt |
+| `personDream(p, personRef)` | `GET .../persons/:person/dream` | 做梦状态（设置 / 待整理数 / 最近运行） |
+| `personDreamRun(p, personRef, input?)` | `POST .../persons/:person/dream/run` | 手动触发一次增量做梦 |
+
+### 密钥 / 健康检查
+
+| 方法 | 端点 | 说明 |
+| --- | --- | --- |
+| `keys.list(p)` / `keys.create(p, input)` | `/api/partitions/:p/keys` | 分区 key 列表 / 创建 |
+| `keys.rotate(p, keyId, input?)` / `keys.revoke(p, keyId)` | `/api/partitions/:p/keys/:id` | 轮换（旧 key 立即吊销）/ 吊销 |
+| `keys.org.list()` / `keys.org.create(input)` / `keys.org.revoke(id)` | `/api/org/keys` | 组织级 key（仅 owner） |
+| `health()` | `GET /health` | 健康检查（无需鉴权） |
+
+> `keys.*` 走控制台 `/api`，需要把 **控制台会话 token** 作为 `apiKey`；
+> 公开 v1 的分区 / 人 / 记忆 / 简报 / 做梦 / health 才使用 `mnemos_live_*` API Key。
+> 创建 / 轮换响应里的 `secret` 只出现一次，请立即保存。
+
+## 6. 游标分页
 
 ```ts
-await client.memories.add(
-  { text: '必须保留的决策', user_id: 'u-1' },
-  { idempotencyKey: 'memory-add-20261105-0001' },
-);
+let cursor: string | undefined;
+do {
+  const page = await client.persons.list('ws-demo', {
+    type: 'human',
+    status: 'active',
+    sort: 'recent', // recent=最近活跃 / new=最近新建 / name=显示名
+    limit: 50,
+    cursor,
+  });
+  for (const person of page.items) console.log(person.display_name, person.memory_count);
+  console.log('分区统计', page.partition_stats);
+  cursor = page.next_cursor ?? undefined;
+} while (cursor);
 ```
 
-单个请求还可传 `signal`（外部取消）、`timeoutMs`（覆盖超时）、`headers`。
+- `limit` 默认 50、最大 200；`next_cursor=null` 表示没有更多。
+- 列表**不返回 total**，头部统计用 `partition_stats`（来自 `partition_stats` 表，不做 `COUNT(*)`）。
+- `q` 走 FTS5 前缀搜索；空串按索引排序。
 
-### 命名约定
+## 7. 请求约定
 
-- **入参**：以 camelCase 为主（`userId`、`topK`、`includePrivate`），同时接受 snake_case 别名（`user_id`、`top_k`、`include_private`），统一序列化为 snake_case 发送；
-- **出参**：统一归一化为 snake_case（`user_id`、`created_at`、`matched_on`），即使服务端个别接口返回 camelCase；
-- 记忆正文同时暴露 `content` 与 `memory`（服务端列表/检索接口字段名为 `memory`）；
-- 任务简报的 `agent` / `task` 可能为 `null`（未指定时）。
+- **入参命名**：camelCase 为主（`displayName`、`sessionId`、`maxChars`），同时接受 snake_case（`display_name`、`session_id`、`max_chars`）；客户端统一发 snake_case。
+- **响应命名**：统一归一化为 snake_case（`created_at`、`memory_count`、`next_cursor`），控制台 camelCase 响应也一样。
+- **`scope`**：`person` 仅本人 / `partition` 分区共享 / `session` 仅会话（需 `sessionId`）。
+- **重试**：GET、只读检索 POST、PUT/PATCH/DELETE 可安全重试；写记忆 / 做梦 / 建密钥等非只读 POST 不自动重试，避免重复写入。
+- **幂等键**：写请求可传 `{ idempotencyKey }`，每次尝试都会携带同一个 `Idempotency-Key` 头；v6 服务端不持久化幂等记录，请勿依赖它做服务端去重。
+- **`DELETE`**：成功返回 `204`，方法返回 `void`。
 
-## 错误处理
-
-所有失败都抛 `MnemosApiError`：
+## 8. 错误处理
 
 ```ts
+import { MnemosApiError } from '@mnemos/sdk';
+
 try {
-  await client.memories.get('mem_missing');
+  await client.memories.add('ws-demo', 'user-1', { text: '…' });
 } catch (error) {
   if (error instanceof MnemosApiError) {
-    console.error(error.status);    // HTTP 状态；网络/超时为 0
-    console.error(error.code);      // 稳定错误码，比较时建议忽略大小写
-    console.error(error.message);   // 可直接展示的中文文案
-    console.error(error.requestId); // 服务端请求 ID，便于排查
-    console.error(error.details);   // 校验明细等
+    console.error(error.status, error.code, error.message);
+    if (error.requestId) console.error('requestId:', error.requestId);
+    if (error.details) console.error('details:', error.details);
   }
 }
 ```
 
-常见错误码（`docs/api.md`）：
+- 服务端错误：`status` 为 HTTP 状态，`code` 为稳定英文标识（如 `VALIDATION_ERROR`、`NOT_FOUND`、`RATE_LIMITED`）；
+- 网络错误：`status=0`、`code="network_error"`；
+- 超时：`status=0`、`code="timeout"`；
+- 主动取消：`status=0`、`code="aborted"`。
 
-| HTTP | code | 含义 |
-| --- | --- | --- |
-| 400 | `validation_error` | 参数不合法（`details` 带字段明细） |
-| 401 | `unauthorized` | 缺少/无效 API Key |
-| 403 | `forbidden` | 作用域不足（如缺 `memories:write`） |
-| 404 | `not_found` | 资源不存在或不属于该项目 |
-| 409 | `conflict` | 唯一约束 / 幂等键冲突 |
-| 413 | `payload_too_large` | 请求体超过 1 MB |
-| 422 | `unprocessable` | 语义校验失败 |
-| 429 | `rate_limited` | 超出限流或配额 |
-| 500 | `internal_error` | 服务端异常 |
+## 9. 主要类型
 
-> 当前服务端实现返回大写错误码（如 `VALIDATION_ERROR`），SDK 原样透传；建议用 `error.code.toLowerCase()` 比较。
+`Partition` / `PartitionInput` / `PartitionStats` / `PartitionSettings`、
+`Person` / `PersonInput` / `PersonListQuery`、`PersonBrief` / `PersonContext`、
+`Memory` / `MemoryInput` / `MemoryListQuery` / `MemorySearchInput` / `MemoryDetail`、
+`MemoryScope` / `MemoryCategory` / `MemoryStatus`、`CursorPage<T>`、
+`DreamRun` / `DreamStatus` / `DreamResult`、`ApiKey`（别名 `Key`）、
+`Usage` / `Audit` / `HealthResponse`、`MnemosApiError`。
 
-网络错误与超时也使用 `MnemosApiError`：
+`DreamRun` 是 `MemoryDreamRun` 的别名，`DreamResult` 是 `MemoryDreamResult` 的别名。
 
-| 场景 | `status` | `code` |
-| --- | --- | --- |
-| DNS / 连接失败 | `0` | `network_error` |
-| 超时 | `0` | `timeout` |
-| 调用方取消 | `0` | `aborted` |
+## 10. 从 v5 迁移
 
-## 重试语义
-
-默认 `maxRetries = 2`（即最多 3 次尝试）：
-
-- **会重试**：`429`、`502`、`503`、`504`、网络错误与超时；
-- **不会重试**：`400/401/403/404/409/413/422/500` 等确定性错误；
-- 退避：`200ms × 2^attempt` + 最多 50% 抖动；
-- 若响应带 `Retry-After`（秒数或 HTTP 日期），优先按它等待；
-- **非幂等 POST** 只有传入 `idempotencyKey` 才重试；`POST /v1/memories/search` 是只读接口，可安全重试；
-- `GET` / `PUT` / `PATCH` / `DELETE` 默认允许重试；
-- 超时按**单次尝试**计算，重试会重新计时；总耗时最坏约为 `timeoutMs × (maxRetries + 1)` + 退避。
-
-## 幂等键
-
-- 通过 `{ idempotencyKey }` 显式传入，SDK **不会自动生成**（避免无意义的重放语义）；
-- 服务端要求 8–128 字符；相同 key + 相同请求体在 24h 内回放首次响应（带 `x-idempotent-replayed: true`），请求体不同返回 `409 idempotency_conflict`；
-- 重试时复用同一个 key，因此带 key 的写请求是安全的；
-- 适用接口：`POST /v1/memories`、`POST /v1/tasks`、`POST /v1/tasks/{id}/finish` 等写接口。
-
-```ts
-const key = `add-${userId}-${Date.now()}`;
-await client.memories.add({ text: '要落库的事实' }, { idempotencyKey: key });
-// 网络抖动重试 / 人工重放都使用同一个 key
-```
-
-## 可见性参数
-
-记忆支持三档可见性：
-
-| `visibility` | 谁能看到 |
+| v5 | v6 |
 | --- | --- |
-| `project`（默认） | 项目内所有 Agent（共享） |
-| `agent` | 仅写入该记忆的 Agent（`agent_id`） |
-| `task` | 仅当前任务（`task_id`） |
+| `client.memories.add({ user_id })` | `client.memories.add(partition, personRef, input)` |
+| `client.memories.list({ personId })` | `client.memories.list(partition, { personId })` 或 `listByPerson` |
+| `client.agents.*` / `client.tasks.*` | 删除（v6 无 Agent / 任务领域） |
+| `client.context.build()` / `client.brief()` | `client.personContext()` / `client.personBrief()` |
+| `client.graph()` / `client.stats()` / `client.export()` | 删除（图谱 / 项目统计 / 导出不在 v6） |
+| `client.webhooks.*` | 删除 |
+| 页码分页（`page` / `pageSize` / `total`） | 游标分页（`cursor` / `limit` / `next_cursor`） |
 
-检索时的 `agentId` 是**调用方身份**：它决定能看到哪些私有记忆，但不会过滤掉其他 Agent 写入的项目共享记忆。需要看所有 Agent 私有记忆（控制台/审计）时传 `includePrivate: true`（需服务端支持）。
-`writtenByAgentId` 才是“只看某 Agent 写入”的归属过滤。
-
-## 分区 + 人（中立记忆服务 v5）
-
-v5 起记忆以「人（Person）」组织、以「分区（Partition）」隔离。TypeScript SDK 新增：
-
-- `client.partitions.create/get`：建分区（`POST /v1/partitions`，需 **org key** + `admin`）、查分区；
-- `client.persons.*`：人列表 / 详情 / 建档 / 更新 / 人的简报 / 上下文 / 人级做梦状态与触发；
-- `client.memories.*`：入参带 `partition` 时自动走 `/v1/partitions/:p/memories*`；
-  `personId` / `personExternalId` / `scope` / `sessionId` 等中立字段**必须**配合 `partition`
-  （否则 SDK 抛 `TypeError`，避免旧端点静默忽略）；
-- `get/update/delete` 通过 `options.partition` 切换分区端点（`update` 在分区端点用 `PATCH`）；
-  `history` / `feedback` 仅旧 `/v1/memories` 提供（传 `partition` 会抛 `TypeError`）。
-
-```ts
-// org key：可访问 / 创建本组织任意分区
-const client = new MnemosClient({ apiKey: process.env.MNEMOS_ORG_KEY! });
-
-const { partition, created } = await client.partitions.create({ slug: 'zhiwu-app', name: '知物感恩 App' });
-console.log(partition.id, partition.partition_id, created);
-
-// 建档 + 写该人的私有记忆 + 分区共享知识
-await client.persons.upsert(partition.slug, 'user-123', { type: 'human', displayName: '用户 123' });
-await client.memories.add({ partition: partition.slug, text: '用户 123 喜欢黑咖啡', personId: 'user-123', scope: 'person' });
-await client.memories.add({ partition: partition.slug, text: '团队约定：P1 工单 30 分钟首响', scope: 'partition' });
-
-// 按人过滤 + 人的简报 / 上下文 / 做梦
-const page = await client.persons.list(partition.slug, { type: 'human', q: 'user', sort: 'recent' });
-const person = await client.persons.get(partition.slug, 'user-123');
-const mine = await client.memories.list({ partition: partition.slug, personId: 'user-123', scope: 'person' });
-const brief = await client.personBrief(partition.slug, 'user-123', { maxChars: 400 });
-const context = await client.personContext(partition.slug, 'user-123', { query: '咖啡偏好', budgetTokens: 800 });
-console.log(person.stats?.memories, page.count, mine.count, brief.text, context.prompt);
-await client.personDreamRun(partition.slug, 'user-123'); // 该人正在做梦时返回 { run: null, status }
-```
-
-`scope` 三档（旧 `visibility` 自动映射，双方继续双写）：
-
-| `scope` | 谁能看到 | 旧 `visibility` |
-| --- | --- | --- |
-| `person` | 仅该人 | `agent` |
-| `partition`（默认） | 分区内所有调用方 | `project` |
-| `session` | 仅同一 `sessionId`（必须提供） | `task` |
-
-人级简报 = 该人 `scope=person` 记忆 + 与其相关的分区共享记忆；人级做梦只巩固该人的私有新记忆。
-分区端点 `update` 返回 `MemoryMutationResponse`（`memory` 字段为更新后的记忆）；旧端点返回 `{ message }`。
-
-## 导入 / 导出
-
-```ts
-const document = await client.export();   // mnemos-export/v1，已归一化为 SDK 模型
-await client.import(document);            // 自动转回服务端导入格式；≤1000 条/次
-```
-
-`export()` 返回 `ProjectExport`（`memories` / `agents` / `tasks` / `project`），
-`import()` 也接受 `{ memories: [...] }` 形式；导入去重计入 `skipped`。
-
-## Webhook（beta）
-
-服务端 `/v1/webhooks` 已实现，SDK 覆盖完整生命周期（标记 **beta**，字段可能调整）：
-
-```ts
-const hooks = await client.webhooks.list();        // → { results, count }（服务端返回数组）
-const hook = await client.webhooks.create({
-  name: 'CI 回调',
-  url: 'https://ci.example.com/hook',
-  eventTypes: ['memory.created'],                  // 至少订阅一个事件
-});                                               // 响应含一次性明文 secret
-await client.webhooks.update(hook.id, { enabled: false });
-await client.webhooks.delete(hook.id);            // → { message: 'ok', ok: true }
-
-const deliveries = await client.webhooks.deliveries(hook.id, {
-  page: 1,
-  pageSize: 20,
-  status: 'failed',
-});                                               // → { items, page, page_size, total, total_pages }
-
-await client.webhooks.replay('del_xxx');           // POST /v1/webhook-deliveries/{id}/replay
-```
-
-作用域：列表与投递记录需要 `memories:read`；创建 / 更新 / 删除 / 轮换需要 `admin`。
-事件类型：`memory.created`、`memory.updated`、`memory.deleted`、`task.finished`、
-`agent.registered`、`key.created`、`key.revoked`、`quota.exceeded`。
-
-## 记忆简报与做梦（控制台 API）
-
-这 5 个方法对应控制台接口 `/api/projects/{id}/memory/*`，用**控制台会话令牌**鉴权（登录 `/api/auth/login` 拿 `token`），而不是 `mnemos_live_*` API Key；构造客户端时把会话令牌传给 `apiKey` 即可。入参按控制台接口使用 camelCase，响应统一归一化为 snake_case。
-
-```ts
-const consoleClient = new MnemosClient({
-  apiKey: sessionToken, // 控制台会话 token
-  baseUrl: 'http://127.0.0.1:4380',
-});
-const projectId = 'prj_orion_python';
-
-// 读取简报（可临时覆盖字数、跳过缓存）
-const brief = await consoleClient.brief(projectId, { maxChars: 800, force: true });
-console.log(brief.count, brief.max_chars, brief.text);
-
-// 不传 agentId = 审计全量视角（含所有 Agent 私有）；
-// 传 agentId = 该 Agent 实际看到的简报（项目共享 + 其私有，排除其他 Agent 私有）
-const agentBrief = await consoleClient.brief(projectId, { agentId: 'agent-coder' });
-
-// 更新项目简报字符上限（100–5000），返回更新后的简报
-await consoleClient.updateBriefSettings(projectId, 1200);
-
-// 做梦状态 / 设置 / 手动触发
-const status = await consoleClient.dream(projectId);
-console.log(status.pending_count, status.settings.interval_minutes);
-await consoleClient.updateDreamSettings(projectId, { enabled: true, intervalMinutes: 720 });
-const result = await consoleClient.runDream(projectId);
-// 项目正在做梦时返回 409，SDK 返回 { run: null, status }（status 为回读的当前状态）
-if (result.run) console.log(result.run.input_count, result.run.insight_count);
-```
-
-对应的服务端契约、`MemoryBrief` / `MemoryDreamStatus` 字段与 409 说明见 [`docs/api.md`](../../docs/api.md) 的「8.1 记忆简报与做梦」。
-
-## 构建与测试
-
-从仓库根目录执行：
+## 11. 开发与测试
 
 ```bash
-pnpm exec tsc -p sdk/typescript/tsconfig.json   # 构建到 sdk/typescript/dist
-node --test sdk/typescript/test/*.test.ts       # 本地 mock server 测试
+cd sdk/typescript
+npx tsc -p tsconfig.json      # 构建 dist
+node --test test/*.test.ts    # mock fetch，无需启动服务
 ```
 
-测试使用随机端口的 `node:http` mock，覆盖鉴权头、请求体、查询参数、错误映射、幂等键、
-429 / 5xx 重试、`Retry-After`、超时、webhook 路径、记忆简报 / 做梦的控制台端点，以及
-分区 / 人 / 人级简报上下文做梦 / 人级记忆的分区路由，共 21 个用例。
-
-## 版本兼容
-
-- SDK `1.x` 对应 **Mnemos API v1**（`/v1/*`）；v5 的「分区 + 人」为**向后兼容增量**，
-  旧方法签名、旧端点与旧字段保持不变；
-- 同一大版本内只做向后兼容增量（新增可选字段/方法），不会移除已有字段；
-- 服务端新增字段会被忽略，旧字段缺失时提供空值/默认值；
-- `@beta` 标注的 Webhook API 不在兼容性承诺内。
-
-## 目录
-
-```
-sdk/typescript
-├── src/index.ts     # 客户端、传输层、重试与归一化
-├── src/types.ts     # 手写类型（Memory/Person/Partition/Agent/Task/Briefing/SearchHit/Webhook…）
-├── test/client.test.ts
-├── examples/basic.ts
-├── tsconfig.json
-└── package.json
-```
+测试覆盖：v6 端点路径、camelCase→snake_case 请求体、游标查询、响应归一化、
+错误映射、429/5xx 重试、非幂等 POST 不重试、超时与取消。

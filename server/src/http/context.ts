@@ -1,23 +1,14 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ZodTypeAny, z } from 'zod';
-import type { Actor, ApiKey, Org, Project, User } from '../../../shared/src/types.ts';
+import type { Actor, ApiKey, Org, Partition, User } from '../../../shared/src/types.ts';
 import type { AppContext } from '../contracts.ts';
 import { HttpError, errors, sendJson } from './respond.ts';
 
-/** 请求体硬上限 1MB。 */
+/** 请求体硬上限：默认 1MB，可由 env.bodyLimitBytes 覆盖。 */
 export const MAX_BODY_BYTES = 1024 * 1024;
-/** 导入接口单次可携带最多 1000 条记忆，请求体放宽到 8MB。 */
-export const IMPORT_BODY_BYTES = 8 * 1024 * 1024;
-
-const IMPORT_PATH_PATTERN = /^\/(?:v1\/import|api\/projects\/[^/]+\/import)$/;
-
-/** 按路径返回请求体上限：导入接口 8MB，其余 1MB。 */
-export function bodyLimitForPath(pathname: string): number {
-  return IMPORT_PATH_PATTERN.test(pathname) ? IMPORT_BODY_BYTES : MAX_BODY_BYTES;
-}
 
 export interface UsageDraft {
-  projectId: string;
+  partitionId: string;
   operation: string;
   channel: 'console' | 'api' | 'playground' | 'system';
   resultCount: number;
@@ -37,13 +28,10 @@ export interface ConsoleAuth {
 export interface ApiKeyAuth {
   kind: 'api_key';
   key: ApiKey;
-  /**
-   * 钥匙绑定的分区：project key 即自身分区；org key 为创建时选定的锚点分区
-   * （仅用于审计/用量兜底，实际访问的分区由 `/v1/partitions/:partition` 参数解析）。
-   */
-  project: Project;
-  /** org key 所属组织；project key 为空 */
-  org?: Org;
+  /** org key 所属组织（所有 key 都有，便于审计/用量） */
+  org: Org;
+  /** 分区 key 绑定的分区；org key 为空 */
+  partition?: Partition;
 }
 
 export type AuthState = ConsoleAuth | ApiKeyAuth | null;
@@ -60,8 +48,6 @@ export interface RequestContext {
   ip: string;
   userAgent: string;
   auth: AuthState;
-  /** 路由声明 project 元信息时预先载入并校验过的项目 */
-  project: Project | null;
   usage: UsageDraft | null;
   /** 读取并解析 JSON 请求体（缓存，仅允许读一次） */
   readBody(): Promise<unknown>;
@@ -71,8 +57,13 @@ export interface RequestContext {
   query<T extends ZodTypeAny>(schema: T): z.output<T>;
   /** 输出 JSON 响应 */
   json(data: unknown, status?: number): void;
-  /** 登记用量（项目级路由会自动登记，其它路由手动调用） */
-  markUsage(draft: { projectId: string; operation: string; channel?: UsageDraft['channel']; orgId?: string }): void;
+  /** 登记用量（分区级路由建议在 handler 内调用） */
+  markUsage(draft: {
+    partitionId: string;
+    operation: string;
+    channel?: UsageDraft['channel'];
+    orgId?: string;
+  }): void;
   /** 补充本次用量的结果数量与注入 token 数 */
   noteUsage(resultCount?: number, memoryTokens?: number): void;
 }
@@ -129,7 +120,7 @@ export interface CreateContextInput {
 export function createRequestContext(input: CreateContextInput): RequestContext {
   const { app, req, res, url, method, pathname, params, requestId } = input;
   let bodyPromise: Promise<unknown> | null = null;
-  const bodyLimit = bodyLimitForPath(pathname);
+  const bodyLimit = Math.max(MAX_BODY_BYTES, app.env.bodyLimitBytes);
 
   function payloadTooLarge(): HttpError {
     const megabytes = Math.round(bodyLimit / (1024 * 1024));
@@ -172,7 +163,6 @@ export function createRequestContext(input: CreateContextInput): RequestContext 
     ip: clientIp(req),
     userAgent: headerOf(req, 'user-agent') ?? '',
     auth: null,
-    project: null,
     usage: null,
     readBody,
     async body(schema) {
@@ -186,7 +176,7 @@ export function createRequestContext(input: CreateContextInput): RequestContext 
     },
     markUsage(draft) {
       context.usage = {
-        projectId: draft.projectId,
+        partitionId: draft.partitionId,
         operation: draft.operation,
         channel: draft.channel ?? 'console',
         resultCount: 0,
@@ -215,11 +205,11 @@ export function actorForUser(rc: RequestContext, user: User): Actor {
   };
 }
 
-export function actorForApiKey(rc: RequestContext, key: ApiKey, project: Project): Actor {
+export function actorForApiKey(rc: RequestContext, key: ApiKey, partition?: Partition): Actor {
   return {
     type: 'api_key',
     id: key.id,
-    label: `${key.name}（${project.name}）`,
+    label: partition ? `${key.name}（${partition.name}）` : key.name,
     ip: rc.ip || undefined,
     userAgent: rc.userAgent || undefined,
   };

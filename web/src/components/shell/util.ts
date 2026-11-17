@@ -1,8 +1,8 @@
-import { PROJECT_STATUSES, type ProjectStatus } from '@shared';
 import type { Tone } from '@ui';
+import type { PartitionStatus } from '@lib/types.ts';
 
-/** 项目配色：由 id 派生，保证同一项目在侧栏、卡片、顶栏颜色一致。 */
-const PROJECT_TONES: Tone[] = ['violet', 'cyan', 'pink', 'amber', 'lime', 'blue'];
+/** 分区配色：由 id 派生，保证同一分区在侧栏、卡片、顶栏颜色一致。 */
+const PARTITION_TONES: Tone[] = ['violet', 'cyan', 'pink', 'amber', 'lime', 'blue'];
 
 function hashString(value: string): number {
   let hash = 0;
@@ -12,20 +12,32 @@ function hashString(value: string): number {
   return hash;
 }
 
-export function projectTone(seed: string): Tone {
-  return PROJECT_TONES[hashString(seed) % PROJECT_TONES.length] ?? 'violet';
+export function partitionTone(seed: string): Tone {
+  return PARTITION_TONES[hashString(seed) % PARTITION_TONES.length] ?? 'violet';
 }
 
-/** 项目方块的首字：中文取首字，英文取首字母。 */
-export function projectInitial(name: string): string {
+/** 分区方块的首字：中文取首字，英文取首字母。 */
+export function partitionInitial(name: string): string {
   const trimmed = name.trim();
-  if (!trimmed) return '记';
-  const first = Array.from(trimmed)[0] ?? '记';
+  if (!trimmed) return '区';
+  const first = Array.from(trimmed)[0] ?? '区';
   return first.toUpperCase();
 }
 
-export function projectStatusLabel(status: ProjectStatus): string {
-  return PROJECT_STATUSES.find((item) => item.value === status)?.label ?? status;
+const STATUS_LABEL: Record<PartitionStatus, string> = {
+  active: '运行中',
+  paused: '已暂停',
+  archived: '已归档',
+};
+
+export function partitionStatusLabel(status: PartitionStatus | string | undefined): string {
+  return STATUS_LABEL[(status ?? 'active') as PartitionStatus] ?? String(status ?? '—');
+}
+
+export function partitionStatusTone(status: PartitionStatus | string | undefined): Tone {
+  if (status === 'paused') return 'amber';
+  if (status === 'archived') return 'slate';
+  return 'green';
 }
 
 /** slug 生成：仅保留小写字母、数字与连字符（中文名称回退到短哈希）。 */

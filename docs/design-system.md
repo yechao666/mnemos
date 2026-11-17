@@ -1,6 +1,6 @@
 # Mnemos 控制台设计系统
 
-> 本文件是前端三组（Shell / Project Core / Project Ops）共同遵守的唯一视觉与组件契约。
+> 本文件是 Mnemos v6 控制台（信息架构：组织 → 分区 → 人 → 记忆）的视觉与组件约定。
 > **禁止**新增 UI 依赖、**禁止**修改 `web/src/styles/*.css`、`web/src/components/ui/*`、`web/src/components/charts/*`。
 > 需要新样式时：优先用已有类 + 少量 inline style；确需全局样式请在汇报中提出，由 Lead 统一添加。
 
@@ -11,7 +11,7 @@
   - `@shared` → `shared/src/index.ts`（领域类型 + 常量）
   - `@ui` → `web/src/components/ui/index.tsx`（组件库）
   - `@charts` → `web/src/components/charts/index.tsx`（SVG 图表）
-  - `@lib/*` → `web/src/lib/*`（`api.ts` / `auth.tsx` / `hooks.ts` / `format.ts` / `tone.ts` / `project-context.tsx`）
+  - `@lib/*` → `web/src/lib/*`（`api.ts` / `auth.tsx` / `hooks.ts` / `format.ts` / `tone.ts` / `partition-context.tsx` / `types.ts` / `constants.ts`）
 
 ## 2. 视觉语言：Aurora Console
 
@@ -31,7 +31,7 @@
 | `.app-shell` `.app-body` `.app-main` | 外层骨架（AppShell 用） |
 | `.sidebar` `.sidebar.open` `.sidebar-backdrop` `.sidebar-brand` `.brand-mark` `.brand-name` `.brand-sub` | 侧边栏 |
 | `.nav` `.nav-section` `.nav-item` `.nav-item.active` `.nav-badge` `.sidebar-foot` `.usage-meter` `.usage-meter-head` | 导航 |
-| `.topbar` `.crumbs` `.crumb` `.crumb-sep` `.project-switcher` `.ps-trigger` `.ps-avatar` | 顶栏 |
+| `.topbar` `.crumbs` `.crumb` `.crumb-sep` | 顶栏 / 面包屑 |
 | `.popover` `.popover-item` `.popover-item.active` `.popover-label` `.popover-sep` | 下拉面板 |
 | `.search-trigger` `.user-chip` `.user-meta` `.user-name` `.user-role` | 顶栏控件 |
 | `.page` `.page-head` `.page-eyebrow` `.page-title` `.page-desc` `.page-actions` | 页面头 |
@@ -89,7 +89,7 @@ import { useAsync, useDebounced, useInterval } from '@lib/hooks.ts';
 import { useAuth } from '@lib/auth.tsx';
 import { fmtInt, fmtCompact, fmtBytes, fmtMs, fmtRelative, fmtDateTime, fmtDay, fmtPct } from '@lib/format.ts';
 import { toneForCategory, toneForStatus, toneForRole, toneForAction, actionLabel, ROLE_LABEL } from '@lib/tone.ts';
-import { useProjectContext } from '@lib/project-context.tsx';
+import { usePartitionContext } from '@lib/partition-context.tsx';
 ```
 
 - 数据加载统一 `useAsync(() => api.xxx(), [deps])` → `{data, loading, error, refresh}`；加载用 `Skeleton`/`LoadingBlock`，失败用 `ErrorState`，空数据用 `EmptyState`。
@@ -115,6 +115,9 @@ export function XxxPage() {
 ## 8. 质量红线
 
 - 每个页面必须覆盖：加载态、错误态、空态、窄屏布局。
+- 列表页遵循 v6 游标协议（`items/nextCursor/partitionStats`）：人列表用 `WindowedList` 虚拟滚动 +
+  滚动加载，不要一次性拉全量，也不要用 `Pagination` 造 page/total；头部统计读列表响应里的
+  `partitionStats`（或分区上下文），不要另发逐行/全表统计请求。
 - 不使用 `any`；类型来自 `@shared`；不要 `console.log`。
 - 不修改别人负责的文件；先读再写；不要提交 git。
 - 完成后运行 `pnpm --filter @mnemos/web run build` 与

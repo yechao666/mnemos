@@ -1,9 +1,9 @@
-import type { ApiScope, Role } from '../../../shared/src/types.ts';
+import type { ApiScope } from '../../../shared/src/types.ts';
 import type { RequestContext } from './context.ts';
 
 /**
  * 极简路由器：路径分段匹配，支持 `:param` 占位。
- * 不依赖任何第三方框架，满足控制台 / 公开 API 的静态路由需求。
+ * v6 只有分区级资源，路由不再预载「项目」，分区由 handler 用 resolvePartition 解析。
  */
 
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS';
@@ -11,20 +11,13 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 
 export interface RouteMeta {
   /** none = 公开；console = 会话令牌；apikey = 公开 v1 API Key */
   auth: 'none' | 'console' | 'apikey';
-  /** 路径中的项目参数名（默认 id）与所需最低项目角色 */
-  project?: { param?: string; minRole?: Role };
   /** apikey 路由所需 scope（全部满足） */
   scopes?: ApiScope[];
-  /**
-   * 允许组织级 API Key（kind=org）访问。默认 false：org key 只能走 `/v1/partitions/*`
-   * 这类自身带分区参数、由 handler 解析分区的端点，避免隐式落到 key 的锚点分区。
-   */
-  allowOrgKey?: boolean;
-  /** 用量记录：业务操作名 */
+  /** 用量记录：业务操作名（handler 也可自行 markUsage） */
   operation?: string;
   /** 用量记录：渠道 */
   channel?: 'console' | 'api' | 'playground' | 'system';
-  /** 允许从 ?token= 读取会话令牌（SSE 专用） */
+  /** 允许从 ?token= 读取会话令牌 */
   allowQueryToken?: boolean;
 }
 

@@ -4,7 +4,7 @@
  *
  * 配置本身由 dsh 的 settings 提供者持久化，插件不需要自己写存储文件。
  *
- * 新版 Mnemos（中立记忆服务 v5）只认「分区 + 人」两个键：
+ * Mnemos v6 只认「分区 + 人」两个键（契约：docs/v6-architecture.md）：
  * - 分区由 `partitionMode` 决定：`workspace`（默认，DSH 会话工作区规范化成 slug）或 `fixed`；
  * - 人由 `personId` / `personType` 决定，默认 `dsh-agent`（type=agent）。
  */

@@ -1,6 +1,8 @@
 node_modules/
 dist/
 data/
+data-v6/
+.perf/
 .run/
 *.log
 .DS_Store

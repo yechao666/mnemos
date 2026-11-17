@@ -1,7 +1,7 @@
 /**
  * 分区 = 工作区：把 DSH 会话工作区绝对路径规范化成稳定的 Mnemos 分区 slug。
  *
- * 规则（docs/neutral-memory-model.md §8）：
+ * 规则（docs/v6-architecture.md §6）：
  *   slug = `ws-<basename 小写、去非法字符>-<sha1(规范化绝对路径).slice(0, 8)>`
  *
  * - basename 只用于人可读与调试；唯一性由路径哈希保证（两个同名目录不会撞分区）。
@@ -12,8 +12,13 @@ import { createHash } from 'node:crypto';
 import { basename, resolve as resolvePath } from 'node:path';
 /** slug 前缀：明确标识「由工作区派生」，与服务端手工创建的分区区分开。 */
 export const WORKSPACE_SLUG_PREFIX = 'ws-';
-/** basename 允许出现在 slug 里的最大长度（哈希已保证唯一性，名字只求可读）。 */
-const MAX_NAME_LENGTH = 40;
+/**
+ * basename 允许出现在 slug 里的最大长度（哈希已保证唯一性，名字只求可读）。
+ *
+ * 取 36 是为了让 `ws-<segment>-<hash8>` 不超过 v6 的 slug 上限 48 字符
+ * （3 + 36 + 1 + 8 = 48）；basename 更长的目录只是少显示几个字符，哈希仍唯一。
+ */
+const MAX_NAME_LENGTH = 36;
 /** 规范化失败 / 配置缺失时的可操作错误（工具层会转成 `{ ok:false, error, action }`）。 */
 export class WorkspacePathError extends Error {
     /** 本地错误码（与 MnemosApiError 的小写错误码风格一致）。 */

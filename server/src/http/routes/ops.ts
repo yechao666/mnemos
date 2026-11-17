@@ -3,23 +3,20 @@ import { z } from 'zod';
 import { APP_VERSION, ROLE_RANK } from '../../../../shared/src/constants.ts';
 import type { OpsStatus } from '../../../../shared/src/types.ts';
 import { SCHEMA_VERSION, getSchemaVersion, tableCount } from '../../db/index.ts';
-import { parseSettings } from '../mappers.ts';
+import { parseSettings, type PartitionRow } from '../../engine/rows.ts';
 import { requireConsoleAuth, type ConsoleAuth } from '../middleware/auth.ts';
-import { errors, sendError } from '../respond.ts';
+import { errors } from '../respond.ts';
 import type { RequestContext } from '../context.ts';
 import type { Router } from '../router.ts';
 import { startOfUtcMonth } from '../../platform/quota.ts';
 
 /**
  * 运维路由（组织 admin+）：
- *  - GET  /api/ops/status          运行状态快照（DB/WAL、schema、计数、配额、保留期、备份、维护、指标）
- *  - POST /api/ops/maintenance     手动维护（dryRun/vacuum）
- *  - GET  /api/ops/maintenance     维护历史
- *  - POST /api/ops/backup          立即备份
- *  - GET  /api/ops/backups         备份列表
- *  - GET  /api/ops/backups/:file   备份下载（仅文件名，防路径穿越）
- *  - GET  /metrics                 Prometheus 文本（无需鉴权，内网抓取）
- *  - GET  /healthz /readyz         存活 / 就绪探针
+ *  - GET  /healthz /readyz       存活 / 就绪探针
+ *  - GET  /metrics               Prometheus 文本（无需鉴权，内网抓取）
+ *  - GET  /api/ops/status        运行状态快照
+ *  - GET/POST /api/ops/maintenance
+ *  - POST /api/ops/backup / GET /api/ops/backups / GET /api/ops/backups/:file
  */
 
 const maintenanceBodySchema = z.object({
@@ -37,10 +34,6 @@ function requireOpsAdmin(rc: RequestContext): ConsoleAuth {
     throw errors.forbidden('该操作需要组织管理员（admin）及以上角色');
   }
   return auth;
-}
-
-function actorLabel(auth: ConsoleAuth): string {
-  return auth.user.name || auth.user.email;
 }
 
 function fileSize(path: string): number {
@@ -63,90 +56,61 @@ function journalMode(db: RequestContext['app']['db']): string {
   }
 }
 
-interface QuotaSqlRow {
-  id: string;
-  name: string;
-  settings: string;
-  used: number;
-  memories: number;
-}
-
-function quotaTable(db: RequestContext['app']['db'], orgId: string): OpsStatus['quotas'] {
+function quotaTable(rc: RequestContext, partitions: PartitionRow[]): OpsStatus['quotas'] {
   const monthStart = startOfUtcMonth().toISOString();
-  const rows = db
-    .prepare(
-      `SELECT p.id, p.name, p.settings,
-              COALESCE((SELECT SUM(u.memory_tokens) FROM usage_events u
-                         WHERE u.project_id = p.id AND u.created_at >= ?), 0) AS used,
-              (SELECT COUNT(*) FROM memories m
-                WHERE m.project_id = p.id AND m.status = 'active') AS memories
-         FROM projects p
-        WHERE p.org_id = ?
-        ORDER BY p.created_at ASC`,
-    )
-    .all(monthStart, orgId) as unknown as QuotaSqlRow[];
-
-  return rows.map((row) => {
-    const settings = parseSettings(row.settings);
-    const quota = Number(settings.monthlyQuota ?? 0);
-    const used = Number(row.used ?? 0);
-    return {
-      projectId: row.id,
-      name: row.name,
-      usedTokens: used,
-      monthlyQuota: quota,
-      usedPct: quota > 0 ? Math.round((used / quota) * 1_000) / 10 : 0,
-      memories: Number(row.memories ?? 0),
-    };
-  });
-}
-
-interface RetentionSqlRow {
-  id: string;
-  name: string;
-  settings: string;
-}
-
-function retentionTable(db: RequestContext['app']['db'], orgId: string): OpsStatus['retention'] {
-  const rows = db
-    .prepare('SELECT id, name, settings FROM projects WHERE org_id = ? ORDER BY created_at ASC')
-    .all(orgId) as unknown as RetentionSqlRow[];
-
-  return rows.map((row) => {
-    const settings = parseSettings(row.settings);
-    const retentionDays = Number(settings.retentionDays ?? 0);
-    let expiredMemories = 0;
-    if (retentionDays > 0) {
-      const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
-      const counted = db
+  return partitions
+    .map((partition) => {
+      const settings = parseSettings(partition.settings);
+      if (settings.monthlyQuota <= 0) return null;
+      const row = rc.app.db
         .prepare(
-          `SELECT COUNT(*) AS c FROM memories
-            WHERE project_id = ? AND status = 'active' AND created_at < ?`,
+          `SELECT COALESCE(SUM(memory_tokens), 0) AS used FROM usage_events
+            WHERE partition_id = ? AND created_at >= ?`,
         )
-        .get(row.id, cutoff) as unknown as { c: number } | undefined;
-      expiredMemories = counted?.c ?? 0;
-    }
-    return { projectId: row.id, name: row.name, retentionDays, expiredMemories };
-  });
+        .get(partition.id, monthStart) as unknown as { used: number };
+      const memories = rc.app.db
+        .prepare('SELECT COUNT(*) AS c FROM memories WHERE partition_id = ?')
+        .get(partition.id) as unknown as { c: number };
+      const used = row.used;
+      return {
+        partitionId: partition.id,
+        name: partition.name,
+        usedTokens: used,
+        monthlyQuota: settings.monthlyQuota,
+        usedPct: settings.monthlyQuota > 0 ? Math.min(100, Math.round((used / settings.monthlyQuota) * 1000) / 10) : 0,
+        memories: memories.c,
+      };
+    })
+    .filter((row): row is OpsStatus['quotas'][number] => row !== null);
 }
 
-function rawResponse(rc: RequestContext, status: number, contentType: string, body: string): void {
-  rc.res.statusCode = status;
-  rc.res.setHeader('content-type', contentType);
-  rc.res.setHeader('content-length', String(Buffer.byteLength(body)));
-  rc.res.end(rc.req.method === 'HEAD' ? undefined : body);
+function retentionTable(rc: RequestContext, partitions: PartitionRow[]): OpsStatus['retention'] {
+  return partitions
+    .map((partition) => {
+      const settings = parseSettings(partition.settings);
+      if (settings.retentionDays <= 0) return null;
+      const cutoff = new Date(Date.now() - settings.retentionDays * 86_400_000).toISOString();
+      const row = rc.app.db
+        .prepare(
+          "SELECT COUNT(*) AS c FROM memories WHERE partition_id = ? AND status = 'active' AND created_at < ?",
+        )
+        .get(partition.id, cutoff) as unknown as { c: number };
+      return {
+        partitionId: partition.id,
+        name: partition.name,
+        retentionDays: settings.retentionDays,
+        expiredMemories: row.c,
+      };
+    })
+    .filter((row): row is OpsStatus['retention'][number] => row !== null);
 }
 
 export function registerOpsRoutes(router: Router): void {
-  /* ----------------------------- 探针 ----------------------------- */
-
   router.add({
     method: 'GET',
     path: '/healthz',
     auth: 'none',
-    handler: (rc: RequestContext) => {
-      rc.json({ ok: true, status: 'alive', uptimeMs: Date.now() - rc.app.startedAt });
-    },
+    handler: (rc: RequestContext) => rc.json({ ok: true }),
   });
 
   router.add({
@@ -154,93 +118,66 @@ export function registerOpsRoutes(router: Router): void {
     path: '/readyz',
     auth: 'none',
     handler: (rc: RequestContext) => {
-      let dbOk = true;
-      let dbDetail = 'ok';
       try {
         rc.app.db.prepare('SELECT 1 AS ok').get();
-      } catch (error) {
-        dbOk = false;
-        dbDetail = error instanceof Error ? error.message : String(error);
+        rc.json({ ok: true });
+      } catch {
+        rc.json({ ok: false }, 503);
       }
-      const schemaVersion = getSchemaVersion(rc.app.db);
-      const schemaOk = schemaVersion >= SCHEMA_VERSION;
-      const engine = rc.app.engine;
-      const engineOk = typeof engine?.add === 'function' && typeof engine?.search === 'function';
-      const ready = dbOk && schemaOk && engineOk;
-      rc.json(
-        {
-          ok: ready,
-          status: ready ? 'ready' : 'not_ready',
-          version: APP_VERSION,
-          uptimeMs: Date.now() - rc.app.startedAt,
-          checks: {
-            db: { ok: dbOk, detail: dbDetail },
-            schema: { ok: schemaOk, detail: `v${schemaVersion}（期望 v${SCHEMA_VERSION}）` },
-            engine: { ok: engineOk, detail: engineOk ? 'ok' : '引擎不可用' },
-          },
-        },
-        ready ? 200 : 503,
-      );
     },
   });
-
-  /* ----------------------------- 指标 ----------------------------- */
 
   router.add({
     method: 'GET',
     path: '/metrics',
     auth: 'none',
     handler: (rc: RequestContext) => {
-      if (!rc.app.env.metricsEnabled) throw errors.notFound('性能指标端点未启用');
-      rawResponse(rc, 200, 'text/plain; version=0.0.4; charset=utf-8', rc.app.metrics.render());
+      rc.res.statusCode = 200;
+      rc.res.setHeader('content-type', 'text/plain; version=0.0.4; charset=utf-8');
+      rc.res.end(rc.app.metrics.render());
     },
   });
-
-  /* ----------------------------- 状态 ----------------------------- */
 
   router.add({
     method: 'GET',
     path: '/api/ops/status',
     auth: 'console',
     handler: (rc: RequestContext) => {
-      const auth = requireOpsAdmin(rc);
-      const app = rc.app;
-      const dbPath = app.env.dbPath;
+      requireOpsAdmin(rc);
+      const dbPath = rc.app.env.dbPath;
+      const partitions = rc.app.db.prepare('SELECT * FROM partitions ORDER BY created_at ASC').all() as unknown as PartitionRow[];
       const status: OpsStatus = {
         version: APP_VERSION,
         node: process.version,
-        env: app.env.nodeEnv,
-        startedAt: new Date(app.startedAt).toISOString(),
-        uptimeMs: Date.now() - app.startedAt,
+        env: rc.app.env.nodeEnv,
+        startedAt: new Date(rc.app.startedAt).toISOString(),
+        uptimeMs: Date.now() - rc.app.startedAt,
         database: {
           path: dbPath,
           sizeBytes: fileSize(dbPath),
           walSizeBytes: fileSize(`${dbPath}-wal`),
-          schemaVersion: getSchemaVersion(app.db),
-          journalMode: journalMode(app.db),
+          schemaVersion: getSchemaVersion(rc.app.db) || SCHEMA_VERSION,
+          journalMode: journalMode(rc.app.db),
         },
         counts: {
-          orgs: tableCount(app.db, 'orgs'),
-          users: tableCount(app.db, 'users'),
-          projects: tableCount(app.db, 'projects'),
-          memories: tableCount(app.db, 'memories'),
-          agents: tableCount(app.db, 'agents'),
-          tasks: tableCount(app.db, 'tasks'),
-          apiKeys: tableCount(app.db, 'api_keys'),
-          auditEvents: tableCount(app.db, 'audit_logs'),
-          usageEvents: tableCount(app.db, 'usage_events'),
+          orgs: tableCount(rc.app.db, 'orgs'),
+          users: tableCount(rc.app.db, 'users'),
+          partitions: tableCount(rc.app.db, 'partitions'),
+          persons: tableCount(rc.app.db, 'persons'),
+          memories: tableCount(rc.app.db, 'memories'),
+          apiKeys: tableCount(rc.app.db, 'api_keys'),
+          auditEvents: tableCount(rc.app.db, 'audit_logs'),
+          usageEvents: tableCount(rc.app.db, 'usage_events'),
         },
-        quotas: quotaTable(app.db, auth.user.orgId),
-        retention: retentionTable(app.db, auth.user.orgId),
-        backups: app.platform.backups.list(),
-        maintenance: app.platform.maintenance.history(10),
-        metrics: app.platform.metrics.snapshot(),
+        quotas: quotaTable(rc, partitions),
+        retention: retentionTable(rc, partitions),
+        backups: rc.app.platform.backups.list(),
+        maintenance: rc.app.platform.maintenance.history(10),
+        metrics: rc.app.metrics.snapshot(),
       };
       rc.json(status);
     },
   });
-
-  /* ----------------------------- 维护 ----------------------------- */
 
   router.add({
     method: 'POST',
@@ -248,11 +185,8 @@ export function registerOpsRoutes(router: Router): void {
     auth: 'console',
     handler: async (rc: RequestContext) => {
       const auth = requireOpsAdmin(rc);
-      const input = await rc.body(maintenanceBodySchema);
-      const result = await rc.app.platform.maintenance.run(
-        { dryRun: input.dryRun === true, vacuum: input.vacuum === true },
-        actorLabel(auth),
-      );
+      const body = await rc.body(maintenanceBodySchema);
+      const result = await rc.app.platform.maintenance.run(body, auth.user.email);
       rc.json(result);
     },
   });
@@ -268,16 +202,14 @@ export function registerOpsRoutes(router: Router): void {
     },
   });
 
-  /* ----------------------------- 备份 ----------------------------- */
-
   router.add({
     method: 'POST',
     path: '/api/ops/backup',
     auth: 'console',
     handler: async (rc: RequestContext) => {
       const auth = requireOpsAdmin(rc);
-      const info = await rc.app.platform.backups.create('manual', actorLabel(auth));
-      rc.json(info);
+      const info = await rc.app.platform.backups.create('manual', auth.user.email);
+      rc.json(info, 201);
     },
   });
 
@@ -295,46 +227,17 @@ export function registerOpsRoutes(router: Router): void {
     method: 'GET',
     path: '/api/ops/backups/:file',
     auth: 'console',
-    handler: async (rc: RequestContext) => {
+    handler: (rc: RequestContext) => {
       requireOpsAdmin(rc);
-      const fileName = rc.params.file ?? '';
-      const fullPath = rc.app.platform.backups.pathOf(fileName);
-      if (!fullPath) throw errors.notFound('备份文件不存在');
-
-      let size = 0;
-      try {
-        size = statSync(fullPath).size;
-      } catch {
-        throw errors.notFound('备份文件不存在');
-      }
-      const safeName = fileName.replace(/[^A-Za-z0-9._-]/g, '_');
-      const res = rc.res;
-      res.statusCode = 200;
-      res.setHeader('content-type', 'application/octet-stream');
-      res.setHeader('content-disposition', `attachment; filename="${safeName}"`);
-      res.setHeader('content-length', String(size));
-
-      const stream = createReadStream(fullPath);
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const done = (): void => {
-          if (settled) return;
-          settled = true;
-          resolve();
-        };
-        stream.once('error', (error) => {
-          rc.app.logger.error('ops.backup_stream_failed', { file: fileName, error });
-          if (!res.headersSent) {
-            sendError(res, rc.requestId, errors.internal('备份文件读取失败'));
-          } else {
-            res.destroy();
-          }
-          done();
-        });
-        res.once('finish', done);
-        res.once('close', done);
-        stream.pipe(res);
-      });
+      const file = rc.params.file ?? '';
+      const resolved = rc.app.platform.backups.pathOf(file);
+      if (!resolved) throw errors.notFound('备份文件不存在');
+      const stat = statSync(resolved);
+      rc.res.statusCode = 200;
+      rc.res.setHeader('content-type', 'application/octet-stream');
+      rc.res.setHeader('content-length', String(stat.size));
+      rc.res.setHeader('content-disposition', `attachment; filename="${file}"`);
+      createReadStream(resolved).pipe(rc.res);
     },
   });
 }

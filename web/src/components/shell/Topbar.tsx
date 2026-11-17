@@ -1,13 +1,11 @@
 import { useCallback, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { ROLE_LABEL, toneForEventType, toneForRole, toneForStatus } from '@lib/tone.ts';
-import { fmtRelative } from '@lib/format.ts';
+import { ROLE_LABEL, toneForRole } from '@lib/tone.ts';
 import { useAuth } from '@lib/auth.tsx';
 import { useMediaQuery } from '@lib/hooks.ts';
-import { Avatar, Badge, Dropdown, Icon, IconButton, Kbd, useToast } from '@ui';
+import { Avatar, Dropdown, Icon, IconButton, Kbd, useToast } from '@ui';
 import { breadcrumbs } from './nav.ts';
-import { projectInitial, projectTone, projectStatusLabel } from './util.ts';
-import { liveEventLabel, useLiveEvents } from './useLiveEvents.ts';
+import { partitionInitial, partitionStatusTone, partitionTone } from './util.ts';
 import { ChangePasswordModal } from './ChangePasswordModal.tsx';
 
 export interface TopbarProps {
@@ -17,11 +15,11 @@ export interface TopbarProps {
 }
 
 export function Topbar({ onOpenMenu, onToggleSidebar, onOpenPalette }: TopbarProps) {
-  const { projects } = useAuth();
+  const { partitions } = useAuth();
   const location = useLocation();
   const isMobile = useMediaQuery('(max-width: 1024px)');
   const isNarrow = useMediaQuery('(max-width: 720px)');
-  const crumbs = breadcrumbs(location.pathname, projects);
+  const crumbs = breadcrumbs(location.pathname, partitions);
   const visibleCrumbs = isNarrow ? crumbs.slice(-1) : crumbs;
 
   return (
@@ -45,35 +43,37 @@ export function Topbar({ onOpenMenu, onToggleSidebar, onOpenPalette }: TopbarPro
 
       <button type="button" className="search-trigger" onClick={onOpenPalette} aria-label="打开命令面板">
         <Icon name="search" size={14} />
-        <span>搜索页面、项目…</span>
+        <span>搜索页面、分区…</span>
         <Kbd>⌘K</Kbd>
       </button>
 
-      <ProjectSwitcher key={`switcher-${location.pathname}`} compact={isNarrow} />
-      <LiveEventsMenu key="live-events" compact={isNarrow} />
+      <PartitionSwitcher key={`switcher-${location.pathname}`} compact={isNarrow} />
       <UserMenu key={`user-${location.pathname}`} />
     </header>
   );
 }
 
-function ProjectSwitcher({ compact = false }: { compact?: boolean }) {
-  const { projects } = useAuth();
+function PartitionSwitcher({ compact = false }: { compact?: boolean }) {
+  const { partitions } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
-  const match = /^\/projects\/([^/]+)/.exec(location.pathname);
-  const current = match ? projects.find((project) => project.id === match[1]) : undefined;
+  const match = /^\/partitions\/([^/]+)/.exec(location.pathname);
+  const currentId = match?.[1] ? decodeURIComponent(match[1]) : undefined;
+  const current = currentId
+    ? partitions.find((partition) => partition.id === currentId || partition.slug === currentId)
+    : undefined;
 
   return (
     <Dropdown
       align="right"
-      width={compact ? 244 : 276}
+      width={compact ? 244 : 288}
       trigger={
-        <button type="button" className="ps-trigger" aria-label="切换项目">
-          <span className={`ps-avatar tone-${current ? projectTone(current.id) : 'slate'}`}>
-            {current ? projectInitial(current.name) : <Icon name="layers" size={11} />}
+        <button type="button" className="ps-trigger" aria-label="切换分区">
+          <span className={`ps-avatar tone-${current ? partitionTone(current.id) : 'slate'}`}>
+            {current ? partitionInitial(current.name) : <Icon name="layers" size={11} />}
           </span>
           {compact ? null : (
-            <span className="truncate" style={{ maxWidth: 112 }}>{current?.name ?? '全部项目'}</span>
+            <span className="truncate" style={{ maxWidth: 120 }}>{current?.name ?? '全部分区'}</span>
           )}
           <Icon name="chevronDown" size={13} />
         </button>
@@ -81,48 +81,48 @@ function ProjectSwitcher({ compact = false }: { compact?: boolean }) {
     >
       {(close) => (
         <>
-          <div className="popover-label">项目</div>
+          <div className="popover-label">分区</div>
           <button
             type="button"
             className={`popover-item${current ? '' : ' active'}`}
             onClick={() => {
               close();
-              navigate('/projects');
+              navigate('/partitions');
             }}
           >
             <Icon name="layers" size={14} />
-            <span className="grow">全部项目</span>
+            <span className="grow">全部分区</span>
           </button>
-          {projects.length === 0 ? (
-            <div className="tiny dim" style={{ padding: '6px 10px 8px' }}>还没有项目，先创建一个。</div>
+          {partitions.length === 0 ? (
+            <div className="tiny dim" style={{ padding: '6px 10px 8px' }}>还没有分区，先创建一个。</div>
           ) : (
-            projects.slice(0, 8).map((project) => (
+            partitions.slice(0, 10).map((partition) => (
               <button
                 type="button"
-                key={project.id}
-                className={`popover-item${current?.id === project.id ? ' active' : ''}`}
+                key={partition.id}
+                className={`popover-item${current?.id === partition.id ? ' active' : ''}`}
                 onClick={() => {
                   close();
-                  navigate(`/projects/${project.id}`);
+                  navigate(`/partitions/${partition.id}`);
                 }}
               >
-                <span className={`dot tone-${toneForStatus(project.status)}`} aria-hidden="true" />
-                <span className="truncate grow">{project.name}</span>
-                <span className="tiny dim nowrap">{projectStatusLabel(project.status)}</span>
+                <span className={`dot tone-${partitionStatusTone(partition.status)}`} aria-hidden="true" />
+                <span className="truncate grow">{partition.name}</span>
+                <span className="tiny dim nowrap mono">{partition.slug}</span>
               </button>
             ))
           )}
-          {projects.length > 8 ? (
+          {partitions.length > 10 ? (
             <button
               type="button"
               className="popover-item"
               onClick={() => {
                 close();
-                navigate('/projects');
+                navigate('/partitions');
               }}
             >
               <Icon name="arrowRight" size={14} />
-              查看全部 {projects.length} 个项目
+              查看全部 {partitions.length} 个分区
             </button>
           ) : null}
           <div className="popover-sep" />
@@ -131,60 +131,12 @@ function ProjectSwitcher({ compact = false }: { compact?: boolean }) {
             className="popover-item"
             onClick={() => {
               close();
-              navigate('/projects');
+              navigate('/partitions');
             }}
           >
             <Icon name="plus" size={14} />
-            新建项目
+            新建分区
           </button>
-        </>
-      )}
-    </Dropdown>
-  );
-}
-
-function LiveEventsMenu({ compact = false }: { compact?: boolean }) {
-  const location = useLocation();
-  const events = useLiveEvents();
-  const recent = events.slice(0, 5);
-
-  return (
-    <Dropdown
-      key={`live-${location.pathname}`}
-      align="right"
-      width={compact ? 284 : 340}
-      trigger={
-        <button type="button" className="ps-trigger" aria-label="实时事件">
-          <span className={`dot tone-${recent.length > 0 ? 'green' : 'slate'}${recent.length > 0 ? ' dot-pulse' : ''}`} />
-          {compact ? null : <span className="nowrap">实时</span>}
-        </button>
-      }
-    >
-      {() => (
-        <>
-          <div className="between" style={{ padding: '4px 10px 6px' }}>
-            <span className="popover-label" style={{ padding: 0 }}>实时事件</span>
-            <span className="tiny dim">{recent.length > 0 ? `最近 ${recent.length} 条` : '等待中'}</span>
-          </div>
-          {recent.length === 0 ? (
-            <div className="tiny dim" style={{ padding: '8px 10px 10px', lineHeight: 1.6 }}>
-              暂无实时事件。新的记忆写入、检索或密钥操作会在这里出现。
-            </div>
-          ) : (
-            recent.map((event) => (
-              <div key={event.id} className="vstack" style={{ gap: 3, padding: '8px 10px' }}>
-                <div className="hstack gap-6">
-                  <Badge tone={toneForEventType(event.type)} size="sm">{liveEventLabel(event.type)}</Badge>
-                  <span className="tiny dim truncate">{event.actor}</span>
-                  <span className="tiny dim ml-auto nowrap" title={event.at}>{fmtRelative(event.at)}</span>
-                </div>
-                <div className="small truncate" style={{ color: 'var(--text-soft)' }} title={event.summary}>
-                  {event.summary}
-                </div>
-                {event.projectName ? <div className="tiny dim truncate">{event.projectName}</div> : null}
-              </div>
-            ))
-          )}
         </>
       )}
     </Dropdown>
@@ -209,7 +161,7 @@ function UserMenu() {
     <>
       <Dropdown
         align="right"
-        width={228}
+        width={232}
         trigger={
           <button type="button" className="user-chip" aria-label="用户菜单">
             <Avatar name={user.name} tone={toneForRole(user.role)} size="sm" />

@@ -1,5 +1,5 @@
 import type { ServerResponse } from 'node:http';
-import type { Paginated } from '../../../shared/src/types.ts';
+import { EngineError } from '../engine/errors.ts';
 
 /**
  * 统一响应 / 错误模型。
@@ -61,26 +61,29 @@ export const errors = {
   conflict(message: string, details?: unknown): HttpError {
     return new HttpError(409, 'CONFLICT', message, details);
   },
-  payloadTooLarge(): HttpError {
-    return new HttpError(413, 'PAYLOAD_TOO_LARGE', '请求体超过 1MB 上限');
+  payloadTooLarge(message = '请求体超过大小上限'): HttpError {
+    return new HttpError(413, 'PAYLOAD_TOO_LARGE', message);
   },
   rateLimited(message = '请求过于频繁，请稍后重试'): HttpError {
     return new HttpError(429, 'RATE_LIMITED', message);
   },
+  quotaExceeded(message: string, details?: unknown): HttpError {
+    return new HttpError(429, 'QUOTA_EXCEEDED', message, details);
+  },
   internal(message = '服务器内部错误'): HttpError {
     return new HttpError(500, 'INTERNAL_ERROR', message);
-  },
-  engine(message = '记忆引擎处理失败'): HttpError {
-    return new HttpError(500, 'ENGINE_ERROR', message);
   },
   unavailable(message = '服务暂不可用'): HttpError {
     return new HttpError(503, 'SERVICE_UNAVAILABLE', message);
   },
 };
 
-/** 把任意异常规整为 HttpError（未知异常保留原始信息便于排查）。 */
+/** 把任意异常规整为 HttpError（EngineError 保留其状态码与稳定 code）。 */
 export function normalizeError(error: unknown): HttpError {
   if (error instanceof HttpError) return error;
+  if (error instanceof EngineError) {
+    return new HttpError(error.status, error.code, error.message, error.details);
+  }
   if (error instanceof Error) {
     const message = error.message?.trim() || '服务器内部错误';
     return new HttpError(500, 'INTERNAL_ERROR', message, { name: error.name });
@@ -120,7 +123,6 @@ export function sendJson(
 export function sendError(res: ServerResponse, requestId: string, error: unknown): void {
   const httpError = normalizeError(error);
   if (res.headersSent) {
-    // SSE / 文件流已开始输出，无法再写结构化错误，只能结束连接。
     try {
       res.end();
     } catch {
@@ -140,18 +142,6 @@ export function sendError(res: ServerResponse, requestId: string, error: unknown
   if (httpError.status >= 500) {
     console.error(`[http] ${requestId} ${httpError.status} ${httpError.code}: ${httpError.message}`);
   }
-}
-
-/** 构造 Paginated<T>，totalPages 至少为 1，便于前端分页器直接渲染。 */
-export function paginate<T>(items: T[], page: number, pageSize: number, total: number): Paginated<T> {
-  const safePageSize = pageSize > 0 ? pageSize : 20;
-  return {
-    items,
-    page,
-    pageSize: safePageSize,
-    total,
-    totalPages: Math.max(1, Math.ceil(total / safePageSize)),
-  };
 }
 
 /** 线性插值百分位（0..1）。空数组返回 0。 */

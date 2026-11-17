@@ -1,75 +1,75 @@
-/**
- * 记忆做梦调度器：按固定 tick 扫描到期项目并顺序执行增量做梦。
- *
- * - MNEMOS_DREAM_SCHEDULER=0/'' 时直接返回空停止函数（不注册定时器）；
- * - 每轮最多处理 5 个到期项目，busy 时不重入；
- * - 单个项目失败只记 warn，不中断同轮其它项目；
- * - 定时器 unref()，不阻止进程退出。
- */
-
 import type { DatabaseSync } from 'node:sqlite';
-import type { Actor, MemoryService } from '../../../shared/src/types.ts';
-import type { Logger, Metrics } from '../contracts.ts';
-import type { Env } from '../env.ts';
-import { dueDreamProjects } from './dream.ts';
+import type { MemoryService } from '../../../shared/src/types.ts';
+import type { Logger } from '../contracts.ts';
+import { parseSettings, type PartitionRow } from './rows.ts';
 
-export interface DreamSchedulerOptions {
+export interface DreamSchedulerDeps {
   db: DatabaseSync;
-  env: Pick<Env, 'dreamSchedulerEnabled' | 'dreamTickMs'>;
   engine: MemoryService;
   logger: Logger;
-  metrics?: Metrics;
+  /** tick 间隔（毫秒，默认 60s） */
+  tickMs?: number;
 }
 
-const SCHEDULER_ACTOR: Actor = { type: 'system', id: 'dream-scheduler', label: '做梦调度器' };
-const MAX_PROJECTS_PER_TICK = 5;
-const MIN_TICK_MS = 5_000;
-const DEFAULT_TICK_MS = 60_000;
+/**
+ * 分区级做梦调度：按分区的 dreamEnabled / dreamIntervalMinutes 触发。
+ * 单人级不做调度（由人的活跃度驱动，按需 run）。启动后首个 tick 延迟一个周期。
+ */
+export function startDreamScheduler(deps: DreamSchedulerDeps): () => void {
+  const { db, engine, logger } = deps;
+  const tickMs = Math.max(5_000, deps.tickMs ?? 60_000);
+  let ticking = false;
 
-/** 启动调度器，返回停止函数（幂等）。 */
-export function startDreamScheduler(options: DreamSchedulerOptions): () => void {
-  if (!options.env.dreamSchedulerEnabled) return () => {};
-
-  const tickMs = Math.max(MIN_TICK_MS, Math.floor(options.env.dreamTickMs || DEFAULT_TICK_MS));
-  let busy = false;
-  let timer: NodeJS.Timeout | null = null;
-
-  const tick = (): void => {
-    if (busy) return;
-    busy = true;
-    void (async () => {
-      try {
-        const due = dueDreamProjects(options.db).slice(0, MAX_PROJECTS_PER_TICK);
-        for (const projectId of due) {
-          const result = await options.engine.dream({ projectId, trigger: 'schedule' }, SCHEDULER_ACTOR);
-          const run = result.run;
-          if (run?.status === 'completed') {
-            options.metrics?.counter('mnemos_dream_runs_total', { status: 'completed' });
-            options.logger.info('记忆做梦完成', {
-              projectId,
-              inputCount: run.inputCount,
-              insightCount: run.insightCount,
-            });
-          } else if (run?.status === 'failed') {
-            options.metrics?.counter('mnemos_dream_runs_total', { status: 'failed' });
-            options.logger.warn('记忆做梦失败', { projectId, error: run.error });
-          }
+  async function tick(): Promise<void> {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const partitions = db.prepare("SELECT * FROM partitions WHERE status = 'active'").all() as unknown as PartitionRow[];
+      const now = Date.now();
+      for (const partition of partitions) {
+        const settings = parseSettings(partition.settings);
+        if (!settings.dreamEnabled) continue;
+        const last = db
+          .prepare(
+            `SELECT finished_at FROM dream_runs
+              WHERE partition_id = ? AND person_id IS NULL AND status IN ('completed', 'skipped')
+              ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+          )
+          .get(partition.id) as unknown as { finished_at: string | null } | undefined;
+        if (last?.finished_at) {
+          const lastMs = Date.parse(last.finished_at);
+          if (Number.isFinite(lastMs) && now - lastMs < settings.dreamIntervalMinutes * 60_000) continue;
         }
-      } catch (error) {
-        options.logger.warn('做梦调度失败', { error: error instanceof Error ? error.message : String(error) });
-      } finally {
-        busy = false;
+        try {
+          const result = await engine.dream(
+            { partitionId: partition.id, trigger: 'schedule' },
+            { type: 'system', id: 'system', label: '做梦调度' },
+          );
+          if (result.run && result.run.status === 'completed') {
+            logger.info('dream.scheduled_completed', {
+              partitionId: partition.id,
+              runId: result.run.id,
+              inputCount: result.run.inputCount,
+            });
+          }
+        } catch (error) {
+          logger.warn('dream.scheduled_failed', {
+            partitionId: partition.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
-    })();
-  };
+    } catch (error) {
+      logger.warn('dream.scheduler_tick_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      ticking = false;
+    }
+  }
 
-  timer = setInterval(tick, tickMs);
+  const timer = setInterval(() => void tick(), tickMs);
   timer.unref();
 
-  return () => {
-    if (timer) {
-      clearInterval(timer);
-      timer = null;
-    }
-  };
+  return () => clearInterval(timer);
 }

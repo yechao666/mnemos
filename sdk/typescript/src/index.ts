@@ -1,101 +1,52 @@
 /**
- * `@mnemos/sdk` —— Mnemos 官方 TypeScript SDK。
+ * `@mnemos/sdk` —— Mnemos v6 官方 TypeScript SDK。
+ *
+ * v6 只有三个核心：**分区（Partition）+ 人（Person）+ 记忆（Memory）**。
+ * 所有数据端点都在 `/v1/partitions/:partition/...` 下，`:partition` 支持内部 id
+ * 或 slug；人 / 记忆列表统一使用游标分页（`{ items, next_cursor, partition_stats }`）。
  *
  * 设计要点：
  * - 零运行时依赖，Node ≥18（全局 fetch）与浏览器通用；
- * - 请求参数支持 camelCase 别名，统一序列化为 snake_case；
- * - 响应模型统一归一化为 snake_case（兼容服务端不同接口的命名差异）；
+ * - 入参接受 camelCase 与 snake_case，统一序列化为 snake_case；
+ * - 响应统一归一化为 snake_case（含控制台 camelCase 响应）；
  * - 429 / 502 / 503 / 504 与网络错误指数退避重试，尊重 `Retry-After`；
- * - 写请求可传 `idempotencyKey`，重试时复用同一个 `Idempotency-Key`。
+ * - 写请求可传 `idempotencyKey`，重试时复用同一个 `Idempotency-Key`；
+ * - 删除 v5 的 agents / tasks / briefing / webhooks / graph 等领域方法。
  */
 
 import type {
   AddMemoryResponse,
-  Agent,
-  AgentCreateInput,
-  AgentListResponse,
   ApiKey,
-  ApiKeyKind,
-  ApiKeyScope,
-  Briefing,
-  BriefingBrief,
-  ChatMessage,
-  ContextBuildInput,
-  EntityRef,
-  FeedbackInput,
-  GraphData,
-  GraphInput,
-  GraphEdge,
-  GraphNode,
+  CursorPage,
   HealthResponse,
-  ImportDocument,
-  ImportMemoryInput,
-  ImportResult,
+  KeyInput,
+  KeyRotateInput,
   Memory,
-  MemoryAddInput,
   MemoryBrief,
-  MemoryBriefInput,
-  MemoryBriefItem,
   MemoryDetail,
+  MemoryDreamInput,
   MemoryDreamResult,
-  MemoryDreamRun,
-  MemoryDreamRunStatus,
-  MemoryDreamSettings,
-  MemoryDreamSettingsInput,
   MemoryDreamStatus,
-  MemoryDreamTrigger,
-  MemoryEvent,
-  MemoryHistoryEntry,
-  MemoryHistoryResponse,
-  MemoryListInput,
-  MemoryListResponse,
+  MemoryInput,
+  MemoryListQuery,
   MemoryMutationResponse,
-  MemoryScope,
   MemorySearchInput,
   MemoryUpdateInput,
   MnemosClientOptions,
-  MutationResponse,
   Partition,
-  PartitionCreateInput,
-  PartitionCreateResponse,
+  PartitionInput,
+  PartitionSettings,
+  PartitionSettingsInput,
+  PartitionStats,
   Person,
-  PersonBriefInput,
+  PersonBriefQuery,
   PersonContext,
   PersonContextInput,
-  PersonDreamRunInput,
   PersonInput,
-  PersonListInput,
-  PersonListResponse,
-  PersonScope,
-  PersonStats,
-  PersonStatus,
-  PersonType,
+  PersonListQuery,
   PersonUpdateInput,
-  PersonUpsertInput,
-  ProjectExport,
-  ProjectMetrics,
-  Relation,
   RequestOptions,
-  SearchFilters,
-  SearchHit,
   SearchResponse,
-  SignalScores,
-  StatsResponse,
-  Task,
-  TaskCreateInput,
-  TaskFinishInput,
-  TaskFinishResponse,
-  TaskListInput,
-  TaskListResponse,
-  Webhook,
-  WebhookCreateInput,
-  WebhookDelivery,
-  WebhookDeliveryListInput,
-  WebhookDeliveryListResponse,
-  WebhookDeliveryStatus,
-  WebhookEventType,
-  WebhookListResponse,
-  WebhookUpdateInput,
 } from './types.js';
 
 /** SDK 版本。 */
@@ -106,6 +57,10 @@ export const DEFAULT_BASE_URL = 'http://127.0.0.1:4380';
 export const DEFAULT_TIMEOUT_MS = 30_000;
 /** 默认最大重试次数。 */
 export const DEFAULT_MAX_RETRIES = 2;
+/** 游标分页默认条数。 */
+export const DEFAULT_PAGE_LIMIT = 50;
+/** 游标分页最大条数。 */
+export const MAX_PAGE_LIMIT = 200;
 
 /** 可重试的 HTTP 状态码。 */
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
@@ -116,6 +71,55 @@ type JsonRecord = Record<string, unknown>;
 type QueryValue = string | number | boolean | null | undefined;
 type Query = Record<string, QueryValue | QueryValue[]>;
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+/* ------------------------------------------------------------------ */
+/* 枚举常量（归一化兜底用）                                             */
+/* ------------------------------------------------------------------ */
+
+const MEMORY_CATEGORIES = [
+  'preference',
+  'identity',
+  'fact',
+  'plan',
+  'relationship',
+  'event',
+  'skill',
+  'constraint',
+  'context',
+  'insight',
+  'decision',
+  'progress',
+  'lesson',
+  'risk',
+  'change',
+  'acceptance',
+  'assumption',
+  'dependency',
+] as const;
+const MEMORY_SCOPES = ['person', 'partition', 'session'] as const;
+const MEMORY_STATUSES = ['active', 'archived', 'deleted'] as const;
+const MEMORY_SOURCES = ['api', 'conversation', 'agent', 'import', 'playground', 'dream'] as const;
+const PERSON_TYPES = ['human', 'agent', 'service', 'other'] as const;
+const PERSON_STATUSES = ['active', 'archived', 'deleted'] as const;
+const PERSON_SORTS = ['recent', 'new', 'name'] as const;
+const PARTITION_STATUSES = ['active', 'paused', 'archived'] as const;
+const DREAM_RUN_STATUSES = ['running', 'completed', 'skipped', 'failed'] as const;
+const DREAM_TRIGGERS = ['manual', 'schedule'] as const;
+const API_SCOPES = ['memories:read', 'memories:write', 'admin'] as const;
+const API_KEY_KINDS = ['partition', 'org'] as const;
+
+/** 分区设置缺省值（与 shared 常量保持一致）。 */
+const DEFAULT_SETTINGS: PartitionSettings = {
+  default_scope: 'partition',
+  brief_max_chars: 1200,
+  brief_enabled: true,
+  dream_enabled: true,
+  dream_interval_minutes: 1440,
+  retention_days: 0,
+  monthly_quota: 0,
+  person_auto_create: true,
+  locale: 'zh-CN',
+};
 
 /* ------------------------------------------------------------------ */
 /* 错误                                                                */
@@ -141,7 +145,7 @@ export interface MnemosApiErrorInit {
 export class MnemosApiError extends Error {
   /** HTTP 状态码；网络/超时为 0。 */
   readonly status: number;
-  /** 稳定错误码，例如 `validation_error`、`rate_limited`。 */
+  /** 稳定错误码，例如 `VALIDATION_ERROR`、`RATE_LIMITED`。 */
   readonly code: string;
   /** 服务端请求 ID（响应头 `x-request-id` 兜底）。 */
   readonly requestId: string | null;
@@ -183,7 +187,9 @@ function asString(value: unknown, fallback = ''): string {
 }
 
 function asNullableString(value: unknown): string | null {
-  return typeof value === 'string' ? value : null;
+  if (typeof value === 'string') return value;
+  if (value === null) return null;
+  return null;
 }
 
 function asNumber(value: unknown, fallback = 0): number {
@@ -198,10 +204,15 @@ function asStringArray(value: unknown): string[] {
   return asArray(value).filter((item): item is string => typeof item === 'string');
 }
 
+function asRecordOf(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
+}
+
 function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
   return typeof value === 'string' && (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
 }
 
+/** 读取字段：优先主名，其次兼容别名。 */
 function pick<T>(primary: T | undefined, alias: T | undefined): T | undefined {
   return primary !== undefined ? primary : alias;
 }
@@ -274,784 +285,342 @@ function buildQuery(query: Query | undefined): string {
   return text === '' ? '' : `?${text}`;
 }
 
+function encodeRef(value: string): string {
+  return encodeURIComponent(value);
+}
+
+/** 校验分页 limit（1–200）；不传时服务端默认 50。 */
+function assertLimit(limit: number | undefined): number | undefined {
+  if (limit === undefined) return undefined;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE_LIMIT) {
+    throw new TypeError(`limit 必须是 1–${MAX_PAGE_LIMIT} 的整数`);
+  }
+  return limit;
+}
+
+/** PATCH 请求体不能为空。 */
+function assertPatchBody(action: string, body: JsonRecord): JsonRecord {
+  if (Object.keys(body).length === 0) {
+    throw new TypeError(`${action}: 至少提供一个待更新字段`);
+  }
+  return body;
+}
+
 /* ------------------------------------------------------------------ */
 /* 响应归一化                                                          */
 /* ------------------------------------------------------------------ */
 
-const MEMORY_CATEGORIES = [
-  'preference',
-  'identity',
-  'fact',
-  'plan',
-  'relationship',
-  'event',
-  'skill',
-  'constraint',
-  'context',
-  'insight',
-  'decision',
-  'progress',
-  'lesson',
-  'risk',
-  'change',
-  'acceptance',
-  'assumption',
-  'dependency',
-] as const;
-const VISIBILITIES = ['project', 'agent', 'task'] as const;
-const MEMORY_SCOPES = ['person', 'partition', 'session'] as const;
-const PERSON_TYPES = ['human', 'agent', 'service', 'other'] as const;
-const PERSON_STATUSES = ['active', 'archived', 'deleted'] as const;
-const MEMORY_STATUSES = ['active', 'archived', 'deleted'] as const;
-const MEMORY_SOURCES = ['conversation', 'api', 'agent', 'import', 'playground', 'dream'] as const;
-const MEMORY_EVENTS = ['ADD', 'UPDATE', 'DELETE', 'MERGE', 'NOOP'] as const;
-const AGENT_STATUSES = ['active', 'idle', 'retired'] as const;
-const TASK_STATUSES = ['open', 'active', 'done', 'abandoned'] as const;
-const DREAM_RUN_STATUSES = ['running', 'completed', 'skipped', 'failed'] as const;
-const DREAM_TRIGGERS = ['schedule', 'manual'] as const;
-const WEBHOOK_EVENT_TYPES = [
-  'memory.created',
-  'memory.updated',
-  'memory.deleted',
-  'task.finished',
-  'agent.registered',
-  'key.created',
-  'key.revoked',
-  'quota.exceeded',
-] as const;
-const WEBHOOK_DELIVERY_STATUSES = ['pending', 'delivering', 'success', 'failed', 'dead'] as const;
-const SECTION_KEYS = [
-  'project',
-  'conventions',
-  'decisions',
-  'experience',
-  'incidents',
-  'agent_notes',
-  'open_tasks',
-] as const;
-
-function normalizeSignals(value: unknown): SignalScores {
-  const record = asRecord(value);
+function normalizeSettings(value: unknown): PartitionSettings {
+  const raw = asRecord(value);
   return {
-    semantic: asNumber(record.semantic),
-    keyword: asNumber(record.keyword),
-    entity: asNumber(record.entity),
-    recency: asNumber(record.recency),
-    importance: asNumber(record.importance),
-  };
-}
-
-function normalizeMemory(value: unknown): Memory {
-  const record = asRecord(value);
-  const content = asString(record.content, asString(record.memory));
-  return {
-    id: asString(record.id),
-    content,
-    memory: asString(record.memory, content),
-    project_id: asNullableString(record.project_id ?? record.projectId),
-    partition_id: asNullableString(record.partition_id ?? record.partitionId ?? record.project_id ?? record.projectId),
-    person_id: asNullableString(record.person_id ?? record.personId),
-    person_external_id: asNullableString(record.person_external_id ?? record.personExternalId),
-    actor_person_id: asNullableString(record.actor_person_id ?? record.actorPersonId),
-    scope: oneOf(record.scope, MEMORY_SCOPES, visibilityScopeFallback(record.visibility)),
-    session_id: asNullableString(record.session_id ?? record.sessionId),
-    user_id: asNullableString(record.user_id ?? record.userId),
-    agent_id: asNullableString(record.agent_id ?? record.agentId),
-    run_id: asNullableString(record.run_id ?? record.runId),
-    app_id: asNullableString(record.app_id ?? record.appId),
-    task_id: asNullableString(record.task_id ?? record.taskId),
-    visibility: oneOf(record.visibility, VISIBILITIES, 'project'),
-    category: oneOf(record.category, MEMORY_CATEGORIES, 'fact'),
-    importance: asNumber(record.importance),
-    confidence: asNumber(record.confidence),
-    source: oneOf(record.source, MEMORY_SOURCES, 'api'),
-    status: oneOf(record.status, MEMORY_STATUSES, 'active'),
-    tags: asStringArray(record.tags),
-    metadata: asRecord(record.metadata),
-    created_at: asString(record.created_at, asString(record.createdAt)),
-    updated_at: asString(record.updated_at, asString(record.updatedAt)),
-    last_accessed_at: asNullableString(record.last_accessed_at ?? record.lastAccessedAt),
-    access_count: asNumber(record.access_count, asNumber(record.accessCount)),
-    expires_at: asNullableString(record.expires_at ?? record.expiresAt),
-  };
-}
-
-/** 旧 `visibility` → 新 `scope` 的兜底映射（服务端未返回 scope 时）。 */
-function visibilityScopeFallback(visibility: unknown): MemoryScope {
-  if (visibility === 'agent') return 'person';
-  if (visibility === 'task') return 'session';
-  return 'partition';
-}
-
-function normalizeHit(value: unknown): SearchHit {
-  const record = asRecord(value);
-  return {
-    ...normalizeMemory(record),
-    score: asNumber(record.score),
-    signals: normalizeSignals(record.signals),
-    matched_on: asStringArray(record.matched_on ?? record.matchedOn),
-    entities: asStringArray(record.entities),
-  };
-}
-
-function normalizeEvent(value: unknown): MemoryEvent {
-  const record = asRecord(value);
-  return {
-    type: oneOf(record.type, MEMORY_EVENTS, 'ADD'),
-    memory_id: asNullableString(record.memory_id ?? record.memoryId),
-    content: asString(record.content),
-    reason: asNullableString(record.reason) ?? undefined,
-    at: asString(record.at),
-  };
-}
-
-function normalizeHistoryEntry(value: unknown): MemoryHistoryEntry {
-  const record = asRecord(value);
-  return {
-    id: asString(record.id),
-    memory_id: asString(record.memory_id, asString(record.memoryId)),
-    event: oneOf(record.event, MEMORY_EVENTS, 'UPDATE'),
-    old_content: asNullableString(record.old_content ?? record.old_memory ?? record.oldContent),
-    new_content: asNullableString(record.new_content ?? record.new_memory ?? record.newContent),
-    actor: asString(record.actor),
-    reason: asNullableString(record.reason),
-    created_at: asString(record.created_at, asString(record.createdAt)),
-    meta: asRecord(record.meta),
-  };
-}
-
-function normalizeEntity(value: unknown): EntityRef {
-  const record = asRecord(value);
-  return {
-    id: asString(record.id),
-    name: asString(record.name),
-    type: asString(record.type),
-    mention_count: asNumber(record.mention_count, asNumber(record.mentionCount)),
-  };
-}
-
-function normalizeRelation(value: unknown): Relation {
-  const record = asRecord(value);
-  return {
-    id: asString(record.id),
-    source_entity_id: asString(record.source_entity_id, asString(record.sourceEntityId)),
-    target_entity_id: asString(record.target_entity_id, asString(record.targetEntityId)),
-    relation: asString(record.relation),
-    memory_id: asNullableString(record.memory_id ?? record.memoryId),
-    weight: asNumber(record.weight),
-    created_at: asString(record.created_at, asString(record.createdAt)),
-  };
-}
-
-function normalizeAgent(value: unknown): Agent {
-  const record = asRecord(value);
-  const stats = asRecord(record.stats);
-  return {
-    id: asString(record.id),
-    project_id: asString(record.project_id, asString(record.projectId)),
-    name: asString(record.name),
-    role: asString(record.role),
-    model: asString(record.model),
-    description: asString(record.description),
-    capabilities: asStringArray(record.capabilities),
-    status: oneOf(record.status, AGENT_STATUSES, 'active'),
-    metadata: asRecord(record.metadata),
-    created_at: asString(record.created_at, asString(record.createdAt)),
-    last_active_at: asNullableString(record.last_active_at ?? record.lastActiveAt),
-    stats: {
-      memories: asNumber(stats.memories),
-      private_memories: asNumber(stats.private_memories, asNumber(stats.privateMemories)),
-      tasks: asNumber(stats.tasks),
-      last_task_at: asNullableString(stats.last_task_at ?? stats.lastTaskAt),
-    },
-  };
-}
-
-function normalizeTask(value: unknown): Task {
-  const record = asRecord(value);
-  return {
-    id: asString(record.id),
-    project_id: asString(record.project_id, asString(record.projectId)),
-    title: asString(record.title),
-    goal: asString(record.goal),
-    status: oneOf(record.status, TASK_STATUSES, 'open'),
-    owner_agent_id: asNullableString(record.owner_agent_id ?? record.ownerAgentId),
-    owner_agent_name: asNullableString(record.owner_agent_name ?? record.ownerAgentName),
-    branch: asNullableString(record.branch),
-    summary: asNullableString(record.summary),
-    metadata: asRecord(record.metadata),
-    created_at: asString(record.created_at, asString(record.createdAt)),
-    started_at: asString(record.started_at, asString(record.startedAt)),
-    ended_at: asNullableString(record.ended_at ?? record.endedAt),
-    memory_count: asNumber(record.memory_count, asNumber(record.memoryCount)),
-    agent_count: asNumber(record.agent_count, asNumber(record.agentCount)),
-  };
-}
-
-function normalizeBriefing(value: unknown): Briefing {
-  const record = asRecord(value);
-  const project = asRecord(record.project);
-  const briefing: Briefing = {
-    project: {
-      id: asString(project.id),
-      name: asString(project.name),
-      description: asString(project.description),
-    },
-    agent: isRecord(record.agent) ? normalizeAgent(record.agent) : null,
-    task: isRecord(record.task) ? normalizeTask(record.task) : null,
-    sections: asArray(record.sections).map((section) => {
-      const item = asRecord(section);
-      return {
-        key: oneOf(item.key, SECTION_KEYS, 'project'),
-        title: asString(item.title),
-        description: asString(item.description),
-        hits: asArray(item.hits).map(normalizeHit),
-      };
-    }),
-    prompt: asString(record.prompt),
-    token_estimate: asNumber(record.token_estimate, asNumber(record.tokenEstimate)),
-    citations: asStringArray(record.citations),
-    built_at: asString(record.built_at, asString(record.builtAt)),
-    took_ms: asNumber(record.took_ms, asNumber(record.tookMs)),
-  };
-  if (isRecord(record.brief)) briefing.brief = normalizeBriefingBrief(record.brief);
-  return briefing;
-}
-
-function normalizeBriefingBrief(value: unknown): BriefingBrief {
-  const record = asRecord(value);
-  return {
-    text: asString(record.text),
-    max_chars: asNumber(record.max_chars, asNumber(record.maxChars)),
-    count: asNumber(record.count),
-  };
-}
-
-function normalizeBriefItem(value: unknown): MemoryBriefItem {
-  const record = asRecord(value);
-  const item: MemoryBriefItem = {
-    id: asString(record.id),
-    content: asString(record.content, asString(record.memory)),
-    category: oneOf(record.category, MEMORY_CATEGORIES, 'fact'),
-    importance: asNumber(record.importance),
-    updated_at: asString(record.updated_at, asString(record.updatedAt)),
-  };
-  const taskId = asNullableString(record.task_id ?? record.taskId);
-  if (taskId) item.task_id = taskId;
-  const agentId = asNullableString(record.agent_id ?? record.agentId);
-  if (agentId) item.agent_id = agentId;
-  const personId = asNullableString(record.person_id ?? record.personId);
-  if (personId) item.person_id = personId;
-  const personExternalId = asNullableString(record.person_external_id ?? record.personExternalId);
-  if (personExternalId) item.person_external_id = personExternalId;
-  const scope = record.scope;
-  if (typeof scope === 'string' && (MEMORY_SCOPES as readonly string[]).includes(scope)) {
-    item.scope = scope as MemoryScope;
-  }
-  return item;
-}
-
-/** 归一化记忆简报；兼容控制台 `{ brief: … }` 包装。 */
-function normalizeBrief(value: unknown): MemoryBrief {
-  const record = asRecord(value);
-  const brief = isRecord(record.brief) ? record.brief : record;
-  const normalized: MemoryBrief = {
-    project_id: asString(brief.project_id, asString(brief.projectId, asString(record.projectId))),
-    text: asString(brief.text),
-    max_chars: asNumber(brief.max_chars, asNumber(brief.maxChars, asNumber(record.maxChars))),
-    count: asNumber(brief.count),
-    model: asString(brief.model),
-    cached: asBoolean(brief.cached),
-    generated_at: asString(brief.generated_at, asString(brief.generatedAt)),
-    recent: asArray(brief.recent).map(normalizeBriefItem),
-  };
-  const partitionId = asNullableString(brief.partition_id ?? brief.partitionId);
-  if (partitionId) normalized.partition_id = partitionId;
-  if ('person_id' in brief || 'personId' in brief) {
-    normalized.person_id = asNullableString(brief.person_id ?? brief.personId);
-  }
-  return normalized;
-}
-
-function normalizeDreamRun(value: unknown): MemoryDreamRun {
-  const record = asRecord(value);
-  const run: MemoryDreamRun = {
-    id: asString(record.id),
-    project_id: asString(record.project_id, asString(record.projectId)),
-    trigger: oneOf(record.trigger, DREAM_TRIGGERS, 'manual'),
-    status: oneOf(record.status, DREAM_RUN_STATUSES, 'completed'),
-    input_count: asNumber(record.input_count, asNumber(record.inputCount)),
-    insight_count: asNumber(record.insight_count, asNumber(record.insightCount)),
-    started_at: asString(record.started_at, asString(record.startedAt)),
-  };
-  const partitionId = asNullableString(record.partition_id ?? record.partitionId);
-  if (partitionId) run.partition_id = partitionId;
-  if ('person_id' in record || 'personId' in record) {
-    run.person_id = asNullableString(record.person_id ?? record.personId);
-  }
-  const summary = asNullableString(record.summary);
-  if (summary) run.summary = summary;
-  const error = asNullableString(record.error);
-  if (error) run.error = error;
-  const finishedAt = asNullableString(record.finished_at ?? record.finishedAt);
-  if (finishedAt) run.finished_at = finishedAt;
-  return run;
-}
-
-function normalizeDreamSettings(value: unknown): MemoryDreamSettings {
-  const record = asRecord(value);
-  const settings: MemoryDreamSettings = {
-    enabled: asBoolean(record.enabled, true),
-    interval_minutes: asNumber(record.interval_minutes, asNumber(record.intervalMinutes, 1440)),
-  };
-  const lastAt = asNullableString(record.last_at ?? record.lastAt);
-  if (lastAt) settings.last_at = lastAt;
-  return settings;
-}
-
-function normalizeDreamStatus(value: unknown): MemoryDreamStatus {
-  const record = asRecord(value);
-  const status: MemoryDreamStatus = {
-    settings: normalizeDreamSettings(record.settings),
-    pending_count: asNumber(record.pending_count, asNumber(record.pendingCount)),
-    runs: asArray(record.runs).map(normalizeDreamRun),
-  };
-  if ('person_id' in record || 'personId' in record) {
-    status.person_id = asNullableString(record.person_id ?? record.personId);
-  }
-  if (isRecord(record.last_run)) status.last_run = normalizeDreamRun(record.last_run);
-  else if (isRecord(record.lastRun)) status.last_run = normalizeDreamRun(record.lastRun);
-  return status;
-}
-
-function normalizeDreamResult(value: unknown): MemoryDreamResult {
-  const record = asRecord(value);
-  return {
-    run: isRecord(record.run) ? normalizeDreamRun(record.run) : null,
-    status: normalizeDreamStatus(record.status),
-  };
-}
-
-function normalizeGraph(value: unknown): GraphData {
-  const record = asRecord(value);
-  const stats = asRecord(record.stats);
-  const data: GraphData = {
-    nodes: asArray(record.nodes).map((node): GraphNode => {
-      const item = asRecord(node);
-      return {
-        id: asString(item.id),
-        label: asString(item.label),
-        type: asString(item.type),
-        weight: asNumber(item.weight),
-        memories: asNumber(item.memories),
-      };
-    }),
-    edges: asArray(record.edges).map((edge): GraphEdge => {
-      const item = asRecord(edge);
-      return {
-        id: asString(item.id),
-        source: asString(item.source),
-        target: asString(item.target),
-        relation: asString(item.relation),
-        weight: asNumber(item.weight),
-      };
-    }),
-  };
-  if (Object.keys(stats).length > 0) {
-    data.stats = {
-      nodes: asNumber(stats.nodes),
-      edges: asNumber(stats.edges),
-      entities: asNumber(stats.entities),
-      density: asNumber(stats.density),
-      top_types: asArray(stats.top_types ?? stats.topTypes).map((entry) => {
-        const item = asRecord(entry);
-        return { type: asString(item.type), count: asNumber(item.count) };
-      }),
-    };
-  }
-  return data;
-}
-
-function normalizeMetrics(value: unknown): ProjectMetrics {
-  const record = asRecord(value);
-  return {
-    total_memories: asNumber(record.total_memories, asNumber(record.totalMemories)),
-    users: asNumber(record.users),
-    agents: asNumber(record.agents),
-    entities: asNumber(record.entities),
-    relations: asNumber(record.relations),
-    searches_7d: asNumber(record.searches_7d, asNumber(record.searches7d)),
-    adds_7d: asNumber(record.adds_7d, asNumber(record.adds7d)),
-    tokens_saved: asNumber(record.tokens_saved, asNumber(record.tokensSaved)),
-    storage_bytes: asNumber(record.storage_bytes, asNumber(record.storageBytes)),
-    quota_used_pct: asNumber(record.quota_used_pct, asNumber(record.quotaUsedPct)),
-    recall_p50_ms: asNumber(record.recall_p50_ms, asNumber(record.recallP50Ms)),
-    recall_p95_ms: asNumber(record.recall_p95_ms, asNumber(record.recallP95Ms)),
-    hit_rate: asNumber(record.hit_rate, asNumber(record.hitRate)),
-    growth_pct: asNumber(record.growth_pct, asNumber(record.growthPct)),
-    last_activity_at: asNullableString(record.last_activity_at ?? record.lastActivityAt),
-  };
-}
-
-function normalizeWebhook(value: unknown): Webhook {
-  const record = asRecord(value);
-  return {
-    id: asString(record.id),
-    project_id: asString(record.project_id, asString(record.projectId)),
-    name: asString(record.name),
-    url: asString(record.url),
-    secret: asNullableString(record.secret) ?? undefined,
-    event_types: asStringArray(record.event_types ?? record.eventTypes).filter(
-      (value): value is WebhookEventType => (WEBHOOK_EVENT_TYPES as readonly string[]).includes(value),
+    default_scope: oneOf(raw.default_scope ?? raw.defaultScope, MEMORY_SCOPES, DEFAULT_SETTINGS.default_scope),
+    brief_max_chars: asNumber(
+      raw.brief_max_chars ?? raw.briefMaxChars,
+      DEFAULT_SETTINGS.brief_max_chars,
     ),
-    enabled: asBoolean(record.enabled, true),
-    description: asString(record.description),
-    created_by: asNullableString(record.created_by ?? record.createdBy),
-    created_at: asString(record.created_at, asString(record.createdAt)),
-    updated_at: asString(record.updated_at, asString(record.updatedAt)),
-    last_delivery_at: asNullableString(record.last_delivery_at ?? record.lastDeliveryAt),
-    last_status: typeof record.last_status === 'number' ? record.last_status : null,
-    failure_count: asNumber(record.failure_count, asNumber(record.failureCount)),
-    disabled_at: asNullableString(record.disabled_at ?? record.disabledAt),
+    brief_enabled: asBoolean(raw.brief_enabled ?? raw.briefEnabled, DEFAULT_SETTINGS.brief_enabled),
+    dream_enabled: asBoolean(raw.dream_enabled ?? raw.dreamEnabled, DEFAULT_SETTINGS.dream_enabled),
+    dream_interval_minutes: asNumber(
+      raw.dream_interval_minutes ?? raw.dreamIntervalMinutes,
+      DEFAULT_SETTINGS.dream_interval_minutes,
+    ),
+    retention_days: asNumber(raw.retention_days ?? raw.retentionDays, DEFAULT_SETTINGS.retention_days),
+    monthly_quota: asNumber(raw.monthly_quota ?? raw.monthlyQuota, DEFAULT_SETTINGS.monthly_quota),
+    person_auto_create: asBoolean(
+      raw.person_auto_create ?? raw.personAutoCreate,
+      DEFAULT_SETTINGS.person_auto_create,
+    ),
+    locale: asString(raw.locale, DEFAULT_SETTINGS.locale),
   };
 }
 
-function normalizeDelivery(value: unknown): WebhookDelivery {
-  const record = asRecord(value);
-  const responseStatus = record.response_status ?? record.responseStatus;
-  const latency = record.latency_ms ?? record.latencyMs;
+function normalizeStats(value: unknown): PartitionStats {
+  const raw = asRecord(value);
   return {
-    id: asString(record.id),
-    webhook_id: asString(record.webhook_id, asString(record.webhookId)),
-    project_id: asNullableString(record.project_id ?? record.projectId),
-    event_type: oneOf(record.event_type ?? record.eventType, WEBHOOK_EVENT_TYPES, 'memory.created'),
-    event_id: asNullableString(record.event_id ?? record.eventId),
-    status: oneOf(record.status, WEBHOOK_DELIVERY_STATUSES, 'pending'),
-    attempts: asNumber(record.attempts),
-    max_attempts: asNumber(record.max_attempts, asNumber(record.maxAttempts, 6)),
-    next_attempt_at: asNullableString(record.next_attempt_at ?? record.nextAttemptAt),
-    response_status: typeof responseStatus === 'number' ? responseStatus : null,
-    response_body: asNullableString(record.response_body ?? record.responseBody),
-    latency_ms: typeof latency === 'number' ? latency : null,
-    error: asNullableString(record.error),
-    created_at: asString(record.created_at, asString(record.createdAt)),
-    delivered_at: asNullableString(record.delivered_at ?? record.deliveredAt),
-  };
-}
-
-function normalizeExport(value: unknown): ProjectExport {
-  const record = asRecord(value);
-  const project = asRecord(record.project);
-  return {
-    format: 'mnemos-export/v1',
-    exported_at: asString(record.exported_at, asString(record.exportedAt)),
-    project: {
-      id: asString(project.id),
-      slug: asString(project.slug),
-      name: asString(project.name),
-    },
-    agents: asArray(record.agents).map(normalizeAgent),
-    tasks: asArray(record.tasks).map(normalizeTask),
-    memories: asArray(record.memories).map(normalizeMemory),
-  };
-}
-
-function normalizeAddResponse(value: unknown): AddMemoryResponse {
-  const record = asRecord(value);
-  return {
-    results: asArray(record.results).map(normalizeMemory),
-    events: asArray(record.events).map(normalizeEvent),
-    took_ms: asNumber(record.took_ms, asNumber(record.tookMs)),
-    extracted: typeof record.extracted === 'number' ? record.extracted : undefined,
-    merged: typeof record.merged === 'number' ? record.merged : undefined,
-    skipped: typeof record.skipped === 'number' ? record.skipped : undefined,
-  };
-}
-
-function normalizeSearchResponse(value: unknown): SearchResponse {
-  const record = asRecord(value);
-  const signals = isRecord(record.signals) ? record.signals : undefined;
-  return {
-    results: asArray(record.results).map(normalizeHit),
-    total: asNumber(record.total, asArray(record.results).length),
-    took_ms: asNumber(record.took_ms, asNumber(record.tookMs)),
-    signals,
-  };
-}
-
-function normalizeListResponse(value: unknown): MemoryListResponse {
-  const record = asRecord(value);
-  const results = asArray(record.results ?? record.items);
-  return {
-    results: results.map(normalizeMemory),
-    count: asNumber(record.count, asNumber(record.total, results.length)),
-    page: asNumber(record.page, 1),
-    page_size: asNumber(record.page_size, asNumber(record.pageSize, results.length)),
-    total: asNumber(record.total, asNumber(record.count, results.length)),
-    total_pages: asNumber(record.total_pages, asNumber(record.totalPages, 1)),
-  };
-}
-
-function normalizeDetail(value: unknown): MemoryDetail {
-  const record = asRecord(value);
-  return {
-    ...normalizeMemory(record),
-    history: asArray(record.history).map(normalizeHistoryEntry),
-    entities: asArray(record.entities).map(normalizeEntity),
-    relations: asArray(record.relations).map(normalizeRelation),
-    neighbors: asArray(record.neighbors).map(normalizeEntity),
-  };
-}
-
-function normalizeMutation(value: unknown): MutationResponse {
-  const record = asRecord(value);
-  return {
-    message: asString(record.message, 'ok'),
-    ok: typeof record.ok === 'boolean' ? record.ok : undefined,
-    deleted: typeof record.deleted === 'number' ? record.deleted : undefined,
-    affected: typeof record.affected === 'number' ? record.affected : undefined,
-  };
-}
-
-/** 记忆更新/删除响应；中立分区端点返回记忆本体时一并归一化。 */
-function normalizeMemoryMutation(value: unknown): MemoryMutationResponse {
-  const record = asRecord(value);
-  const result: MemoryMutationResponse = normalizeMutation(value);
-  if (typeof record.id === 'string' && record.id !== '') {
-    result.memory = normalizeMemory(record);
-  }
-  return result;
-}
-
-/* ------------------------------------------------------------------ */
-/* 中立服务：人 / 分区 归一化                                          */
-/* ------------------------------------------------------------------ */
-
-function normalizePersonStats(value: unknown): PersonStats {
-  const record = asRecord(value);
-  return {
-    memories: asNumber(record.memories),
-    shared_memories: asNumber(record.shared_memories, asNumber(record.sharedMemories)),
-    sessions: asNumber(record.sessions),
-    last_memory_at: asNullableString(record.last_memory_at ?? record.lastMemoryAt),
-  };
-}
-
-function normalizePerson(value: unknown): Person {
-  const record = asRecord(value);
-  const person: Person = {
-    id: asString(record.id),
-    partition_id: asString(record.partition_id, asString(record.partitionId, asString(record.project_id ?? record.projectId))),
-    project_id: asString(record.project_id, asString(record.projectId, asString(record.partition_id ?? record.partitionId))),
-    external_id: asString(record.external_id, asString(record.externalId)),
-    type: oneOf(record.type, PERSON_TYPES, 'human'),
-    display_name: asString(record.display_name, asString(record.displayName)),
-    attributes: asRecord(record.attributes),
-    status: oneOf(record.status, PERSON_STATUSES, 'active'),
-    first_seen_at: asString(record.first_seen_at, asString(record.firstSeenAt)),
-    last_seen_at: asString(record.last_seen_at, asString(record.lastSeenAt)),
-    created_at: asString(record.created_at, asString(record.createdAt)),
-    updated_at: asString(record.updated_at, asString(record.updatedAt)),
-  };
-  if (isRecord(record.stats)) person.stats = normalizePersonStats(record.stats);
-  return person;
-}
-
-function normalizePersonPage(value: unknown): PersonListResponse {
-  const record = asRecord(value);
-  const rawItems = asArray(record.results ?? record.items);
-  const results = rawItems.map(normalizePerson);
-  return {
-    results,
-    items: results,
-    count: asNumber(record.count, asNumber(record.total, results.length)),
-    total: asNumber(record.total, asNumber(record.count, results.length)),
-    page: asNumber(record.page, 1),
-    page_size: asNumber(record.page_size, asNumber(record.pageSize, results.length)),
-    total_pages: asNumber(record.total_pages, asNumber(record.totalPages, 1)),
+    partition_id: asString(raw.partition_id ?? raw.partitionId),
+    persons_total: asNumber(raw.persons_total ?? raw.personsTotal),
+    persons_human: asNumber(raw.persons_human ?? raw.personsHuman),
+    persons_agent: asNumber(raw.persons_agent ?? raw.personsAgent),
+    persons_service: asNumber(raw.persons_service ?? raw.personsService),
+    memories_total: asNumber(raw.memories_total ?? raw.memoriesTotal),
+    shared_total: asNumber(raw.shared_total ?? raw.sharedTotal),
+    sessions_total: asNumber(raw.sessions_total ?? raw.sessionsTotal),
+    updated_at: asString(raw.updated_at ?? raw.updatedAt),
   };
 }
 
 function normalizePartition(value: unknown): Partition {
-  const record = asRecord(value);
+  const raw = asRecord(value);
+  const partition: Partition = {
+    id: asString(raw.id),
+    org_id: asString(raw.org_id ?? raw.orgId),
+    slug: asString(raw.slug),
+    name: asString(raw.name),
+    description: asString(raw.description),
+    status: oneOf(raw.status, PARTITION_STATUSES, 'active'),
+    settings: normalizeSettings(raw.settings),
+    created_at: asString(raw.created_at ?? raw.createdAt),
+    updated_at: asString(raw.updated_at ?? raw.updatedAt),
+    archived_at: asNullableString(raw.archived_at ?? raw.archivedAt),
+  };
+  const stats = raw.stats;
+  if (stats !== undefined && stats !== null) partition.stats = normalizeStats(stats);
+  return partition;
+}
+
+function normalizePerson(value: unknown): Person {
+  const raw = asRecord(value);
   return {
-    id: asString(record.id),
-    partition_id: asNullableString(record.partition_id ?? record.partitionId) ?? undefined,
-    project_id: asNullableString(record.project_id ?? record.projectId) ?? undefined,
-    org_id: asString(record.org_id, asString(record.orgId)),
-    slug: asString(record.slug),
-    name: asString(record.name),
-    description: asString(record.description),
-    status: asString(record.status),
-    region: asString(record.region),
-    env: asString(record.env),
-    created_at: asString(record.created_at, asString(record.createdAt)),
-    updated_at: asString(record.updated_at, asString(record.updatedAt)),
-    archived_at: asNullableString(record.archived_at ?? record.archivedAt),
+    id: asString(raw.id),
+    partition_id: asString(raw.partition_id ?? raw.partitionId),
+    external_id: asString(raw.external_id ?? raw.externalId),
+    type: oneOf(raw.type, PERSON_TYPES, 'human'),
+    display_name: asString(raw.display_name ?? raw.displayName),
+    attributes: asRecordOf(raw.attributes),
+    status: oneOf(raw.status, PERSON_STATUSES, 'active'),
+    memory_count: asNumber(raw.memory_count ?? raw.memoryCount),
+    shared_memory_count: asNumber(raw.shared_memory_count ?? raw.sharedMemoryCount),
+    session_count: asNumber(raw.session_count ?? raw.sessionCount),
+    last_memory_at: asNullableString(raw.last_memory_at ?? raw.lastMemoryAt),
+    first_seen_at: asString(raw.first_seen_at ?? raw.firstSeenAt),
+    last_seen_at: asString(raw.last_seen_at ?? raw.lastSeenAt),
+    created_at: asString(raw.created_at ?? raw.createdAt),
+    updated_at: asString(raw.updated_at ?? raw.updatedAt),
   };
 }
 
-function normalizePersonContext(value: unknown): PersonContext {
-  const record = asRecord(value);
+function normalizeMemory(value: unknown): Memory {
+  const raw = asRecord(value);
   return {
-    person: normalizePerson(record.person),
-    brief: normalizeBrief(record.brief),
-    memories: asArray(record.memories).map(normalizeMemory),
-    shared: asArray(record.shared).map(normalizeMemory),
-    prompt: asString(record.prompt),
-    token_estimate: asNumber(record.token_estimate, asNumber(record.tokenEstimate)),
-    citations: asStringArray(record.citations),
-    built_at: asString(record.built_at, asString(record.builtAt)),
+    id: asString(raw.id),
+    partition_id: asString(raw.partition_id ?? raw.partitionId),
+    person_id: asString(raw.person_id ?? raw.personId),
+    person_external_id: asNullableString(raw.person_external_id ?? raw.personExternalId),
+    actor_person_id: asNullableString(raw.actor_person_id ?? raw.actorPersonId),
+    scope: oneOf(raw.scope, MEMORY_SCOPES, 'partition'),
+    session_id: asNullableString(raw.session_id ?? raw.sessionId),
+    category: oneOf(raw.category, MEMORY_CATEGORIES, 'fact'),
+    content: asString(raw.content ?? raw.memory),
+    importance: asNumber(raw.importance, 0.5),
+    confidence: asNumber(raw.confidence, 0.8),
+    source: oneOf(raw.source, MEMORY_SOURCES, 'api'),
+    status: oneOf(raw.status, MEMORY_STATUSES, 'active'),
+    tags: asStringArray(raw.tags),
+    metadata: asRecordOf(raw.metadata),
+    created_at: asString(raw.created_at ?? raw.createdAt),
+    updated_at: asString(raw.updated_at ?? raw.updatedAt),
+    expires_at: asNullableString(raw.expires_at ?? raw.expiresAt),
+    dreamed_at: asNullableString(raw.dreamed_at ?? raw.dreamedAt),
+  };
+}
+
+function normalizePage<T>(value: unknown, map: (item: unknown) => T): CursorPage<T> {
+  const raw = asRecord(value);
+  const page: CursorPage<T> = {
+    items: asArray(raw.items ?? raw.results).map(map),
+    next_cursor: asNullableString(raw.next_cursor ?? raw.nextCursor),
+  };
+  const stats = raw.partition_stats ?? raw.partitionStats;
+  if (stats !== undefined && stats !== null) page.partition_stats = normalizeStats(stats);
+  return page;
+}
+
+function normalizeAddResponse(value: unknown): AddMemoryResponse {
+  const raw = asRecord(value);
+  const memoryRaw = raw.memory ?? asArray(raw.results)[0] ?? raw;
+  return {
+    memory: normalizeMemory(memoryRaw),
+    events: asArray(raw.events).map((event) => {
+      const item = asRecord(event);
+      return {
+        type: 'ADD' as const,
+        memory_id: asString(item.memory_id ?? item.memoryId),
+        at: asString(item.at),
+      };
+    }),
+  };
+}
+
+function normalizeMemoryDetail(value: unknown): MemoryDetail {
+  const raw = asRecord(value);
+  return {
+    memory: normalizeMemory(raw.memory),
+    person: raw.person === null || raw.person === undefined ? null : normalizePerson(raw.person),
+  };
+}
+
+function normalizeMemoryMutation(value: unknown): MemoryMutationResponse {
+  const raw = asRecord(value);
+  return { memory: normalizeMemory(raw.memory ?? raw) };
+}
+
+function normalizeSearchResponse(value: unknown): SearchResponse {
+  const raw = asRecord(value);
+  const response: SearchResponse = {
+    results: asArray(raw.results).map(normalizeMemory),
+    took_ms: asNumber(raw.took_ms ?? raw.tookMs),
+    next_cursor: asNullableString(raw.next_cursor ?? raw.nextCursor),
+  };
+  const stats = raw.partition_stats ?? raw.partitionStats;
+  if (stats !== undefined && stats !== null) response.partition_stats = normalizeStats(stats);
+  return response;
+}
+
+function normalizeBriefItem(value: unknown) {
+  const raw = asRecord(value);
+  return {
+    id: asString(raw.id),
+    content: asString(raw.content),
+    category: oneOf(raw.category, MEMORY_CATEGORIES, 'fact'),
+    importance: asNumber(raw.importance, 0.5),
+    scope: oneOf(raw.scope, MEMORY_SCOPES, 'partition'),
+    updated_at: asString(raw.updated_at ?? raw.updatedAt),
+    person_id: asString(raw.person_id ?? raw.personId),
+    person_external_id: asNullableString(raw.person_external_id ?? raw.personExternalId),
+  };
+}
+
+function normalizeBrief(value: unknown): MemoryBrief {
+  const raw = asRecord(value);
+  return {
+    partition_id: asString(raw.partition_id ?? raw.partitionId),
+    person_id: asNullableString(raw.person_id ?? raw.personId),
+    scope_key: asString(raw.scope_key ?? raw.scopeKey),
+    text: asString(raw.text),
+    max_chars: asNumber(raw.max_chars ?? raw.maxChars),
+    count: asNumber(raw.count),
+    model: asString(raw.model),
+    cached: asBoolean(raw.cached),
+    source_hash: asString(raw.source_hash ?? raw.sourceHash),
+    generated_at: asString(raw.generated_at ?? raw.generatedAt),
+    recent: asArray(raw.recent).map(normalizeBriefItem),
+  };
+}
+
+function normalizeContext(value: unknown): PersonContext {
+  const raw = asRecord(value);
+  return {
+    person: normalizePerson(raw.person),
+    brief: normalizeBrief(raw.brief),
+    memories: asArray(raw.memories).map(normalizeMemory),
+    shared: asArray(raw.shared).map(normalizeMemory),
+    prompt: asString(raw.prompt),
+    token_estimate: asNumber(raw.token_estimate ?? raw.tokenEstimate),
+    citations: asStringArray(raw.citations),
+    built_at: asString(raw.built_at ?? raw.builtAt),
+  };
+}
+
+function normalizeDreamRun(value: unknown) {
+  const raw = asRecord(value);
+  return {
+    id: asString(raw.id),
+    partition_id: asString(raw.partition_id ?? raw.partitionId),
+    person_id: asNullableString(raw.person_id ?? raw.personId),
+    trigger: oneOf(raw.trigger, DREAM_TRIGGERS, 'manual'),
+    status: oneOf(raw.status, DREAM_RUN_STATUSES, 'completed'),
+    input_count: asNumber(raw.input_count ?? raw.inputCount),
+    insight_count: asNumber(raw.insight_count ?? raw.insightCount),
+    summary: asNullableString(raw.summary),
+    error: asNullableString(raw.error),
+    started_at: asString(raw.started_at ?? raw.startedAt),
+    finished_at: asNullableString(raw.finished_at ?? raw.finishedAt),
+  };
+}
+
+function normalizeDreamStatus(value: unknown): MemoryDreamStatus {
+  const raw = asRecord(value);
+  const settings = asRecord(raw.settings);
+  const lastRun = raw.last_run ?? raw.lastRun;
+  return {
+    settings: {
+      enabled: asBoolean(settings.enabled),
+      interval_minutes: asNumber(settings.interval_minutes ?? settings.intervalMinutes),
+      last_at: asNullableString(settings.last_at ?? settings.lastAt),
+    },
+    person_id: asNullableString(raw.person_id ?? raw.personId),
+    pending_count: asNumber(raw.pending_count ?? raw.pendingCount),
+    last_run: lastRun === null || lastRun === undefined ? null : normalizeDreamRun(lastRun),
+    runs: asArray(raw.runs).map(normalizeDreamRun),
+  };
+}
+
+function normalizeDreamResult(value: unknown): MemoryDreamResult {
+  const raw = asRecord(value);
+  return {
+    run: raw.run === null || raw.run === undefined ? null : normalizeDreamRun(raw.run),
+    status: normalizeDreamStatus(raw.status),
+  };
+}
+
+function normalizeApiKey(value: unknown): ApiKey {
+  const raw = asRecord(value);
+  return {
+    id: asString(raw.id),
+    partition_id: asNullableString(raw.partition_id ?? raw.partitionId),
+    org_id: asNullableString(raw.org_id ?? raw.orgId),
+    kind: oneOf(raw.kind, API_KEY_KINDS, 'partition'),
+    name: asString(raw.name),
+    prefix: asString(raw.prefix),
+    scopes: asArray(raw.scopes).map((scope) => oneOf(scope, API_SCOPES, 'memories:read')),
+    created_by: asString(raw.created_by ?? raw.createdBy),
+    created_at: asString(raw.created_at ?? raw.createdAt),
+    last_used_at: asNullableString(raw.last_used_at ?? raw.lastUsedAt),
+    revoked_at: asNullableString(raw.revoked_at ?? raw.revokedAt),
+    expires_at: asNullableString(raw.expires_at ?? raw.expiresAt),
+    allowed_ips: asStringArray(raw.allowed_ips ?? raw.allowedIps),
+    rotated_from: asNullableString(raw.rotated_from ?? raw.rotatedFrom),
+    rotated_at: asNullableString(raw.rotated_at ?? raw.rotatedAt),
+    rate_limit_per_min: asNumber(raw.rate_limit_per_min ?? raw.rateLimitPerMin),
+    ...(typeof raw.secret === 'string' ? { secret: raw.secret } : {}),
+  };
+}
+
+function normalizeHealth(value: unknown): HealthResponse {
+  const raw = asRecord(value);
+  return {
+    ok: asBoolean(raw.ok),
+    version: asString(raw.version),
+    uptime_ms: asNumber(raw.uptime_ms ?? raw.uptimeMs),
+    schema_version: asNumber(raw.schema_version ?? raw.schemaVersion),
+    db: raw.db === 'ok' ? 'ok' : 'error',
+    node: asString(raw.node),
   };
 }
 
 /* ------------------------------------------------------------------ */
-/* 请求体构造                                                          */
+/* 请求体 / 查询串构造（camelCase → snake_case）                        */
 /* ------------------------------------------------------------------ */
 
-/** 中立分区路径前缀（id 或 slug）；未提供分区时返回空串（走旧 `/v1/*`）。 */
-function partitionBase(partition: string | undefined): string {
-  const value = typeof partition === 'string' ? partition.trim() : '';
-  return value === '' ? '' : `/v1/partitions/${encodeURIComponent(value)}`;
-}
-
-function memoryAddBody(input: MemoryAddInput, neutral: boolean): JsonRecord {
-  return compact({
-    messages: input.messages,
-    text: input.text,
-    person_id: neutral ? pick(input.personId, input.person_id) : undefined,
-    person_external_id: neutral ? pick(input.personExternalId, input.person_external_id) : undefined,
-    actor_person_id: neutral ? pick(input.actorPersonId, input.actor_person_id) : undefined,
-    scope: neutral ? input.scope : undefined,
-    session_id: neutral ? pick(input.sessionId, input.session_id) : undefined,
-    category: neutral ? input.category : undefined,
-    tags: neutral ? input.tags : undefined,
-    user_id: pick(input.userId, input.user_id),
-    agent_id: pick(input.agentId, input.agent_id),
-    run_id: pick(input.runId, input.run_id),
-    app_id: pick(input.appId, input.app_id),
-    task_id: pick(input.taskId, input.task_id),
-    visibility: input.visibility,
-    metadata: input.metadata,
-    infer: input.infer,
-    mode: input.mode,
-  });
-}
-
-function searchFiltersBody(filters: SearchFilters | undefined): JsonRecord | undefined {
-  if (!filters) return undefined;
+function settingsBody(input: PartitionSettingsInput | undefined): JsonRecord | undefined {
+  if (!input) return undefined;
   const body = compact({
-    status: filters.status,
-    category: filters.category,
-    tags: filters.tags,
-    created_after: pick(filters.createdAfter, filters.created_after),
-    created_before: pick(filters.createdBefore, filters.created_before),
-    min_importance: pick(filters.minImportance, filters.min_importance),
-    metadata: filters.metadata,
-    user_id: pick(filters.userId, filters.user_id),
-    agent_id: pick(filters.agentId, filters.agent_id),
-    run_id: pick(filters.runId, filters.run_id),
-    person_id: pick(filters.personId, filters.person_id),
-    person_external_id: pick(filters.personExternalId, filters.person_external_id),
-    scope: filters.scope,
-    session_id: pick(filters.sessionId, filters.session_id),
+    default_scope: pick(input.defaultScope, input.default_scope),
+    brief_max_chars: pick(input.briefMaxChars, input.brief_max_chars),
+    brief_enabled: pick(input.briefEnabled, input.brief_enabled),
+    dream_enabled: pick(input.dreamEnabled, input.dream_enabled),
+    dream_interval_minutes: pick(input.dreamIntervalMinutes, input.dream_interval_minutes),
+    retention_days: pick(input.retentionDays, input.retention_days),
+    monthly_quota: pick(input.monthlyQuota, input.monthly_quota),
+    person_auto_create: pick(input.personAutoCreate, input.person_auto_create),
+    locale: input.locale,
   });
-  return Object.keys(body).length > 0 ? body : undefined;
+  return Object.keys(body).length === 0 ? undefined : body;
 }
 
-function searchBody(input: MemorySearchInput, neutral: boolean): JsonRecord {
-  if (!neutral) {
-    return compact({
-      query: input.query,
-      user_id: pick(input.userId, input.user_id),
-      agent_id: pick(input.agentId, input.agent_id),
-      task_id: pick(input.taskId, input.task_id),
-      run_id: pick(input.runId, input.run_id),
-      app_id: pick(input.appId, input.app_id),
-      written_by_agent_id: pick(input.writtenByAgentId, input.written_by_agent_id),
-      visibility: input.visibility,
-      top_k: pick(input.topK, input.top_k),
-      threshold: input.threshold,
-      include_private: pick(input.includePrivate, input.include_private),
-      filters: searchFiltersBody(input.filters),
-    });
-  }
-  // 中立分区检索：person 引用（内部 id 或 external id）、scope、顶层 category。
+function partitionBody(input: PartitionInput, includeSlug: boolean): JsonRecord {
   return compact({
-    query: input.query,
-    person_id: pick(input.personId, input.person_id) ?? pick(input.personExternalId, input.person_external_id),
-    scope: input.scope,
-    session_id: pick(input.sessionId, input.session_id),
-    category: input.category,
-    top_k: pick(input.topK, input.top_k),
-    threshold: input.threshold,
-    include_private: pick(input.includePrivate, input.include_private),
-  });
-}
-
-function listQuery(input: MemoryListInput, neutral: boolean): Query {
-  if (!neutral) {
-    return queryFrom({
-      user_id: pick(input.userId, input.user_id),
-      agent_id: pick(input.agentId, input.agent_id),
-      run_id: pick(input.runId, input.run_id),
-      app_id: pick(input.appId, input.app_id),
-      task_id: pick(input.taskId, input.task_id),
-      visibility: input.visibility,
-      category: input.category,
-      page: input.page,
-      page_size: pick(input.pageSize, input.page_size),
-    });
-  }
-  return queryFrom({
-    person_id: pick(input.personId, input.person_id) ?? pick(input.personExternalId, input.person_external_id),
-    scope: input.scope,
-    session_id: pick(input.sessionId, input.session_id),
-    category: input.category,
-    status: input.status,
-    q: input.q,
-    sort: input.sort,
-    include_private: pick(input.includePrivate, input.include_private),
-    page: input.page,
-    page_size: pick(input.pageSize, input.page_size),
-  });
-}
-
-function updateBody(input: MemoryUpdateInput): JsonRecord {
-  const content = input.content ?? input.text;
-  if (!content) {
-    throw new TypeError('memories.update: text 与 content 至少提供一个');
-  }
-  return compact({
-    text: input.text,
-    content,
-    category: input.category,
-    importance: input.importance,
-    status: input.status,
-    tags: input.tags,
-    metadata: input.metadata,
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* 中立服务：分区 / 人 请求构造                                        */
-/* ------------------------------------------------------------------ */
-
-function partitionCreateBody(input: PartitionCreateInput): JsonRecord {
-  if (typeof input.slug !== 'string' || input.slug.trim() === '') {
-    throw new TypeError('partitions.create: slug 不能为空');
-  }
-  return compact({
-    slug: input.slug.trim(),
+    ...(includeSlug ? { slug: input.slug } : {}),
     name: input.name,
     description: input.description,
-    region: input.region,
-    env: input.env,
+    status: input.status,
+    settings: settingsBody(input.settings),
   });
 }
 
-function personUpsertBody(input: PersonUpsertInput): JsonRecord {
+function personUpsertBody(input: PersonInput): JsonRecord {
   return compact({
+    external_id: pick(input.externalId, input.external_id),
     type: input.type,
     display_name: pick(input.displayName, input.display_name),
     attributes: input.attributes,
@@ -1060,29 +629,74 @@ function personUpsertBody(input: PersonUpsertInput): JsonRecord {
 }
 
 function personUpdateBody(input: PersonUpdateInput): JsonRecord {
-  const body = compact({
+  return compact({
     display_name: pick(input.displayName, input.display_name),
     attributes: input.attributes,
     status: input.status,
   });
-  if (Object.keys(body).length === 0) {
-    throw new TypeError('persons.update: 至少提供一个待更新字段（displayName / attributes / status）');
-  }
-  return body;
 }
 
-function personListQuery(input: PersonListInput): Query {
+function personListQuery(input: PersonListQuery): Query {
   return queryFrom({
     type: input.type,
     status: input.status,
     q: input.q,
-    page: input.page,
-    page_size: pick(input.pageSize, input.page_size),
     sort: input.sort,
+    cursor: input.cursor,
+    limit: assertLimit(input.limit),
   });
 }
 
-function personBriefQuery(input: PersonBriefInput): Query {
+function memoryAddBody(input: MemoryInput): JsonRecord {
+  const text = pick(input.text, input.content);
+  const messages = input.messages;
+  if (!text?.trim() && !messages?.length) {
+    throw new TypeError('memories.add: text / content / messages 至少提供一个');
+  }
+  return compact({
+    text,
+    content: input.content,
+    messages: messages?.map((message) => ({ role: message.role, content: message.content, name: message.name })),
+    scope: input.scope,
+    session_id: pick(input.sessionId, input.session_id),
+    session_title: pick(input.sessionTitle, input.session_title),
+    category: input.category,
+    importance: input.importance,
+    confidence: input.confidence,
+    source: input.source,
+    tags: input.tags,
+    metadata: input.metadata,
+    expires_at: pick(input.expiresAt, input.expires_at),
+  });
+}
+
+function memoryUpdateBody(input: MemoryUpdateInput): JsonRecord {
+  return compact({
+    content: input.content,
+    category: input.category,
+    importance: input.importance,
+    confidence: input.confidence,
+    status: input.status,
+    tags: input.tags,
+    metadata: input.metadata,
+    expires_at: pick(input.expiresAt, input.expires_at),
+  });
+}
+
+function memoryListQuery(input: MemoryListQuery): Query {
+  return queryFrom({
+    person_id: pick(input.personId, input.person_id),
+    person_external_id: pick(input.personExternalId, input.person_external_id),
+    scope: input.scope,
+    category: input.category,
+    status: input.status,
+    q: input.q,
+    cursor: input.cursor,
+    limit: assertLimit(input.limit),
+  });
+}
+
+function personBriefQuery(input: PersonBriefQuery): Query {
   return queryFrom({
     force: input.force,
     max_chars: pick(input.maxChars, input.max_chars),
@@ -1097,122 +711,28 @@ function personContextBody(input: PersonContextInput): JsonRecord {
   });
 }
 
-function personDreamRunBody(input: PersonDreamRunInput): JsonRecord {
+function dreamRunBody(input: MemoryDreamInput): JsonRecord {
   return compact({ batch_size: pick(input.batchSize, input.batch_size) });
 }
 
-function agentCreateBody(input: AgentCreateInput): JsonRecord {
+function keyBody(input: KeyInput): JsonRecord {
   return compact({
     name: input.name,
-    role: input.role,
-    model: input.model,
-    description: input.description,
-    capabilities: input.capabilities,
-    status: input.status,
-    metadata: input.metadata,
+    scopes: input.scopes,
+    rateLimitPerMin: pick(input.rateLimitPerMin, input.rate_limit_per_min),
+    expiresAt: pick(input.expiresAt, input.expires_at),
+    allowedIps: pick(input.allowedIps, input.allowed_ips),
   });
 }
 
-function taskCreateBody(input: TaskCreateInput): JsonRecord {
-  return compact({
-    title: input.title,
-    goal: input.goal,
-    owner_agent_id: pick(input.ownerAgentId, input.owner_agent_id),
-    branch: input.branch,
-    status: input.status,
-  });
-}
-
-function taskFinishBody(input: TaskFinishInput): JsonRecord {
-  return compact({
-    status: input.status,
-    summary: input.summary,
-    decisions: input.decisions,
-    lessons: input.lessons,
-    notes: input.notes,
-    agent_id: pick(input.agentId, input.agent_id),
-  });
-}
-
-function contextBody(input: ContextBuildInput): JsonRecord {
-  return compact({
-    agent_id: pick(input.agentId, input.agent_id),
-    task_id: pick(input.taskId, input.task_id),
-    query: input.query,
-    budget_tokens: pick(input.budgetTokens, input.budget_tokens),
-  });
-}
-
-function taskListQuery(input: TaskListInput): Query {
-  return queryFrom({
-    status: input.status,
-    agent_id: pick(input.agentId, input.agent_id),
-    limit: input.limit,
-  });
-}
-
-/**
- * 记忆简报查询参数。
- *
- * 注意：`/api/*` 控制台接口使用 camelCase 查询参数，这里按服务端契约发送
- * `force / agentId / maxChars`（控制台视角固定 includePrivate=true、allowLlm=true）。
- */
-function briefQuery(input: MemoryBriefInput): Query {
-  return queryFrom({
-    force: input.force,
-    agentId: pick(input.agentId, input.agent_id),
-    maxChars: pick(input.maxChars, input.max_chars),
-  });
-}
-
-/** 更新做梦设置（控制台 API 使用 camelCase 请求体）。 */
-function dreamSettingsBody(input: MemoryDreamSettingsInput): JsonRecord {
-  return compact({
-    enabled: input.enabled,
-    intervalMinutes: pick(input.intervalMinutes, input.interval_minutes),
-  });
-}
-
-function webhookBody(input: WebhookCreateInput | WebhookUpdateInput): JsonRecord {
-  return compact({
-    name: input.name,
-    url: input.url,
-    event_types: pick(input.eventTypes, input.event_types),
-    enabled: input.enabled,
-    description: input.description,
-  });
-}
-
-/** 把 SDK 归一化的导出文档转回服务端导入格式。 */
-function exportToImportDocument(document: ProjectExport): ImportDocument {
-  return {
-    format: document.format,
-    memories: document.memories.map((memory): ImportMemoryInput => {
-      const item: ImportMemoryInput = {
-        content: memory.content,
-        visibility: memory.visibility,
-        tags: memory.tags,
-        metadata: memory.metadata,
-      };
-      if (memory.user_id) item.userId = memory.user_id;
-      if (memory.agent_id) item.agentId = memory.agent_id;
-      if (memory.run_id) item.runId = memory.run_id;
-      if (memory.app_id) item.appId = memory.app_id;
-      if (memory.task_id) item.taskId = memory.task_id;
-      return item;
-    }),
-  };
-}
-
-function isProjectExport(value: unknown): value is ProjectExport {
-  return isRecord(value) && Array.isArray(value.memories) && typeof value.exported_at === 'string';
+function keyRotateBody(input: KeyRotateInput): JsonRecord {
+  return compact({ graceHours: pick(input.graceHours, input.grace_hours) });
 }
 
 /* ------------------------------------------------------------------ */
-/* HTTP 传输层                                                         */
+/* 传输层                                                              */
 /* ------------------------------------------------------------------ */
 
-/** 单次请求配置。 */
 export interface RequestConfig {
   body?: unknown;
   query?: Query;
@@ -1226,13 +746,7 @@ export interface RequestTransport {
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   const text = await response.text();
-  if (text.trim() === '') {
-    throw new MnemosApiError('响应为空，期望 JSON', {
-      status: response.status,
-      code: 'invalid_response',
-      requestId: response.headers.get('x-request-id'),
-    });
-  }
+  if (text.trim() === '') return undefined as T;
   try {
     return JSON.parse(text) as T;
   } catch {
@@ -1272,183 +786,25 @@ async function toApiError(response: Response): Promise<MnemosApiError> {
   });
 }
 
-/** 判断该方法在失败时是否可以安全重试。 */
-function canRetryRequest(method: HttpMethod, path: string, idempotencyKey: string | undefined): boolean {
+/**
+ * 判断该方法在失败时是否可以安全重试。
+ *
+ * v6 服务端没有幂等记录存储，因此非只读 POST（写记忆 / 做梦 / 建密钥）
+ * 一律不自动重试；只有只读检索 POST 可以安全重放。PUT/PATCH/DELETE 因为
+ * 语义幂等，允许重试。
+ */
+function canRetryRequest(method: HttpMethod, path: string): boolean {
   if (method === 'GET') return true;
-  if (method === 'POST') {
-    if (idempotencyKey) return true;
-    // 检索是只读 POST，可安全重试（旧 v1 与中立分区端点均适用）。
-    return path.endsWith('/memories/search');
-  }
-  // PUT / DELETE 语义上幂等。
+  if (method === 'POST') return path.endsWith('/memories/search');
+  // PUT / PATCH / DELETE 语义上幂等。
   return method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 }
 
 /* ------------------------------------------------------------------ */
-/* 资源：memories                                                      */
+/* 资源：partitions                                                    */
 /* ------------------------------------------------------------------ */
 
-/** 未提供分区却使用了中立端点专属字段时抛错（避免请求被旧端点静默忽略）。 */
-function assertNoNeutralFields(action: string, fields: Array<[string, unknown]>): void {
-  const used = fields.filter(([, value]) => value !== undefined && value !== '').map(([name]) => name);
-  if (used.length > 0) {
-    throw new TypeError(
-      `${action}: ${used.join(' / ')} 需要提供 partition（中立分区端点），例如 { partition: 'ws-demo', ... }`,
-    );
-  }
-}
-
-/** 记忆资源。 */
-export class MemoriesResource {
-  private readonly transport: RequestTransport;
-
-  constructor(transport: RequestTransport) {
-    this.transport = transport;
-  }
-
-  /** 记忆详情路径：提供 partition 时走中立端点，否则走旧 `/v1/memories`。 */
-  private itemPath(id: string, partition: string | undefined, suffix = ''): string {
-    const base = partitionBase(partition) || '/v1';
-    return `${base}/memories/${encodeURIComponent(id)}${suffix}`;
-  }
-
-  /** 记忆集合路径：提供 partition 时走中立端点，否则走旧 `/v1/memories`。 */
-  private collectionPath(partition: string | undefined, suffix = ''): string {
-    const base = partitionBase(partition);
-    return base === '' ? `/v1/memories${suffix}` : `${base}/memories${suffix}`;
-  }
-
-  /** 写入记忆（`messages` 与 `text` 至少一个）。 */
-  async add(input: MemoryAddInput, options?: RequestOptions): Promise<AddMemoryResponse> {
-    const neutral = partitionBase(input.partition) !== '';
-    if (!neutral) {
-      assertNoNeutralFields('memories.add', [
-        ['personId', input.personId ?? input.person_id],
-        ['personExternalId', input.personExternalId ?? input.person_external_id],
-        ['actorPersonId', input.actorPersonId ?? input.actor_person_id],
-        ['scope', input.scope],
-        ['sessionId', input.sessionId ?? input.session_id],
-        ['category', input.category],
-        ['tags', input.tags],
-      ]);
-    }
-    const raw = await this.transport.request<unknown>('POST', this.collectionPath(input.partition), {
-      body: memoryAddBody(input, neutral),
-      options,
-    });
-    return normalizeAddResponse(raw);
-  }
-
-  /** 混合检索记忆。 */
-  async search(input: MemorySearchInput, options?: RequestOptions): Promise<SearchResponse> {
-    const neutral = partitionBase(input.partition) !== '';
-    if (!neutral) {
-      assertNoNeutralFields('memories.search', [
-        ['personId', input.personId ?? input.person_id],
-        ['personExternalId', input.personExternalId ?? input.person_external_id],
-        ['scope', input.scope],
-        ['sessionId', input.sessionId ?? input.session_id],
-        ['category', input.category],
-        ['filters.personId', input.filters?.personId ?? input.filters?.person_id],
-        ['filters.personExternalId', input.filters?.personExternalId ?? input.filters?.person_external_id],
-        ['filters.scope', input.filters?.scope],
-        ['filters.sessionId', input.filters?.sessionId ?? input.filters?.session_id],
-      ]);
-    }
-    const raw = await this.transport.request<unknown>('POST', this.collectionPath(input.partition, '/search'), {
-      body: searchBody(input, neutral),
-      options,
-    });
-    return normalizeSearchResponse(raw);
-  }
-
-  /** 分页列出记忆。 */
-  async list(input: MemoryListInput = {}, options?: RequestOptions): Promise<MemoryListResponse> {
-    const neutral = partitionBase(input.partition) !== '';
-    if (!neutral) {
-      assertNoNeutralFields('memories.list', [
-        ['personId', input.personId ?? input.person_id],
-        ['personExternalId', input.personExternalId ?? input.person_external_id],
-        ['scope', input.scope],
-        ['sessionId', input.sessionId ?? input.session_id],
-        ['q', input.q],
-        ['status', input.status],
-        ['sort', input.sort],
-        ['includePrivate', input.includePrivate ?? input.include_private],
-      ]);
-    }
-    const raw = await this.transport.request<unknown>('GET', this.collectionPath(input.partition), {
-      query: listQuery(input, neutral),
-      options,
-    });
-    return normalizeListResponse(raw);
-  }
-
-  /**
-   * 记忆详情（含历史、实体、关系）。
-   *
-   * 提供 `options.partition` 时走中立分区端点（org key 必须提供）。
-   */
-  async get(id: string, options?: RequestOptions): Promise<MemoryDetail> {
-    const raw = await this.transport.request<unknown>('GET', this.itemPath(id, options?.partition), {
-      options,
-    });
-    return normalizeDetail(raw);
-  }
-
-  /**
-   * 更新记忆正文 / 分类 / 重要度。
-   *
-   * 提供 `options.partition` 时走中立分区端点（`PATCH`），响应额外返回 `memory`。
-   */
-  async update(id: string, input: MemoryUpdateInput, options?: RequestOptions): Promise<MemoryMutationResponse> {
-    const neutral = partitionBase(options?.partition) !== '';
-    const raw = await this.transport.request<unknown>(
-      neutral ? 'PATCH' : 'PUT',
-      this.itemPath(id, options?.partition),
-      { body: updateBody(input), options },
-    );
-    return normalizeMemoryMutation(raw);
-  }
-
-  /** 软删除单条记忆（提供 `options.partition` 时走中立分区端点）。 */
-  async delete(id: string, options?: RequestOptions): Promise<MemoryMutationResponse> {
-    const raw = await this.transport.request<unknown>('DELETE', this.itemPath(id, options?.partition), {
-      options,
-    });
-    return normalizeMemoryMutation(raw);
-  }
-
-  /** 变更历史（仅旧 `/v1/memories` 提供）。 */
-  async history(id: string, options?: RequestOptions): Promise<MemoryHistoryResponse> {
-    if (partitionBase(options?.partition) !== '') {
-      throw new TypeError('memories.history: 中立分区端点暂不提供历史接口，请使用 project key 走 /v1/memories');
-    }
-    const raw = await this.transport.request<unknown>('GET', this.itemPath(id, undefined, '/history'), {
-      options,
-    });
-    const record = asRecord(raw);
-    return { results: asArray(record.results).map(normalizeHistoryEntry) };
-  }
-
-  /** 反馈（调整重要度；仅旧 `/v1/memories` 提供）。 */
-  async feedback(id: string, input: FeedbackInput, options?: RequestOptions): Promise<Memory> {
-    if (partitionBase(options?.partition) !== '') {
-      throw new TypeError('memories.feedback: 中立分区端点暂不提供反馈接口，请使用 project key 走 /v1/memories');
-    }
-    const raw = await this.transport.request<unknown>('POST', this.itemPath(id, undefined, '/feedback'), {
-      body: compact({ helpful: input.helpful, query: input.query }),
-      options,
-    });
-    return normalizeMemory(raw);
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* 资源：partitions / persons（中立记忆服务 v5）                        */
-/* ------------------------------------------------------------------ */
-
-/** 分区（项目/应用/租户/工作区）资源。 */
+/** 分区（App / 项目 / 租户 / 工作区）。 */
 export class PartitionsResource {
   private readonly transport: RequestTransport;
 
@@ -1456,36 +812,67 @@ export class PartitionsResource {
     this.transport = transport;
   }
 
-  /**
-   * 创建分区（按 `slug` 幂等 upsert）。
-   *
-   * 需要 **org key**（`kind=org`，`admin` 作用域）；project key 调用返回 403。
-   */
-  async create(input: PartitionCreateInput, options?: RequestOptions): Promise<PartitionCreateResponse> {
-    const raw = await this.transport.request<unknown>('POST', '/v1/partitions', {
-      body: partitionCreateBody(input),
-      options,
-    });
-    const record = asRecord(raw);
-    return {
-      partition: normalizePartition(record.partition ?? raw),
-      created: asBoolean(record.created),
-    };
+  /** 列出本组织可见分区（需要 org key）。 */
+  async list(options?: RequestOptions): Promise<Partition[]> {
+    const raw = await this.transport.request<unknown>('GET', '/v1/partitions', { options });
+    return asArray(raw).map(normalizePartition);
   }
 
-  /** 读取分区信息（`:partition` 支持内部 id 或 slug；不含敏感设置）。 */
+  /** 建 / 幂等 upsert 分区（org key + admin 权限）。 */
+  async create(input: PartitionInput, options?: RequestOptions): Promise<Partition> {
+    const raw = await this.transport.request<unknown>('POST', '/v1/partitions', {
+      body: partitionBody(input, true),
+      options,
+    });
+    return normalizePartition(raw);
+  }
+
+  /** 分区信息 + settings（不含敏感字段）。 */
   async get(partition: string, options?: RequestOptions): Promise<Partition> {
+    const raw = await this.transport.request<unknown>('GET', `/v1/partitions/${encodeRef(partition)}`, {
+      options,
+    });
+    return normalizePartition(raw);
+  }
+
+  /** 局部更新分区（admin 权限）。 */
+  async update(
+    partition: string,
+    input: Partial<Omit<PartitionInput, 'slug'>>,
+    options?: RequestOptions,
+  ): Promise<Partition> {
+    const body = assertPatchBody(
+      'partitions.update',
+      compact({
+        name: input.name,
+        description: input.description,
+        status: input.status,
+        settings: settingsBody(input.settings),
+      }),
+    );
+    const raw = await this.transport.request<unknown>('PATCH', `/v1/partitions/${encodeRef(partition)}`, {
+      body,
+      options,
+    });
+    return normalizePartition(raw);
+  }
+
+  /** 分区统计（直接读 `partition_stats`，O(1)）。 */
+  async stats(partition: string, options?: RequestOptions): Promise<PartitionStats> {
     const raw = await this.transport.request<unknown>(
       'GET',
-      `/v1/partitions/${encodeURIComponent(partition)}`,
+      `/v1/partitions/${encodeRef(partition)}/stats`,
       { options },
     );
-    const record = asRecord(raw);
-    return normalizePartition(record.partition ?? raw);
+    return normalizeStats(raw);
   }
 }
 
-/** 人（Person）资源：记忆主体（App 用户 / 智能体 / 服务）。 */
+/* ------------------------------------------------------------------ */
+/* 资源：persons                                                       */
+/* ------------------------------------------------------------------ */
+
+/** 人（记忆主体：真人 / 智能体 / 服务）。 */
 export class PersonsResource {
   private readonly transport: RequestTransport;
 
@@ -1494,55 +881,53 @@ export class PersonsResource {
   }
 
   private base(partition: string): string {
-    const value = typeof partition === 'string' ? partition.trim() : '';
-    if (value === '') throw new TypeError('persons: partition（id 或 slug）不能为空');
-    return `/v1/partitions/${encodeURIComponent(value)}`;
-  }
-
-  private personPath(partition: string, personRef: string, suffix = ''): string {
-    return `${this.base(partition)}/persons/${encodeURIComponent(personRef)}${suffix}`;
-  }
-
-  /** 人列表（type / status / q / 分页 / 排序）。 */
-  async list(partition: string, input: PersonListInput = {}, options?: RequestOptions): Promise<PersonListResponse> {
-    const raw = await this.transport.request<unknown>('GET', `${this.base(partition)}/persons`, {
-      query: personListQuery(input),
-      options,
-    });
-    return normalizePersonPage(raw);
+    return `/v1/partitions/${encodeRef(partition)}/persons`;
   }
 
   /**
-   * 人详情（`:personRef` 支持内部 id 或 external_id）。
+   * 人列表：游标分页（`cursor` / `limit` / `q` / `type` / `status` / `sort`）。
    *
-   * 同一 external_id 同时命中 human 与 agent 时请改用内部 id。
+   * 响应带 `partition_stats` 头部统计；不返回 total。
    */
-  async get(partition: string, personRef: string, options?: RequestOptions): Promise<Person> {
-    const raw = await this.transport.request<unknown>('GET', this.personPath(partition, personRef), { options });
-    const record = asRecord(raw);
-    return normalizePerson(record.person ?? raw);
+  async list(
+    partition: string,
+    input: PersonListQuery = {},
+    options?: RequestOptions,
+  ): Promise<CursorPage<Person>> {
+    const raw = await this.transport.request<unknown>('GET', this.base(partition), {
+      query: personListQuery(input),
+      options,
+    });
+    return normalizePage(raw, normalizePerson);
   }
 
-  /** 建档 / 更新人（`PUT .../persons/:externalId`，按 external_id 幂等 upsert）。 */
+  /** 人详情（`personRef` 支持内部 id 或 external id）。 */
+  async get(partition: string, personRef: string, options?: RequestOptions): Promise<Person> {
+    const raw = await this.transport.request<unknown>(
+      'GET',
+      `${this.base(partition)}/${encodeRef(personRef)}`,
+      { options },
+    );
+    return normalizePerson(raw);
+  }
+
+  /** 建档 / 更新人（`PUT .../persons/:externalId`）。 */
   async upsert(
     partition: string,
     externalId: string,
-    input: PersonUpsertInput = {},
+    input: PersonInput = {},
     options?: RequestOptions,
   ): Promise<Person> {
-    if (typeof externalId !== 'string' || externalId.trim() === '') {
-      throw new TypeError('persons.upsert: externalId 不能为空');
-    }
+    if (!externalId.trim()) throw new TypeError('persons.upsert: externalId 不能为空');
     const raw = await this.transport.request<unknown>(
       'PUT',
-      this.personPath(partition, externalId),
+      `${this.base(partition)}/${encodeRef(externalId)}`,
       { body: personUpsertBody(input), options },
     );
-    const record = asRecord(raw);
-    return normalizePerson(record.person ?? raw);
+    return normalizePerson(raw);
   }
 
-  /** 局部更新人的显示名 / attributes / 状态（type 与 external_id 不可改）。 */
+  /** 局部更新人（展示名 / attributes / status）。 */
   async update(
     partition: string,
     personRef: string,
@@ -1551,306 +936,222 @@ export class PersonsResource {
   ): Promise<Person> {
     const raw = await this.transport.request<unknown>(
       'PATCH',
-      this.personPath(partition, personRef),
-      { body: personUpdateBody(input), options },
+      `${this.base(partition)}/${encodeRef(personRef)}`,
+      { body: assertPatchBody('persons.update', personUpdateBody(input)), options },
     );
-    const record = asRecord(raw);
-    return normalizePerson(record.person ?? raw);
+    return normalizePerson(raw);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 资源：memories                                                      */
+/* ------------------------------------------------------------------ */
+
+/** 记忆（永远属于一个人；共享由 `scope` 决定）。 */
+export class MemoriesResource {
+  private readonly transport: RequestTransport;
+
+  constructor(transport: RequestTransport) {
+    this.transport = transport;
   }
 
-  /** 人的简报：该人 scope=person 记忆 + 与其相关的分区共享记忆，压成可注入文本。 */
-  async brief(
-    partition: string,
-    personRef: string,
-    input: PersonBriefInput = {},
-    options?: RequestOptions,
-  ): Promise<MemoryBrief> {
-    const raw = await this.transport.request<unknown>('GET', this.personPath(partition, personRef, '/brief'), {
-      query: personBriefQuery(input),
-      options,
-    });
-    return normalizeBrief(raw);
+  private base(partition: string): string {
+    return `/v1/partitions/${encodeRef(partition)}/memories`;
   }
 
-  /** 人的上下文：资料 + 简报 + 高相关记忆 +（可选）分区共享知识，含可直接注入的 `prompt`。 */
-  async context(
-    partition: string,
-    personRef: string,
-    input: PersonContextInput = {},
-    options?: RequestOptions,
-  ): Promise<PersonContext> {
-    const raw = await this.transport.request<unknown>('POST', this.personPath(partition, personRef, '/context'), {
-      body: personContextBody(input),
-      options,
-    });
-    return normalizePersonContext(raw);
-  }
-
-  /** 人级做梦状态：待整理数 + 最近运行记录。 */
-  async dream(partition: string, personRef: string, options?: RequestOptions): Promise<MemoryDreamStatus> {
-    const raw = await this.transport.request<unknown>('GET', this.personPath(partition, personRef, '/dream'), {
-      options,
-    });
-    return normalizeDreamStatus(raw);
+  private personBase(partition: string, personRef: string): string {
+    return `/v1/partitions/${encodeRef(partition)}/persons/${encodeRef(personRef)}/memories`;
   }
 
   /**
-   * 立即对该人做一次增量做梦。
-   *
-   * 该人正在做梦时服务端返回 409，SDK 返回 `{ run: null, status }`（status 为回读状态）。
+   * 分区内记忆全局列表（游标分页）：可按人（内部 / 外部 ID）、scope、分类、
+   * 状态与 `q` 过滤。
    */
-  async dreamRun(
+  async list(
+    partition: string,
+    input: MemoryListQuery = {},
+    options?: RequestOptions,
+  ): Promise<CursorPage<Memory>> {
+    const raw = await this.transport.request<unknown>('GET', this.base(partition), {
+      query: memoryListQuery(input),
+      options,
+    });
+    return normalizePage(raw, normalizeMemory);
+  }
+
+  /** 某人的记忆列表（游标分页 + scope/category 过滤）。 */
+  async listByPerson(
     partition: string,
     personRef: string,
-    input: PersonDreamRunInput = {},
+    input: MemoryListQuery = {},
     options?: RequestOptions,
-  ): Promise<MemoryDreamResult> {
-    try {
-      const raw = await this.transport.request<unknown>('POST', this.personPath(partition, personRef, '/dream/run'), {
-        body: personDreamRunBody(input),
+  ): Promise<CursorPage<Memory>> {
+    const query = memoryListQuery(input);
+    // 人路径已经限定主体，不再重复发送 person_id。
+    delete query.person_id;
+    delete query.person_external_id;
+    const raw = await this.transport.request<unknown>('GET', this.personBase(partition, personRef), {
+      query,
+      options,
+    });
+    return normalizePage(raw, normalizeMemory);
+  }
+
+  /** 写入记忆（`personRef` 必填；scope 缺省取分区设置）。 */
+  async add(
+    partition: string,
+    personRef: string,
+    input: MemoryInput,
+    options?: RequestOptions,
+  ): Promise<AddMemoryResponse> {
+    const raw = await this.transport.request<unknown>('POST', this.personBase(partition, personRef), {
+      body: memoryAddBody(input),
+      options,
+    });
+    return normalizeAddResponse(raw);
+  }
+
+  /** 全文检索（FTS5 前缀匹配）。 */
+  async search(
+    partition: string,
+    input: MemorySearchInput,
+    options?: RequestOptions,
+  ): Promise<SearchResponse> {
+    if (!input.query?.trim()) throw new TypeError('memories.search: query 不能为空');
+    const raw = await this.transport.request<unknown>(
+      'POST',
+      `${this.base(partition)}/search`,
+      {
+        body: compact({
+          query: input.query,
+          person_id: pick(input.personId, input.person_id),
+          scope: input.scope,
+          category: input.category,
+          top_k: pick(input.topK, input.top_k),
+        }),
         options,
-      });
-      return normalizeDreamResult(raw);
-    } catch (error) {
-      if (error instanceof MnemosApiError && error.status === 409) {
-        return { run: null, status: await this.dream(partition, personRef, options) };
-      }
-      throw error;
-    }
+      },
+    );
+    return normalizeSearchResponse(raw);
+  }
+
+  /** 记忆详情（含归属人）。 */
+  async get(partition: string, id: string, options?: RequestOptions): Promise<MemoryDetail> {
+    const raw = await this.transport.request<unknown>(
+      'GET',
+      `${this.base(partition)}/${encodeRef(id)}`,
+      { options },
+    );
+    return normalizeMemoryDetail(raw);
+  }
+
+  /** 更新记忆（只发送提供的字段）。 */
+  async update(
+    partition: string,
+    id: string,
+    input: MemoryUpdateInput,
+    options?: RequestOptions,
+  ): Promise<MemoryMutationResponse> {
+    const raw = await this.transport.request<unknown>(
+      'PATCH',
+      `${this.base(partition)}/${encodeRef(id)}`,
+      { body: assertPatchBody('memories.update', memoryUpdateBody(input)), options },
+    );
+    return normalizeMemoryMutation(raw);
+  }
+
+  /** 删除记忆（服务端返回 204）。 */
+  async delete(partition: string, id: string, options?: RequestOptions): Promise<void> {
+    await this.transport.request<void>('DELETE', `${this.base(partition)}/${encodeRef(id)}`, { options });
   }
 }
 
 /* ------------------------------------------------------------------ */
-/* 资源：agents / tasks / context                                      */
+/* 资源：keys（控制台端点，需会话 token）                               */
 /* ------------------------------------------------------------------ */
 
-/** Agent 注册表资源。 */
-export class AgentsResource {
+/** 组织级 API Key（仅组织 owner 可管理）。 */
+export class OrgKeysResource {
   private readonly transport: RequestTransport;
 
   constructor(transport: RequestTransport) {
     this.transport = transport;
   }
 
-  /** 项目内 Agent 列表。 */
-  async list(options?: RequestOptions): Promise<AgentListResponse> {
-    const raw = await this.transport.request<unknown>('GET', '/v1/agents', { options });
-    const record = asRecord(raw);
-    const results = asArray(record.results);
-    return { results: results.map(normalizeAgent), count: asNumber(record.count, results.length) };
+  async list(options?: RequestOptions): Promise<ApiKey[]> {
+    const raw = await this.transport.request<unknown>('GET', '/api/org/keys', { options });
+    return asArray(raw).map(normalizeApiKey);
   }
 
-  /** 注册 Agent。 */
-  async create(input: AgentCreateInput, options?: RequestOptions): Promise<Agent> {
-    const raw = await this.transport.request<unknown>('POST', '/v1/agents', {
-      body: agentCreateBody(input),
+  async create(input: KeyInput, options?: RequestOptions): Promise<ApiKey> {
+    const raw = await this.transport.request<unknown>('POST', '/api/org/keys', {
+      body: keyBody(input),
       options,
     });
-    return normalizeAgent(raw);
+    return normalizeApiKey(raw);
+  }
+
+  async revoke(keyId: string, options?: RequestOptions): Promise<void> {
+    await this.transport.request<void>('DELETE', `/api/org/keys/${encodeRef(keyId)}`, { options });
   }
 }
-
-/** 任务会话资源。 */
-export class TasksResource {
-  private readonly transport: RequestTransport;
-
-  constructor(transport: RequestTransport) {
-    this.transport = transport;
-  }
-
-  /** 任务列表（按开始时间倒序）。 */
-  async list(input: TaskListInput = {}, options?: RequestOptions): Promise<TaskListResponse> {
-    const raw = await this.transport.request<unknown>('GET', '/v1/tasks', {
-      query: taskListQuery(input),
-      options,
-    });
-    const record = asRecord(raw);
-    const results = asArray(record.results);
-    return { results: results.map(normalizeTask), count: asNumber(record.count, results.length) };
-  }
-
-  /** 开始任务。 */
-  async create(input: TaskCreateInput, options?: RequestOptions): Promise<Task> {
-    const raw = await this.transport.request<unknown>('POST', '/v1/tasks', {
-      body: taskCreateBody(input),
-      options,
-    });
-    return normalizeTask(raw);
-  }
-
-  /** 任务详情。 */
-  async get(id: string, options?: RequestOptions): Promise<Task> {
-    const raw = await this.transport.request<unknown>('GET', `/v1/tasks/${encodeURIComponent(id)}`, { options });
-    return normalizeTask(raw);
-  }
-
-  /** 结束任务并沉淀决策 / 经验 / 备注。 */
-  async finish(id: string, input: TaskFinishInput = {}, options?: RequestOptions): Promise<TaskFinishResponse> {
-    const raw = await this.transport.request<unknown>('POST', `/v1/tasks/${encodeURIComponent(id)}/finish`, {
-      body: taskFinishBody(input),
-      options,
-    });
-    const record = asRecord(raw);
-    return {
-      task: normalizeTask(record.task),
-      memories: asArray(record.memories).map(normalizeMemory),
-    };
-  }
-}
-
-/** 任务简报资源。 */
-export class ContextResource {
-  private readonly transport: RequestTransport;
-
-  constructor(transport: RequestTransport) {
-    this.transport = transport;
-  }
-
-  /** 构建可直接注入 system prompt 的任务简报。 */
-  async build(input: ContextBuildInput = {}, options?: RequestOptions): Promise<Briefing> {
-    const raw = await this.transport.request<unknown>('POST', '/v1/context', {
-      body: contextBody(input),
-      options,
-    });
-    return normalizeBriefing(raw);
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* 资源：webhooks（beta）                                              */
-/* ------------------------------------------------------------------ */
 
 /**
- * Webhook 资源。
+ * API Key 管理（控制台端点）。
  *
- * 服务端已提供 `/v1/webhooks`、`/v1/webhooks/{id}/rotate-secret`、
- * `/v1/webhooks/{id}/deliveries` 与 `/v1/webhook-deliveries/{id}/replay`。
- *
- * @beta 端点与字段仍可能调整，生产接入前请确认 `docs/api.md`。
+ * 这些方法走 `/api/partitions/:partition/keys`（控制台鉴权），因此客户端的
+ * `apiKey` 需要是控制台会话 token，而不是 `mnemos_live_*` API Key。
  */
-export class WebhooksResource {
+export class KeysResource {
   private readonly transport: RequestTransport;
+  /** 组织级密钥。 */
+  readonly org: OrgKeysResource;
 
   constructor(transport: RequestTransport) {
     this.transport = transport;
+    this.org = new OrgKeysResource(transport);
   }
 
-  /**
-   * 列出 Webhook。
-   *
-   * @beta
-   */
-  async list(options?: RequestOptions): Promise<WebhookListResponse> {
-    const raw = await this.transport.request<unknown>('GET', '/v1/webhooks', { options });
-    // 服务端 v1 直接返回数组；兼容旧版 { results } 包装。
-    const items = Array.isArray(raw) ? raw : asArray(asRecord(raw).results);
-    return { results: items.map(normalizeWebhook), count: items.length };
+  private base(partition: string): string {
+    return `/api/partitions/${encodeRef(partition)}/keys`;
   }
 
-  /**
-   * 创建 Webhook。
-   *
-   * @beta
-   */
-  async create(input: WebhookCreateInput, options?: RequestOptions): Promise<Webhook> {
-    const raw = await this.transport.request<unknown>('POST', '/v1/webhooks', {
-      body: webhookBody(input),
+  async list(partition: string, options?: RequestOptions): Promise<ApiKey[]> {
+    const raw = await this.transport.request<unknown>('GET', this.base(partition), { options });
+    return asArray(raw).map(normalizeApiKey);
+  }
+
+  /** 创建分区 key；响应里的 `secret` 只出现一次。 */
+  async create(partition: string, input: KeyInput, options?: RequestOptions): Promise<ApiKey> {
+    const raw = await this.transport.request<unknown>('POST', this.base(partition), {
+      body: keyBody(input),
       options,
     });
-    return normalizeWebhook(raw);
+    return normalizeApiKey(raw);
   }
 
-  /**
-   * 更新 Webhook。
-   *
-   * @beta
-   */
-  async update(id: string, input: WebhookUpdateInput, options?: RequestOptions): Promise<Webhook> {
-    const raw = await this.transport.request<unknown>('PATCH', `/v1/webhooks/${encodeURIComponent(id)}`, {
-      body: webhookBody(input),
-      options,
-    });
-    return normalizeWebhook(raw);
-  }
-
-  /**
-   * 删除 Webhook。
-   *
-   * @beta
-   */
-  async delete(id: string, options?: RequestOptions): Promise<MutationResponse> {
-    const raw = await this.transport.request<unknown>('DELETE', `/v1/webhooks/${encodeURIComponent(id)}`, {
-      options,
-    });
-    return normalizeMutation(raw);
-  }
-
-  /**
-   * 轮换签名密钥，返回带明文 `secret` 的 Webhook。
-   *
-   * @beta
-   */
-  async rotateSecret(id: string, options?: RequestOptions): Promise<Webhook> {
-    const raw = await this.transport.request<unknown>(
-      'POST',
-      `/v1/webhooks/${encodeURIComponent(id)}/rotate-secret`,
-      { body: {}, options },
-    );
-    return normalizeWebhook(raw);
-  }
-
-  /**
-   * 投递记录。
-   *
-   * @beta
-   */
-  async deliveries(
-    id: string,
-    input: WebhookDeliveryListInput = {},
+  /** 轮换分区 key（v6 立即吊销旧 key；`graceHours` 仅写审计）。 */
+  async rotate(
+    partition: string,
+    keyId: string,
+    input: KeyRotateInput = {},
     options?: RequestOptions,
-  ): Promise<WebhookDeliveryListResponse> {
-    const raw = await this.transport.request<unknown>('GET', `/v1/webhooks/${encodeURIComponent(id)}/deliveries`, {
-      query: queryFrom({
-        page: input.page,
-        page_size: pick(input.pageSize, input.page_size) ?? input.limit,
-        status: input.status,
-      }),
-      options,
-    });
-    const record = asRecord(raw);
-    const items = asArray(record.items ?? record.results);
-    return {
-      items: items.map(normalizeDelivery),
-      page: asNumber(record.page, 1),
-      page_size: asNumber(record.page_size, asNumber(record.pageSize, items.length)),
-      total: asNumber(record.total, items.length),
-      total_pages: asNumber(record.total_pages, asNumber(record.totalPages, 1)),
-    };
-  }
-
-  /**
-   * 重放某次投递。
-   *
-   * 服务端端点为 `POST /v1/webhook-deliveries/{deliveryId}/replay`，只需要投递 ID；
-   * 同时兼容早期的 `replay(webhookId, deliveryId)` 两参数写法。
-   *
-   * @beta
-   */
-  async replay(deliveryId: string, options?: RequestOptions): Promise<WebhookDelivery>;
-  async replay(webhookId: string, deliveryId: string, options?: RequestOptions): Promise<WebhookDelivery>;
-  async replay(
-    deliveryIdOrWebhookId: string,
-    optionsOrDeliveryId?: RequestOptions | string,
-    maybeOptions?: RequestOptions,
-  ): Promise<WebhookDelivery> {
-    const deliveryId = typeof optionsOrDeliveryId === 'string' ? optionsOrDeliveryId : deliveryIdOrWebhookId;
-    const options = typeof optionsOrDeliveryId === 'string' ? maybeOptions : optionsOrDeliveryId;
+  ): Promise<ApiKey> {
     const raw = await this.transport.request<unknown>(
       'POST',
-      `/v1/webhook-deliveries/${encodeURIComponent(deliveryId)}/replay`,
-      { body: {}, options },
+      `${this.base(partition)}/${encodeRef(keyId)}/rotate`,
+      { body: keyRotateBody(input), options },
     );
-    return normalizeDelivery(raw);
+    return normalizeApiKey(raw);
+  }
+
+  /** 吊销分区 key。 */
+  async revoke(partition: string, keyId: string, options?: RequestOptions): Promise<void> {
+    await this.transport.request<void>(
+      'DELETE',
+      `${this.base(partition)}/${encodeRef(keyId)}`,
+      { options },
+    );
   }
 }
 
@@ -1860,20 +1161,14 @@ export class WebhooksResource {
 
 /** Mnemos 客户端。 */
 export class MnemosClient implements RequestTransport {
+  /** 分区（App / 项目 / 租户 / 工作区）。 */
+  readonly partitions: PartitionsResource;
+  /** 人（记忆主体）。 */
+  readonly persons: PersonsResource;
   /** 记忆。 */
   readonly memories: MemoriesResource;
-  /** 分区（项目/应用/租户/工作区，中立 v5）。 */
-  readonly partitions: PartitionsResource;
-  /** 人（记忆主体，中立 v5）。 */
-  readonly persons: PersonsResource;
-  /** Agent 注册表。 */
-  readonly agents: AgentsResource;
-  /** 任务会话。 */
-  readonly tasks: TasksResource;
-  /** 任务简报。 */
-  readonly context: ContextResource;
-  /** Webhook（beta）。 */
-  readonly webhooks: WebhooksResource;
+  /** API Key 管理（控制台会话 token）。 */
+  readonly keys: KeysResource;
 
   private readonly apiKey: string;
   private readonly baseUrl: string;
@@ -1911,13 +1206,10 @@ export class MnemosClient implements RequestTransport {
     this.maxRetries = maxRetries;
     this.fetchImpl = impl.bind(globalThis);
 
-    this.memories = new MemoriesResource(this);
     this.partitions = new PartitionsResource(this);
     this.persons = new PersonsResource(this);
-    this.agents = new AgentsResource(this);
-    this.tasks = new TasksResource(this);
-    this.context = new ContextResource(this);
-    this.webhooks = new WebhooksResource(this);
+    this.memories = new MemoriesResource(this);
+    this.keys = new KeysResource(this);
   }
 
   /** 发送一次（含重试）API 请求。内部方法，资源类使用。 */
@@ -1934,7 +1226,7 @@ export class MnemosClient implements RequestTransport {
     Object.assign(headers, options.headers ?? {});
 
     const timeoutMs = options.timeoutMs ?? this.timeoutMs;
-    const retryableRequest = canRetryRequest(method, path, options.idempotencyKey);
+    const retryableRequest = canRetryRequest(method, path);
     const requestBody = config.body === undefined ? undefined : JSON.stringify(config.body);
     let lastError: MnemosApiError | null = null;
 
@@ -1961,6 +1253,7 @@ export class MnemosClient implements RequestTransport {
         });
 
         if (response.ok) {
+          if (response.status === 204) return undefined as T;
           return await parseJsonResponse<T>(response);
         }
 
@@ -2001,277 +1294,154 @@ export class MnemosClient implements RequestTransport {
   }
 
   /* ------------------------------------------------------------------ */
-  /* 记忆简报 / 做梦（控制台 API，需会话 token）                          */
+  /* 人级简报 / 上下文 / 做梦                                            */
   /* ------------------------------------------------------------------ */
 
   /**
-   * 获取项目记忆简报：最近的活跃记忆/洞见压缩成不超过 `maxChars` 的文本。
+   * 获取人级简报：最近的活跃记忆压缩成不超过 `maxChars` 的文本。
    *
-   * 走控制台 API `GET /api/projects/{id}/memory/brief`，`apiKey` 需要传控制台
-   * 会话 token（而非 `mnemos_live_*` API Key）。命中缓存时 `cached=true`；
-   * 传 `force: true` 可跳过缓存重新生成。
-   */
-  async brief(
-    projectId: string,
-    input: MemoryBriefInput = {},
-    options?: RequestOptions,
-  ): Promise<MemoryBrief> {
-    const raw = await this.request<unknown>(
-      'GET',
-      `/api/projects/${encodeURIComponent(projectId)}/memory/brief`,
-      { query: briefQuery(input), options },
-    );
-    return normalizeBrief(raw);
-  }
-
-  /** 更新项目简报字符上限（100–5000），返回更新后的记忆简报。 */
-  async updateBriefSettings(projectId: string, maxChars: number, options?: RequestOptions): Promise<MemoryBrief> {
-    const raw = await this.request<unknown>(
-      'PATCH',
-      `/api/projects/${encodeURIComponent(projectId)}/memory/brief`,
-      { body: { maxChars }, options },
-    );
-    return normalizeBrief(raw);
-  }
-
-  /** 读取项目做梦状态：设置、尚未做梦的记忆数、最近 10 次运行记录。 */
-  async dream(projectId: string, options?: RequestOptions): Promise<MemoryDreamStatus> {
-    const raw = await this.request<unknown>('GET', `/api/projects/${encodeURIComponent(projectId)}/memory/dream`, {
-      options,
-    });
-    return normalizeDreamStatus(raw);
-  }
-
-  /** 更新做梦设置（是否开启、周期分钟数），返回最新状态。 */
-  async updateDreamSettings(
-    projectId: string,
-    input: MemoryDreamSettingsInput,
-    options?: RequestOptions,
-  ): Promise<MemoryDreamStatus> {
-    const raw = await this.request<unknown>('PATCH', `/api/projects/${encodeURIComponent(projectId)}/memory/dream`, {
-      body: dreamSettingsBody(input),
-      options,
-    });
-    return normalizeDreamStatus(raw);
-  }
-
-  /**
-   * 手动触发一次增量做梦。
-   *
-   * 服务端同一项目同时只允许一次做梦：正在运行时返回 HTTP 409，
-   * SDK 会据此返回 `{ run: null, status }`（`status` 为重新读取的当前状态）。
-   */
-  async runDream(projectId: string, options?: RequestOptions): Promise<MemoryDreamResult> {
-    try {
-      const raw = await this.request<unknown>(
-        'POST',
-        `/api/projects/${encodeURIComponent(projectId)}/memory/dream/run`,
-        { body: {}, options },
-      );
-      return normalizeDreamResult(raw);
-    } catch (error) {
-      if (error instanceof MnemosApiError && error.status === 409) {
-        return { run: null, status: await this.dream(projectId, options) };
-      }
-      throw error;
-    }
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* 中立记忆服务 v5：人级简报 / 上下文 / 做梦（快捷方法）                */
-  /* ------------------------------------------------------------------ */
-
-  /**
-   * 人的简报（快捷方法，等价于 `client.persons.brief(partition, personRef, input)`）。
-   *
-   * 走 `GET /v1/partitions/:p/persons/:person/brief`，需要 `memories:read`。
+   * 命中缓存时 `cached=true`；传 `force: true` 可跳过缓存重新生成。
    */
   async personBrief(
     partition: string,
     personRef: string,
-    input: PersonBriefInput = {},
+    input: PersonBriefQuery = {},
     options?: RequestOptions,
   ): Promise<MemoryBrief> {
-    return this.persons.brief(partition, personRef, input, options);
+    const raw = await this.request<unknown>(
+      'GET',
+      `/v1/partitions/${encodeRef(partition)}/persons/${encodeRef(personRef)}/brief`,
+      { query: personBriefQuery(input), options },
+    );
+    return normalizeBrief(raw);
   }
 
-  /**
-   * 人的上下文（快捷方法）：资料 + 简报 + 高相关记忆 + 可选分区共享知识 + `prompt`。
-   *
-   * 走 `POST /v1/partitions/:p/persons/:person/context`，需要 `memories:read`。
-   */
+  /** 人级上下文：资料 + 简报 + 相关记忆 +（可选）分区共享知识，附带可注入的 prompt。 */
   async personContext(
     partition: string,
     personRef: string,
     input: PersonContextInput = {},
     options?: RequestOptions,
   ): Promise<PersonContext> {
-    return this.persons.context(partition, personRef, input, options);
+    const raw = await this.request<unknown>(
+      'POST',
+      `/v1/partitions/${encodeRef(partition)}/persons/${encodeRef(personRef)}/context`,
+      { body: personContextBody(input), options },
+    );
+    return normalizeContext(raw);
   }
 
-  /** 人级做梦状态（快捷方法）。 */
-  async personDream(partition: string, personRef: string, options?: RequestOptions): Promise<MemoryDreamStatus> {
-    return this.persons.dream(partition, personRef, options);
+  /** 人级做梦状态：设置、待整理数、最近运行记录。 */
+  async personDream(
+    partition: string,
+    personRef: string,
+    options?: RequestOptions,
+  ): Promise<MemoryDreamStatus> {
+    const raw = await this.request<unknown>(
+      'GET',
+      `/v1/partitions/${encodeRef(partition)}/persons/${encodeRef(personRef)}/dream`,
+      { options },
+    );
+    return normalizeDreamStatus(raw);
   }
 
-  /** 立即对该人做一次增量做梦（快捷方法；该人正在做梦时返回 `{ run: null, status }`）。 */
+  /** 手动触发一次人级做梦（增量记忆巩固）。 */
   async personDreamRun(
     partition: string,
     personRef: string,
-    input: PersonDreamRunInput = {},
+    input: MemoryDreamInput = {},
     options?: RequestOptions,
   ): Promise<MemoryDreamResult> {
-    return this.persons.dreamRun(partition, personRef, input, options);
+    const raw = await this.request<unknown>(
+      'POST',
+      `/v1/partitions/${encodeRef(partition)}/persons/${encodeRef(personRef)}/dream/run`,
+      { body: dreamRunBody(input), options },
+    );
+    return normalizeDreamResult(raw);
   }
 
-  /** 实体关系图谱。 */
-  async graph(input: number | GraphInput = {}, options?: RequestOptions): Promise<GraphData> {
-    const query: GraphInput = typeof input === 'number' ? { limit: input } : input;
-    const raw = await this.request<unknown>('GET', '/v1/graph', {
-      query: queryFrom({ limit: query.limit, user_id: pick(query.userId, query.user_id) }),
-      options,
-    });
-    return normalizeGraph(raw);
-  }
+  /* ------------------------------------------------------------------ */
+  /* 健康检查                                                            */
+  /* ------------------------------------------------------------------ */
 
-  /** 项目指标。 */
-  async stats(options?: RequestOptions): Promise<StatsResponse> {
-    const raw = await this.request<unknown>('GET', '/v1/stats', { options });
-    return { metrics: normalizeMetrics(asRecord(raw).metrics) };
-  }
-
-  /** 健康检查（无需 API Key）。 */
+  /** 健康检查（无需鉴权）。 */
   async health(options?: RequestOptions): Promise<HealthResponse> {
-    const raw = await this.request<unknown>('GET', '/v1/health', { options });
-    const record = asRecord(raw);
-    return {
-      ok: asBoolean(record.ok),
-      version: asString(record.version),
-      uptime_ms: asNumber(record.uptime_ms, asNumber(record.uptimeMs)),
-    };
-  }
-
-  /** 导出项目（`mnemos-export/v1`，已归一化为 snake_case 模型）。 */
-  async export(options?: RequestOptions): Promise<ProjectExport> {
-    const raw = await this.request<unknown>('GET', '/v1/export', { options });
-    return normalizeExport(raw);
-  }
-
-  /**
-   * 导入记忆（≤1000 条/次）。
-   *
-   * 入参可以是 `export()` 返回的文档，也可以是 `{ memories: [...] }`；
-   * 前者会自动转换回服务端导入格式。
-   */
-  async import(document: ProjectExport | ImportDocument, options?: RequestOptions): Promise<ImportResult> {
-    const body = isProjectExport(document) ? exportToImportDocument(document) : document;
-    const raw = await this.request<unknown>('POST', '/v1/import', { body, options });
-    const record = asRecord(raw);
-    return {
-      imported: asNumber(record.imported),
-      skipped: asNumber(record.skipped),
-      failed: asNumber(record.failed),
-      errors: asArray(record.errors).map((item) => {
-        const entry = asRecord(item);
-        return { index: asNumber(entry.index), message: asString(entry.message) };
-      }),
-    };
+    const raw = await this.request<unknown>('GET', '/health', { options });
+    return normalizeHealth(raw);
   }
 
   private buildUrl(path: string, query: Query | undefined): string {
-    const suffix = path.startsWith('/') ? path : `/${path}`;
-    return `${this.baseUrl}${suffix}${buildQuery(query)}`;
+    return `${this.baseUrl}${path}${buildQuery(query)}`;
   }
 }
 
 export type {
+  AddMemoryInput,
   AddMemoryResponse,
-  Agent,
-  AgentCreateInput,
-  AgentListResponse,
-  Briefing,
-  BriefingBrief,
+  ApiErrorPayload,
+  ApiKey,
+  ApiKeyKind,
+  ApiScope,
+  Audit,
+  AuditLog,
   ChatMessage,
-  ContextBuildInput,
-  EntityRef,
-  FeedbackInput,
-  GraphData,
-  GraphInput,
+  CursorPage,
+  DreamResult,
+  DreamRun,
+  DreamRunInput,
+  DreamStatus,
   HealthResponse,
-  ImportDocument,
-  ImportMemoryInput,
-  ImportResult,
+  Key,
+  KeyInput,
+  KeyRotateInput,
   Memory,
-  MemoryAddInput,
+  MemoryAddResponse,
   MemoryBrief,
-  MemoryBriefInput,
   MemoryBriefItem,
   MemoryCategory,
   MemoryDetail,
+  MemoryDreamInput,
   MemoryDreamResult,
   MemoryDreamRun,
   MemoryDreamRunStatus,
   MemoryDreamSettings,
-  MemoryDreamSettingsInput,
   MemoryDreamStatus,
   MemoryDreamTrigger,
   MemoryEvent,
-  MemoryHistoryEntry,
-  MemoryHistoryResponse,
-  MemoryListInput,
-  MemoryListResponse,
+  MemoryInput,
+  MemoryListQuery,
   MemoryMutationResponse,
   MemoryScope,
   MemorySearchInput,
+  MemorySource,
   MemoryStatus,
   MemoryUpdateInput,
-  MemoryVisibility,
+  MessageRole,
   MnemosClientOptions,
-  MutationResponse,
   Partition,
-  PartitionCreateInput,
-  PartitionCreateResponse,
+  PartitionInput,
+  PartitionSettings,
+  PartitionSettingsInput,
+  PartitionStats,
+  PartitionStatus,
   Person,
-  PersonBriefInput,
+  PersonBrief,
+  PersonBriefQuery,
   PersonContext,
   PersonContextInput,
-  PersonDreamRunInput,
   PersonInput,
-  PersonListInput,
-  PersonListResponse,
-  PersonScope,
-  PersonStats,
+  PersonListQuery,
+  PersonSort,
   PersonStatus,
   PersonType,
   PersonUpdateInput,
-  PersonUpsertInput,
-  ApiKey,
-  ApiKeyKind,
-  ApiKeyScope,
-  ProjectExport,
-  ProjectMetrics,
-  Relation,
   RequestOptions,
-  SearchFilters,
-  SearchHit,
   SearchResponse,
-  SignalScores,
-  StatsResponse,
-  Task,
-  TaskCreateInput,
-  TaskFinishInput,
-  TaskFinishResponse,
-  TaskListInput,
-  TaskListResponse,
-  Webhook,
-  WebhookCreateInput,
-  WebhookDelivery,
-  WebhookDeliveryListInput,
-  WebhookDeliveryListResponse,
-  WebhookDeliveryStatus,
-  WebhookEventType,
-  WebhookListResponse,
-  WebhookUpdateInput,
+  Session,
+  Usage,
+  UsageAnalytics,
+  UsageBreakdownRow,
+  UsagePoint,
 } from './types.js';
 
 export default MnemosClient;

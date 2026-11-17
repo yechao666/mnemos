@@ -1,942 +1,697 @@
-# Mnemos API 参考
+# Mnemos v6 API 参考
 
-两个命名空间：
-
-| 命名空间 | 鉴权方式 | 命名风格 | 用途 |
-| --- | --- | --- | --- |
-| `/v1/*` | `Authorization: Bearer mnemos_live_*`（API Key：`project` 绑定分区 / `org` 组织级） | snake_case | 面向 Agent / SDK 的稳定接口（v5 中立面见第 11 节） |
-| `/api/*` | `Authorization: Bearer <session>`（控制台会话） | camelCase | 控制台内部接口 |
-
-通用约定：
-
-- 请求/响应均为 JSON，`content-type: application/json`；请求体上限 1 MB。
-- 每个响应带 `x-request-id`，错误响应体统一为：
-
-```json
-{ "error": { "code": "FORBIDDEN", "message": "当前密钥缺少 memories:write 作用域", "requestId": "req_..." } }
-```
-
-- 时间均为 ISO 8601 UTC 字符串。
-- 分页参数：`page`（从 1 开始）、`page_size`（默认 20，最大 100）。
-
----
-
-## 1. 认证与密钥
-
-API Key 在控制台「项目 · 密钥」创建，明文只展示一次。作用域：
-
-| 作用域 | 允许的操作 |
-| --- | --- |
-| `memories:read` | 搜索、列表、详情、历史 |
-| `memories:write` | 写入、更新、删除 |
-| `graph:read` | 图谱查询 |
-| `admin` | 统计与项目级信息 |
-
-### 1.1 密钥类型：project / org
-
-v5 中立记忆服务引入组织级 API Key（`kind=org`），两类密钥的能力边界：
-
-| kind | 绑定 | 能力 | 典型用途 |
-| --- | --- | --- | --- |
-| `project`（默认） | 单个分区 | 只能访问自身分区；中立端点 `:partition` 必须等于自身 | 业务后端、控制台演示 |
-| `org` | 组织 | 可访问 / `POST /v1/partitions` 创建本组织任意分区 | DSH 插件按工作区建分区、SaaS 多租户接入 |
-
-- 中立 `/v1/partitions/*` 端点同时接受两种 key；旧 `/v1/memories`、`/v1/context` 等仍只接受 `project` key（org key 走分区端点）。
-- org key 的明文只在创建响应出现一次，之后只能看到 `prefix`。
-
-### 1.2 org key 管理（控制台 API，仅组织 owner）
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/org/keys` | 创建：`{name, scopes, partitionId?, rateLimitPerMin?, expiresAt?, allowedIps?}` → `201` + 一次性 `secret` |
-| `GET` | `/api/org/keys` | 列表（**不含**明文 secret） |
-| `DELETE` | `/api/org/keys/{keyId}` | 吊销（软删，立即失效） |
-
-```bash
-# 1) 登录演示账号拿控制台会话令牌
-SESSION=$(curl -s -X POST $BASE/api/auth/login -H 'content-type: application/json' \
-  -d '{"email":"lin.wei@mnemos.dev","password":"mnemos-demo"}' | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).token')
-
-# 2) 创建 org key（需要组织 owner；锚点分区缺省取组织最早创建的分区）
-curl -X POST $BASE/api/org/keys \
-  -H "Authorization: Bearer $SESSION" -H 'content-type: application/json' \
-  -d '{"name":"DSH 工作区","scopes":["memories:read","memories:write","admin"],"rateLimitPerMin":600}'
-```
-
-响应（`secret` 仅此一次；`kind=org`、`orgId` 标识组织级密钥）：
-
-```json
-{
-  "id": "key_…",
-  "projectId": "prj_orion_python",
-  "kind": "org",
-  "orgId": "org_yunshu",
-  "name": "DSH 工作区",
-  "prefix": "mnemos_live_ab12cd34",
-  "scopes": ["memories:read", "memories:write", "admin"],
-  "rateLimitPerMin": 600,
-  "allowedIps": [],
-  "expiresAt": null,
-  "createdAt": "2026-11-05T10:00:00.000Z",
-  "secret": "mnemos_live_…"
-}
-```
-
-> org key 必须绑定一个**锚点分区**（`api_keys.project_id NOT NULL`），仅用于审计与用量兜底；
-> 锚点缺省取组织最早创建的分区，显式传 `partitionId` 时校验分区属于本组织。组织下还没有
-> 任何分区时返回 `409 CONFLICT`（先创建至少一个项目/分区）。
-
-演示密钥（seed 生成）：`mnemos_live_demo_aurora_console`（项目 `aurora-support`）。
-
----
-
-## 2. 写入记忆（旧 v1，v5 保留）
-
-`POST /v1/memories`
-
-> v5 起推荐使用中立分区端点 `POST /v1/partitions/:p/memories`（支持人级 `person_id` / `scope` /
-> `session_id`，见第 11 节）；本节接口保持兼容。
-
-| 字段 | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `messages` | array | 二选一 | `[{role: user\|assistant\|system\|tool, content}]` |
-| `text` | string | 二选一 | 纯文本 |
-| `user_id` | string | 否 | 记忆归属用户 |
-| `agent_id` | string | 否 | 记忆归属 Agent |
-| `run_id` | string | 否 | 单次运行作用域 |
-| `app_id` | string | 否 | 应用作用域 |
-| `task_id` | string | 否 | 所属任务会话（Agent 原生） |
-| `visibility` | string | 否 | `project`（默认，项目共享）/ `agent`（仅该 Agent）/ `task`（仅该任务） |
-| `metadata` | object | 否 | 自定义元数据 |
-| `infer` | boolean | 否 | 默认 `false`（原文入库）；`true` 走事实抽取 |
-| `mode` | string | 否 | `additive`（默认）或 `consolidate`（高相似去重） |
-
-```bash
-curl -X POST http://127.0.0.1:4380/v1/memories \
-  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{
-    "messages": [
-      { "role": "user", "content": "我是张倩，偏好企业微信联系，上午 9 点到 11 点回复最快。" }
-    ],
-    "user_id": "cust-1042",
-    "agent_id": "agent-support-l1",
-    "infer": true
-  }'
-```
-
-响应：
-
-```json
-{
-  "results": [
-    {
-      "id": "mem_…", "projectId": "prj_aurora_support",
-      "userId": "cust-1042", "agentId": "agent-support-l1",
-      "content": "张倩偏好通过企业微信联系，上午 9 点至 11 点回复最快。",
-      "category": "preference", "importance": 0.74, "confidence": 0.86,
-      "source": "api", "status": "active", "tags": [],
-      "metadata": {}, "createdAt": "2026-11-05T14:20:00.000Z",
-      "updatedAt": "2026-11-05T14:20:00.000Z", "accessCount": 0
-    }
-  ],
-  "events": [{ "type": "ADD", "memoryId": "mem_…", "content": "…", "at": "…" }],
-  "tookMs": 4,
-  "extracted": 1,
-  "merged": 0,
-  "skipped": 0
-}
-```
-
----
-
-## 3. 搜索记忆（旧 v1，v5 保留）
-
-`POST /v1/memories/search`
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `query` | string | 自然语言查询 |
-| `user_id` / `run_id` | string | 作用域过滤（精确匹配） |
-| `agent_id` | string | **调用方 Agent 身份**：决定可见性（项目共享 + 自身私有 + 当前任务），不会过滤掉其他 Agent 的共享记忆 |
-| `written_by_agent_id` | string | 归属过滤：只看该 Agent 写入的记忆 |
-| `task_id` | string | 任务上下文：既作为可见性依据，也只返回该任务写入的记忆 |
-| `visibility` | string | 仅检索指定可见性 |
-| `include_private` | boolean | 默认 false；控制台/审计可设为 true 查看所有 Agent 私有记忆 |
-
-> 关键语义：Agent 带自己的 `agent_id` 检索时，**仍然能看到项目内其他 Agent 写入的共享记忆**；只有 `visibility=agent` 的私有记忆按写入者隔离。
-| `top_k` | number | 默认取项目设置（8），最大 50 |
-| `threshold` | number | 0–1，最低融合分 |
-| `filters` | object | `status` / `category` / `tags` / `created_after` / `created_before` / `min_importance` / `metadata` |
-
-响应包含逐命中信号分解：
-
-```json
-{
-  "results": [
-    {
-      "id": "mem_…", "memory": "张倩偏好通过企业微信联系…",
-      "score": 0.73,
-      "signals": { "semantic": 0.68, "keyword": 0.52, "entity": 0.4, "recency": 0.81, "importance": 0.74 },
-      "matchedOn": ["semantic", "keyword", "entity"],
-      "entities": ["张倩", "企业微信"]
-    }
-  ],
-  "total": 1, "took_ms": 6, "signals": ["semantic", "keyword", "entity", "recency", "importance"]
-}
-```
-
-融合公式（权重来自项目设置）：
-
-```
-score = w_semantic·cos + w_keyword·BM25' + w_entity·overlap + w_recency·recency + 0.15·importance
-```
-
----
-
-## 4. 记忆管理（旧 v1，v5 保留）
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/v1/memories?user_id=&agent_id=&page=&page_size=` | 分页列表 |
-| `GET` | `/v1/memories/{id}` | 详情（含实体与历史） |
-| `PUT` | `/v1/memories/{id}` | 更新正文 `{"text": "…"}` |
-| `DELETE` | `/v1/memories/{id}` | 软删除（写历史） |
-| `DELETE` | `/v1/memories?user_id=…&confirm=true` | 批量删除（必须带 confirm） |
-| `GET` | `/v1/memories/{id}/history` | 变更历史 |
-| `POST` | `/v1/memories/{id}/feedback` | `{"helpful": true}` 调整重要度 |
-
-`category` 枚举新增 `insight`、`source` 枚举新增 `dream`：`GET /v1/memories?category=insight` 可读取做梦生成的洞见，`PUT /v1/memories/{id}` 也可把分类更新为 `insight`。
-
----
-
-## 5. 图谱与统计
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/v1/graph?user_id=&limit=120` | 实体节点与关系边 |
-| `GET` | `/v1/stats` | 项目指标：记忆数、检索量、p50/p95、命中率等 |
-| `GET` | `/v1/health` | 健康检查 |
-
----
-
-## 6. Agent 原生 API（v4 兼容层）
-
-> 设计说明见 [`agent-memory-model.md`](agent-memory-model.md)。所有 `/v1` 接口的项目由 API Key 决定。
+> 契约：[`v6-architecture.md`](v6-architecture.md)。本文以 v6 代码为准
+> （`server/src/http/routes/*.ts`、`server/src/http/serialize.ts`、`server/src/http/schemas.ts`）。
 >
-> **v5 起推荐使用第 11 节的「分区 + 人」中立接口**；本节接口全部保留（只增不改），
-> 内部已映射为 `person` / `scope`：`agent_id` → `person(type=agent)`、`user_id` → `person(type=human)`、
-> `visibility` ↔ `scope`（project↔partition、agent↔person、task↔session）。
+> 两套 JSON 命名约定，**不是两套能力**：
+>
+> | 入口 | 前缀 | 鉴权 | 命名 |
+> | --- | --- | --- | --- |
+> | 公开 API | `/v1/partitions/:partition/...` | `Authorization: Bearer mnemos_live_…`（API Key） | `snake_case` |
+> | 控制台 API | `/api/...` | `Authorization: Bearer <登录会话令牌>` | `camelCase` |
+>
+> v6 **不保留** `/v1/memories`、`/v1/memories/search`、`/v1/context`、`/v1/projects`、`/v1/agents`、
+> `/v1/tasks`、`/v1/graph` 等旧端点；旧调用方需要迁移到分区 + 人模型（见[第 9 节](#9-与-v5-的差异)）。
 
-### 6.1 Agent 注册表
+---
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/v1/agents` | 项目内 Agent 列表（含角色、能力、记忆/任务统计） |
-| `POST` | `/v1/agents` | 注册 Agent：`{name, role?, model?, description?, capabilities?}` |
+## 1. 通用约定
 
-### 6.2 任务会话
+- **Base URL**：默认 `http://127.0.0.1:4380`；不带尾斜杠。
+- **请求体**：`content-type: application/json; charset=utf-8`；未知字段默认忽略（部分 schema 严格校验）。
+- **响应体**：JSON；成功直接返回资源对象或 `{ items, next_cursor, partition_stats }`。
+- **时间**：ISO 8601 UTC 字符串（如 `2026-11-17T16:00:44.852Z`）。
+- **请求 ID**：每个响应带 `x-request-id`；错误体里也有 `requestId`，可与日志关联。
+- **大小/超时**：请求体至少 1MB（`MNEMOS_BODY_LIMIT_BYTES` 可调大），请求超时默认 30s。
+- **探针**：`GET /health`、`GET /api/health`、`GET /healthz`、`GET /readyz`、`GET /metrics`（详见第 8 节）。
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/v1/tasks?status=&agent_id=` | 任务列表（按开始时间倒序） |
-| `POST` | `/v1/tasks` | 开始任务：`{title, goal?, owner_agent_id?, branch?}` |
-| `GET` | `/v1/tasks/{id}` | 任务详情 |
-| `POST` | `/v1/tasks/{id}/finish` | 结束任务：`{status?, summary?, decisions?, lessons?, notes?, agent_id?}` |
-
-`finish` 会把 `decisions[]`（→`fact`）、`lessons[]`（→`constraint`）、`notes[]`（→`event`）自动写成**项目共享记忆**，并关联到该 `task_id`：
-
-```bash
-curl -X POST $BASE/v1/tasks/task_orion_split_query/finish \
-  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{
-    "summary": "查询服务拆分完成首期",
-    "decisions": ["查询走 read replica，按 order_id 分片"],
-    "lessons": ["拆分前必须补齐双写对账，上次漏了退款单"],
-    "agent_id": "agent-coder"
-  }'
-```
-
-### 6.3 任务简报（上下文注入）
-
-`POST /v1/context`
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `agent_id` | string | 调用方 Agent（决定可见的私有记忆） |
-| `task_id` | string | 当前任务（决定任务内记忆与默认检索词） |
-| `query` | string | 覆盖默认检索词 |
-| `budget_tokens` | number | 默认 1200，按重要度/时效截断 |
-
-响应：
+### 错误体
 
 ```json
 {
-  "project": { "id": "prj_orion_python", "name": "Orion 订单服务 · Python", "description": "..." },
-  "agent": { "id": "agent-coder", "name": "开发 Agent" },
-  "task": { "id": "task_orion_split_query", "title": "拆分订单查询服务" },
-  "sections": [
-    { "key": "project", "title": "项目背景", "description": "…", "hits": [] },
-    { "key": "conventions", "title": "规范与约束", "hits": [] },
-    { "key": "decisions", "title": "历史决策", "hits": [] },
-    { "key": "experience", "title": "相关经验", "hits": [] },
-    { "key": "incidents", "title": "事故与告警", "hits": [] },
-    { "key": "agent_notes", "title": "我的私有笔记", "hits": [] },
-    { "key": "open_tasks", "title": "进行中的任务", "hits": [] }
-  ],
-  "prompt": "# 项目简报：Orion 订单服务 · Python\n- 生成时间：…\n\n## 记忆简报（最近记忆与洞见）\n- [约束] 库存扣减统一走 deduct_stock 服务方法…\n\n## 项目背景\n- [mem_…] …\n…",
-  "token_estimate": 986,
-  "citations": ["mem_…"],
-  "built_at": "2026-11-05T15:20:00.000Z",
-  "took_ms": 12,
-  "brief": {
-    "text": "# 记忆简报（最近记忆与洞见）\n- [约束] 库存扣减统一走 deduct_stock 服务方法…\n- [事实] 支付回调必须绑定业务单号做幂等…",
-    "maxChars": 500,
-    "count": 9
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "分区不存在",
+    "requestId": "req_e1860a48ce054010"
   }
 }
 ```
 
-`prompt` 是可直接拼进 system prompt 的中文 Markdown，每条记忆带 `[id]` 与 `from: agent/task/date`。
-
-**记忆简报注入（brief）**：项目 `briefEnabled !== false` 且简报非空（`count > 0`）时，响应额外带 `brief: {text, maxChars, count}`，并在 `prompt` 的「项目简报」元信息之后、各分区之前插入「记忆简报」段落；`briefEnabled=false` 或 `count=0` 时不注入、响应不带该字段。简报按调用方 `agent_id` 生成（项目共享记忆 + 该 Agent 私有记忆），字数上限取项目 `briefMaxChars`（默认 500）。字段说明：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `brief.text` | string | 简报正文；无可用记忆时为空串 |
-| `brief.maxChars` | number | 本次生成的字符上限（项目 `briefMaxChars`） |
-| `brief.count` | number | 纳入简报的记忆条数 |
+- `message` 为可直接展示的中文；`code` 为稳定英文标识（判断逻辑用它，不要匹配 message）。
+- 部分错误带 `details`（如 zod 校验详情、登录剩余尝试次数、配额重试秒数）。
 
 ---
 
-## 7. 错误码
+## 2. 鉴权与密钥
 
-| HTTP | code | 含义 |
-| --- | --- | --- |
-| 400 | `VALIDATION_ERROR` / `BAD_REQUEST` / `INVALID_JSON` | 参数不合法（`VALIDATION_ERROR` 附带 `details`）、请求体不是合法 JSON |
-| 401 | `UNAUTHORIZED` / `INVALID_API_KEY` / `API_KEY_REVOKED` | 缺少或无效凭证；API Key 无效/已吊销 |
-| 403 | `FORBIDDEN` | 作用域/角色不足 |
-| 404 | `NOT_FOUND` | 资源不存在或不属于该项目 |
-| 405 | `METHOD_NOT_ALLOWED` | 路径不支持该 HTTP 方法 |
-| 409 | `CONFLICT` | 唯一约束或并发冲突（例如同一项目正在做梦） |
-| 413 | `PAYLOAD_TOO_LARGE` | 请求体超过 1 MB |
-| 422 | `UNPROCESSABLE_ENTITY` | JSON 形状合法但语义不合法（如缺少必需上下文、参数越界） |
-| 429 | `RATE_LIMITED` / `quota_exceeded` / `login_rate_limited` | 密钥限流 / 月度配额耗尽 / 登录尝试过频 |
-| 500 | `INTERNAL_ERROR` / `ENGINE_ERROR` | 未预期的服务端异常 / 记忆引擎处理失败 |
-| 503 | `SERVICE_UNAVAILABLE` | 服务暂不可用 |
+### 2.1 三类凭据
 
----
+| 凭据 | Header | 可访问范围 | 用途 |
+| --- | --- | --- | --- |
+| 控制台会话 | `Bearer <session token>` | 本组织及其分区（按组织角色） | 控制台 `/api` |
+| 分区 API Key（`kind=partition`） | `Bearer mnemos_live_…` | **只能**访问自身分区 | 业务后端 / 单个分区集成 |
+| 组织 API Key（`kind=org`） | `Bearer mnemos_live_…` | 本组织**任意分区** + `POST /v1/partitions` | DSH 插件按工作区建分区、SaaS 多租户 |
 
-## 8. 控制台 API（`/api`，会话鉴权）
+- `:partition` 路径参数支持**内部 id 或 slug**；两种 key 都支持。
+- API Key 作用域：`memories:read`、`memories:write`、`admin`；`admin` 隐含读/写。
+  缺少作用域返回 `403 FORBIDDEN`。
+- Key 可设置 `rateLimitPerMin`（默认 600）、`expiresAt`、`allowedIps`（IPv4/CIDR）；
+  只存 SHA-256，明文 `secret` 只在创建/轮换响应中出现一次。
+- 限流是固定窗口（每分钟），响应头：`X-RateLimit-Limit`、`X-RateLimit-Remaining`、
+  `X-RateLimit-Reset`（epoch 秒）；超限 `429 RATE_LIMITED` + `Retry-After`。
+- 分区 key 访问别的分区统一 `404 NOT_FOUND`（不泄露存在性）；用分区 key 调
+  `POST /v1/partitions` 或需要 `admin` 的接口返回 `403 FORBIDDEN`。
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/auth/login` | `{email, password}` → `{token, user, org}` |
-| `GET` | `/api/auth/me` | 当前用户、组织与可见项目 |
-| `POST` | `/api/auth/logout` | 注销会话 |
-| `GET` | `/api/dashboard` | 组织级聚合 |
-| `GET` | `/api/projects` | 项目列表（含统计） |
-| `POST` | `/api/projects` | 创建项目 |
-| `PATCH` | `/api/projects/{id}` | 更新项目 |
-| `DELETE` | `/api/projects/{id}` | 归档项目 |
-| `GET` | `/api/projects/{id}/overview` | 项目概览 |
-| `GET` | `/api/projects/{id}/usage?days=30` | 用量分析 |
-| `GET` | `/api/projects/{id}/audit` | 审计日志（分页/筛选） |
-| `GET`/`POST` | `/api/projects/{id}/members` | 成员列表/新增 |
-| `PATCH`/`DELETE` | `/api/projects/{id}/members/{userId}` | 修改角色/移除 |
-| `GET`/`POST` | `/api/projects/{id}/keys` | 密钥列表/创建 |
-| `DELETE` | `/api/projects/{id}/keys/{keyId}` | 吊销密钥 |
-| `GET`/`POST` | `/api/org/keys` | 组织级（org）密钥列表 / 创建（仅组织 owner，明文一次） |
-| `DELETE` | `/api/org/keys/{keyId}` | 吊销 org 密钥 |
-| `GET` | `/api/projects/{id}/persons` | 人列表（`type` / `status` / `q` / 分页 / 排序） |
-| `GET` | `/api/projects/{id}/persons/{personRef}` | 人详情 + 统计（`memories` / `sharedMemories` / `sessions` / `lastMemoryAt`） |
-| `PUT` | `/api/projects/{id}/persons/{externalId}` | 建档 / 更新人（lazy upsert） |
-| `PATCH` | `/api/projects/{id}/persons/{personRef}` | 更新显示名 / attributes / status |
-| `GET` | `/api/projects/{id}/persons/{personRef}/brief` | 人的简报 |
-| `POST` | `/api/projects/{id}/persons/{personRef}/context` | 人的上下文（资料 + 简报 + 记忆 + prompt） |
-| `GET` | `/api/projects/{id}/persons/{personRef}/dream` | 人级做梦状态 |
-| `POST` | `/api/projects/{id}/persons/{personRef}/dream/run` | 手动触发人级做梦 |
-| `PATCH` | `/api/projects/{id}/settings` | 更新项目设置（含 `briefMaxChars` / `briefEnabled` / `dreamEnabled` / `dreamIntervalMinutes`） |
-| `GET` | `/api/projects/{id}/memory/brief` | 记忆简报：读取（`force` / `agentId` / `maxChars`） |
-| `PATCH` | `/api/projects/{id}/memory/brief` | 记忆简报：更新字符上限并重新生成 |
-| `GET` | `/api/projects/{id}/memory/dream` | 做梦状态：设置、待整理数、最近运行记录 |
-| `PATCH` | `/api/projects/{id}/memory/dream` | 做梦设置：开关与周期 |
-| `POST` | `/api/projects/{id}/memory/dream/run` | 手动触发一次增量做梦（运行中返回 409） |
-| `GET` | `/api/projects/{id}/memories` | 记忆列表（`q` 走混合检索） |
-| `GET`/`PATCH`/`DELETE` | `/api/memories/{id}` | 记忆详情/更新/删除 |
-| `POST` | `/api/memories/bulk` | 批量删除/归档/恢复 |
-| `GET` | `/api/memories/{id}/history` | 历史 |
-| `POST` | `/api/memories/{id}/feedback` | 反馈 |
-| `GET`/`POST` | `/api/projects/{id}/agents` | Agent 列表/注册 |
-| `PATCH` | `/api/projects/{id}/agents/{agentId}` | 更新 Agent |
-| `GET`/`POST` | `/api/projects/{id}/tasks` | 任务列表/创建 |
-| `GET`/`PATCH` | `/api/tasks/{id}` | 任务详情/更新 |
-| `POST` | `/api/tasks/{id}/finish` | 结束任务并沉淀经验 |
-| `GET` | `/api/projects/{id}/briefing` | 简报预览 |
-| `GET` | `/api/projects/{id}/graph` | 图谱 |
-| `POST` | `/api/projects/{id}/playground/add` | 演练场写入 |
-| `POST` | `/api/projects/{id}/playground/search` | 演练场检索 |
-| `GET` | `/api/events?token=` | SSE 实时事件流 |
-| `GET` | `/api/health` | 健康检查 |
+### 2.2 创建组织级 API Key（控制台，仅组织 owner）
 
-### 8.1 记忆简报与做梦
+```bash
+BASE=http://127.0.0.1:4380
 
-均为控制台会话鉴权，`{id}` 为项目 id（如 `prj_orion_python`）。读取（`GET`）需要项目 `viewer` 及以上，修改（`PATCH` / `POST`）需要 `admin` 及以上。相关项目设置项：`briefMaxChars`（100–5000，默认 500）、`briefEnabled`（默认 `true`）、`dreamEnabled`（默认 `true`）、`dreamIntervalMinutes`（1–43200，默认 1440），可通过 `PATCH /api/projects/{id}/settings` 修改。
+# 1) 登录拿控制台会话令牌
+SESSION=$(curl -s -X POST "$BASE/api/auth/login" -H 'content-type: application/json' \
+  -d '{"email":"admin@mnemos.dev","password":"Demo123456"}' \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).token')
 
-#### 读取记忆简报
+# 2) 创建 org key（secret 只返回这一次）
+curl -s -X POST "$BASE/api/org/keys" \
+  -H "authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{"name":"DSH 工作区","scopes":["memories:read","memories:write","admin"]}'
+```
 
-`GET /api/projects/{id}/memory/brief`
-
-| 查询参数 | 类型 | 说明 |
-| --- | --- | --- |
-| `force` | boolean | `true`/`1` 忽略缓存重新生成；默认 `false` |
-| `agentId` | string | 不传 = 控制台审计全量视角（含所有私有/任务记忆）；传 = 按该 Agent 视角生成（项目共享 + 该 Agent 私有，不含其他 Agent 私有） |
-| `maxChars` | integer | 临时覆盖项目 `briefMaxChars`（服务端 clamp 到 100–5000，不落库） |
-
-不传 `agentId` 时是审计视角，包含项目内所有记忆；传 `agentId` 时预览该 Agent 实际能拿到的简报（项目共享 + 其私有）。简报按「记忆集合 + 字符上限 + 视角」计算 `source_hash` 缓存，记忆变化或上限调整后自动失效。
-
-响应 `MemoryBrief`：
+响应（节选）：
 
 ```json
 {
-  "projectId": "prj_orion_python",
-  "text": "# 记忆简报（最近记忆与洞见）\n- [约束] 库存扣减统一走 deduct_stock 服务方法…\n- [事实] 支付回调必须绑定业务单号做幂等…",
-  "maxChars": 800,
-  "count": 12,
+  "id": "key_d7cfa499e85242cf",
+  "orgId": "org_2a3c939fc3904cf6",
+  "kind": "org",
+  "name": "DSH 工作区",
+  "prefix": "mnemos_live_9LSQr7",
+  "scopes": ["memories:read", "memories:write", "admin"],
+  "createdBy": "usr_3df6cf54dba0455a",
+  "createdAt": "2026-11-17T16:00:56.981Z",
+  "allowedIps": [],
+  "rateLimitPerMin": 600,
+  "secret": "mnemos_live_…（仅此一次）"
+}
+```
+
+- 组织 key 只有组织 **owner** 能创建/吊销；分区 key 由分区 `admin` 在控制台创建。
+- 轮换接口的 `graceHours` 仅写入审计：**v6 轮换会立即吊销旧 key**，避免新旧并存窗口。
+
+---
+
+## 3. 游标分页协议
+
+所有人 / 记忆列表统一使用 **keyset 游标**，响应固定为：
+
+```json
+{
+  "items": [ { "id": "prs_…", "external_id": "…" } ],
+  "next_cursor": "eyJ2IjoiMjAyNi0xMS0xN1QxNjowMDo0NC44NTBaIiwiaWQiOiJwcnNfOTMyNDE3ZTM1NGZhNGQ3MiIsInMiOiJyZWNlbnQifQ",
+  "partition_stats": {
+    "partition_id": "ptn_2c3dcb0f511c4c81",
+    "persons_total": 4,
+    "persons_human": 0,
+    "persons_agent": 3,
+    "persons_service": 1,
+    "memories_total": 12,
+    "shared_total": 12,
+    "sessions_total": 0,
+    "updated_at": "2026-11-17T16:00:44.852Z"
+  }
+}
+```
+
+规则：
+
+- `limit`：默认 **50**，最大 **200**；超过 200 会被夹到 200。
+- **不返回 `total`**；头部统计读 `partition_stats`（每个列表响应自带，控制台页面不再单独请求）。
+- `next_cursor = null` 表示没有下一页；否则把该字符串原样传给下一次请求的 `cursor`。
+- 游标是 `base64url(JSON {v,id,s})`：`v` = 排序值、`id` = 破平键、`s` = 排序方式。
+  - **换排序必须丢弃旧游标**，否则返回 `400 INVALID_CURSOR`（游标与排序不匹配）。
+- 人列表 `sort`：`recent`（默认，最近活跃）、`new`（最新建档）、`name`（显示名升序）。
+- 搜索参数 `q`：FTS5 前缀匹配（`q*`，最多 8 个词 AND）；含中文时退化为子串匹配；
+  长度 < 3 的拉丁查询退化为 `LIKE 'q%'`。`q` 为空时按索引排序。
+- 记忆列表固定按 `created_at DESC, id DESC`；`q` 搜正文。
+
+示例（人列表第 2 页）：
+
+```bash
+CURSOR=$(curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3" -H "authorization: Bearer $KEY" \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).next_cursor')
+
+curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
+  -H "authorization: Bearer $KEY"
+```
+
+---
+
+## 4. 资源模型
+
+### 4.1 Partition
+
+```json
+{
+  "id": "ptn_2c3dcb0f511c4c81",
+  "org_id": "org_2a3c939fc3904cf6",
+  "slug": "mnemos-dev",
+  "name": "Mnemos 研发",
+  "description": "研发协作：人=agent，共享约定与决策",
+  "status": "active",
+  "settings": {
+    "default_scope": "partition",
+    "brief_max_chars": 1500,
+    "brief_enabled": true,
+    "dream_enabled": true,
+    "dream_interval_minutes": 1440,
+    "retention_days": 365,
+    "monthly_quota": 0,
+    "person_auto_create": true,
+    "locale": "zh-CN"
+  },
+  "created_at": "2026-11-17T16:00:44.840Z",
+  "updated_at": "2026-11-17T16:00:44.840Z",
+  "archived_at": null
+}
+```
+
+> 分区列表 / `POST` / `PATCH /v1/partitions`、控制台详情会额外返回 `stats`（结构见 4.2）；
+> 单个 `GET /v1/partitions/:partition` 不返回 `stats`（需要时单独调 `/stats`）。
+
+- `slug`：`^[a-z0-9][a-z0-9-]{0,47}$`，组织内唯一；`POST /v1/partitions` 按 slug 幂等
+  upsert（已存在则更新 name/description/status/settings）。
+- `status`：`active` / `paused` / `archived`；归档分区拒绝所有写入
+  （`403 PARTITION_ARCHIVED`），读取仍可用。
+- `settings`（v1 snake_case ↔ 控制台 camelCase）：
+
+| v1 | 控制台 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `default_scope` | `defaultScope` | `partition` | 新记忆缺省 scope（`person` / `partition` / `session`） |
+| `brief_max_chars` | `briefMaxChars` | 1200 | 简报字符上限（100–5000） |
+| `brief_enabled` | `briefEnabled` | true | 只存储/返回；v6 的 brief 接口不因 false 拒绝生成 |
+| `dream_enabled` | `dreamEnabled` | true | 关闭后**定时调度器**跳过该分区；手动 `dream/run` 仍可执行 |
+| `dream_interval_minutes` | `dreamIntervalMinutes` | 1440 | 调度间隔（1–43200） |
+| `retention_days` | `retentionDays` | 0（不限） | 维护任务归档超过该天数的 active 记忆（0–3650） |
+| `monthly_quota` | `monthlyQuota` | 0（不限） | 分区月度记忆 token 配额；超限写入 429 `QUOTA_EXCEEDED` |
+| `person_auto_create` | `personAutoCreate` | true | 仅影响引擎按 `person_external_id` 写入；v1 的人级写路径仍要求人已存在 |
+| `locale` | `locale` | `zh-CN` | 展示语言 |
+
+### 4.2 PartitionStats
+
+| 字段 | 含义 |
+| --- | --- |
+| `partition_id` | 分区 id |
+| `persons_total` / `persons_human` / `persons_agent` / `persons_service` | 人数与类型分布（`other` 只计入 total） |
+| `memories_total` | 记忆总数 |
+| `shared_total` | `scope=partition` 的记忆数 |
+| `sessions_total` | 会话数 |
+| `updated_at` | 最近一次计数变更时间 |
+
+由触发器维护；手工导入后可用控制台 `POST /api/partitions/:partition/reconcile` 校准。
+
+### 4.3 Person
+
+```json
+{
+  "id": "prs_5ed57a3928ec4518",
+  "partition_id": "ptn_2c3dcb0f511c4c81",
+  "external_id": "docs-user",
+  "type": "human",
+  "display_name": "文档校验用户",
+  "attributes": { "from": "docs" },
+  "status": "active",
+  "memory_count": 1,
+  "shared_memory_count": 0,
+  "session_count": 0,
+  "last_memory_at": "2026-11-17T16:01:05.801Z",
+  "first_seen_at": "2026-11-17T16:01:02.397Z",
+  "last_seen_at": "2026-11-17T16:01:05.801Z",
+  "created_at": "2026-11-17T16:01:02.397Z",
+  "updated_at": "2026-11-17T16:01:05.801Z"
+}
+```
+
+- `type`：`human` / `agent` / `service` / `other`；`status`：`active` / `archived` / `deleted`。
+- 唯一键是 `(partition_id, type, external_id)`：同 `external_id` 允许不同 `type` 各建一个人。
+- 按 `:person` 引用时支持**内部 id 或 external_id**；external_id 跨 type 重复时取最早创建的一条。
+- `memory_count` = 本人 `scope=person/session` 记忆数；`shared_memory_count` = 本人写的
+  `scope=partition` 记忆数；均在 `persons` 行上，列表页直接用。
+
+### 4.4 Memory
+
+```json
+{
+  "id": "mem_3238ae7e145445c0",
+  "partition_id": "ptn_2c3dcb0f511c4c81",
+  "person_id": "prs_5ed57a3928ec4518",
+  "person_external_id": "docs-user",
+  "actor_person_id": "prs_5ed57a3928ec4518",
+  "scope": "person",
+  "session_id": null,
+  "category": "preference",
+  "content": "文档校验：用户喜欢先看结论再看细节",
+  "importance": 0.8,
+  "confidence": 0.8,
+  "source": "api",
+  "status": "active",
+  "tags": ["docs"],
+  "metadata": {},
+  "created_at": "2026-11-17T16:01:05.801Z",
+  "updated_at": "2026-11-17T16:01:05.801Z",
+  "expires_at": null,
+  "dreamed_at": null
+}
+```
+
+- `scope`：`person`（仅本人）/ `partition`（分区共享）/ `session`（仅该会话）。
+- `category`（18 种）：`preference`、`identity`、`fact`、`plan`、`relationship`、`event`、`skill`、
+  `constraint`、`context`、`insight`、`decision`、`progress`、`lesson`、`risk`、`change`、
+  `acceptance`、`assumption`、`dependency`。
+- `source`：`api` / `conversation` / `agent` / `import` / `playground` / `dream`。
+- `status`：`active` / `archived` / `deleted`；`importance`、`confidence` 为 0–1。
+- `person_id` 是**归属人**，`actor_person_id` 是**写入者**（可与人不同）。
+- v6 不做事实抽取：原文入库；`infer` / `mode` 字段被接受但忽略。
+
+### 4.5 MemoryBrief / PersonContext / Dream
+
+Brief（节选：`recent` 只列 1 条，实际最多 100 条）：
+
+```json
+{
+  "partition_id": "ptn_2c3dcb0f511c4c81",
+  "person_id": "prs_5ed57a3928ec4518",
+  "scope_key": "person:prs_5ed57a3928ec4518",
+  "text": "- [偏好] 文档校验：用户喜欢先看结论再看细节\n- [约束] …",
+  "max_chars": 400,
+  "count": 2,
   "model": "mnemos-condense",
   "cached": false,
-  "generatedAt": "2026-11-05T15:40:00.000Z",
+  "source_hash": "f94caff3…",
+  "generated_at": "2026-11-17T16:01:08.954Z",
   "recent": [
     {
-      "id": "mem_…",
-      "content": "支付回调幂等键必须绑定业务单号。",
-      "category": "constraint",
-      "importance": 0.82,
-      "updatedAt": "2026-11-05T14:02:00.000Z",
-      "taskId": "task_orion_payment_idempotency",
-      "agentId": "agent-reviewer"
+      "id": "mem_3238ae7e145445c0",
+      "content": "文档校验：用户喜欢先看结论再看细节",
+      "category": "preference",
+      "importance": 0.9,
+      "scope": "person",
+      "updated_at": "2026-11-17T16:01:05.925Z",
+      "person_id": "prs_5ed57a3928ec4518",
+      "person_external_id": "docs-user"
     }
   ]
 }
 ```
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `text` | string | 简报正文；暂无可用记忆时为空串 |
-| `maxChars` | number | 本次生成的字符上限 |
-| `count` | number | 纳入简报的记忆条数 |
-| `model` | string | `mnemos-condense`（确定性压缩）或实际调用的 LLM 模型名 |
-| `cached` | boolean | 是否命中 `memory_briefs` 缓存 |
-| `generatedAt` | string | 生成时间 |
-| `recent[]` | array | 参与简报的记忆摘要（`id` / `content` / `category` / `importance` / `updatedAt` / 可选 `taskId`、`agentId`） |
+- 人级 `scope_key = person:<内部 person_id>`；分区级为 `partition`。
+- `text` 是按 `max_chars` 截断的要点列表，可直接注入提示词；`model` 目前是
+  `mnemos-condense`（确定性压缩，HTTP 入口不调用 LLM）。
+- 缓存按 `source_hash`（来源记忆 id+updatedAt + maxChars + 模型）命中；`force=true` 跳过缓存。
+- `recent` 是参与压缩的最近记忆条目（前端展示/引用用）。
 
-#### 更新简报字符上限
-
-`PATCH /api/projects/{id}/memory/brief`
-
-| 字段 | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `maxChars` | integer | 是 | 100–5000，写入项目设置并强制重新生成 |
-
-```bash
-curl -X PATCH "$BASE/api/projects/$PROJECT/memory/brief" \
-  -H "Authorization: Bearer $SESSION" -H 'content-type: application/json' \
-  -d '{"maxChars":1200}'
-```
-
-返回更新后的 `MemoryBrief`（字段同上）。
-
-#### 读取做梦状态
-
-`GET /api/projects/{id}/memory/dream` → `MemoryDreamStatus`
+`PersonContext`：
 
 ```json
 {
-  "settings": { "enabled": true, "intervalMinutes": 1440, "lastAt": "2026-11-05T15:42:00.000Z" },
-  "pendingCount": 7,
-  "lastRun": {
-    "id": "dream_…",
-    "projectId": "prj_orion_python",
-    "trigger": "schedule",
-    "status": "completed",
-    "inputCount": 8,
-    "insightCount": 2,
-    "summary": "归纳出并发扣减与回调幂等两条可复用约束",
-    "startedAt": "2026-11-05T15:42:00.000Z",
-    "finishedAt": "2026-11-05T15:42:02.000Z"
-  },
-  "runs": []
+  "person": { "id": "prs_5ed57a3928ec4518", "external_id": "docs-user", "type": "human", "display_name": "文档校验用户" },
+  "brief": { "text": "- [偏好] 用户喜欢先看结论再看细节", "count": 1, "model": "mnemos-condense" },
+  "memories": [ { "id": "mem_3238ae7e145445c0", "scope": "person", "content": "文档校验：用户喜欢先看结论再看细节" } ],
+  "shared": [ { "id": "mem_16f8a40505fe4924", "scope": "partition", "content": "记忆必须属于一个人（person_id NOT NULL）" } ],
+  "prompt": "## 人物资料\n…\n## 记忆简报\n…\n## 相关记忆\n…\n## 分区共享知识\n…",
+  "token_estimate": 318,
+  "citations": ["mem_…"],
+  "built_at": "2026-11-17T16:01:08.967Z"
 }
 ```
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `settings.enabled` | boolean | 是否参与定时做梦 |
-| `settings.intervalMinutes` | number | 做梦周期（分钟，1–43200） |
-| `settings.lastAt` | string? | 上次做梦时间（取最近一次运行的 `startedAt`） |
-| `pendingCount` | number | `dreamed_at` 为空、`visibility='project'`、正文 ≥10 字的活跃记忆数（不含 `insight` 洞见自身） |
-| `lastRun` | object? | 最近一次运行记录；无记录时省略 |
-| `runs[]` | array | 最近 10 次运行记录（新 → 旧），字段同 `lastRun` |
-
-运行记录 `MemoryDreamRun`：`trigger`（`schedule` / `manual`）、`status`（`running` / `completed` / `skipped` / `failed`）、`inputCount`（本次处理的新记忆数）、`insightCount`（写入的洞见数）、`summary` / `error`（可选）、`startedAt` / `finishedAt`。
-
-#### 更新做梦设置
-
-`PATCH /api/projects/{id}/memory/dream`
-
-| 字段 | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| `enabled` | boolean | 二选一 | 是否参与定时做梦 |
-| `intervalMinutes` | integer | 二选一 | 1–43200 分钟；`enabled` 与 `intervalMinutes` 至少提供一个 |
-
-```bash
-curl -X PATCH "$BASE/api/projects/$PROJECT/memory/dream" \
-  -H "Authorization: Bearer $SESSION" -H 'content-type: application/json' \
-  -d '{"enabled":true,"intervalMinutes":720}'
-```
-
-返回更新后的 `MemoryDreamStatus`。
-
-#### 手动触发做梦
-
-`POST /api/projects/{id}/memory/dream/run` → `MemoryDreamResult`
+`DreamStatus` / `DreamRun`：
 
 ```json
 {
-  "run": {
-    "id": "dream_…",
-    "projectId": "prj_orion_python",
+  "settings": { "enabled": true, "interval_minutes": 1440, "last_at": "2026-11-17T16:01:08.987Z" },
+  "person_id": "prs_5ed57a3928ec4518",
+  "pending_count": 0,
+  "last_run": {
+    "id": "drm_70d96dc203fb4ef6",
+    "partition_id": "ptn_2c3dcb0f511c4c81",
+    "person_id": "prs_5ed57a3928ec4518",
     "trigger": "manual",
     "status": "completed",
-    "inputCount": 8,
-    "insightCount": 2,
-    "startedAt": "2026-11-05T15:42:00.000Z",
-    "finishedAt": "2026-11-05T15:42:02.000Z"
+    "input_count": 1,
+    "insight_count": 1,
+    "summary": "已巩固 1 条记忆并生成 1 条洞见",
+    "error": null,
+    "started_at": "2026-11-17T16:01:08.986Z",
+    "finished_at": "2026-11-17T16:01:08.987Z"
   },
-  "status": { "settings": {}, "pendingCount": 0, "runs": [] }
+  "runs": [
+    { "id": "drm_70d96dc203fb4ef6", "status": "completed", "input_count": 1, "insight_count": 1 }
+  ]
 }
 ```
 
-- 只处理 `dreamed_at IS NULL`、`visibility='project'` 且非 `insight` 的活跃记忆（正文 ≥10 字），处理完写入 `dreamed_at` 作为增量水位，不重放旧记忆。
-- 隐私边界：`visibility='agent'`（Agent 私有）与 `visibility='task'`（任务）记忆不参与做梦、不会被写进项目洞见；洞见固定 `visibility='project'`。
-- 洞见写入为 `category=insight`、`source=dream` 的记忆（项目共享），`metadata` 含 `dreamRunId` 与 `sourceMemoryIds`；相同内容不重复写入。
-- 同一项目同时只允许一次做梦：并发触发返回 `409 CONFLICT`（`{"error":{"code":"CONFLICT","message":"该项目正在做梦，请稍后再试","requestId":"…"}}`），不会重复执行。
-- 没有待整理的新记忆时本次运行记为 `skipped`（`inputCount=0`）；有输入但未形成有效洞见时记为 `completed`（`insightCount=0`，`summary` 为「本批没有形成有效洞见」），不会生成空洞见。
+`trigger`：`manual` / `schedule`；`status`：`running` / `completed` / `skipped` / `failed`。
 
 ---
 
-## 9. 生产运维接口
+## 5. 公开 v1 API（API Key）
 
-### 9.1 探针与指标（无需鉴权，建议仅内网暴露）
+所有路径前缀：`/v1/partitions/:partition`。下表「作用域」是该路由要求的 API Key 作用域。
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/healthz` | 存活探针（进程可响应） |
-| `GET` | `/readyz` | 就绪探针：数据库、schema 版本、引擎；失败 503 |
-| `GET` | `/metrics` | Prometheus 文本指标（请求量/延迟/错误/SSE/限流/登录失败/版本） |
+### 5.1 分区
 
-### 9.2 运维管理（`/api/ops/*`，admin+）
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/api/ops/status` | 运行状态、表计数、项目配额、保留期、备份、维护历史、指标快照 |
-| `POST` | `/api/ops/maintenance` | `{dryRun?, vacuum?}`：TTL/保留期归档、软删清理、幂等键/会话清理、WAL checkpoint |
-| `GET` | `/api/ops/maintenance?limit=` | 维护历史 |
-| `POST` | `/api/ops/backup` | 创建 SQLite 一致性备份（`VACUUM INTO`），保留最近 14 份 |
-| `GET` | `/api/ops/backups` | 备份列表 |
-| `GET` | `/api/ops/backups/{file}` | 下载备份（仅允许文件名，防路径穿越） |
-
-### 9.3 组织成员与安全
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET`/`POST` | `/api/org/users` | 成员列表 / 创建（返回一次性临时密码） |
-| `PATCH` | `/api/org/users/{id}` | 角色、状态、姓名、标题 |
-| `POST` | `/api/org/users/{id}/reset-password` | 重置密码（返回一次性临时密码并踢下线） |
-| `PATCH` | `/api/auth/password` | 自助改密（校验旧密码、删除其他会话） |
-| `POST` | `/api/projects/{id}/keys/{keyId}/rotate` | 轮换密钥：`{graceHours}`，旧密钥宽限期后失效 |
-
-登录安全：连续失败 `MNEMOS_LOGIN_MAX_ATTEMPTS`（默认 5）次后锁定 `MNEMOS_LOGIN_LOCK_MINUTES`（默认 15）分钟，返回 `423 account_locked`；同一 IP 每分钟 >30 次登录尝试返回 `429 login_rate_limited`；禁用账号 `403 account_disabled`。
-
-### 9.4 幂等与限流
-
-- 写接口支持 `Idempotency-Key` 请求头（8–128 字符）：相同 key + 相同请求体在 24h 内返回首次结果，并带 `x-idempotent-replayed: true`；请求体不同返回 `409 idempotency_conflict`。
-- API Key 响应包含 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`；超限 `429 rate_limited` + `Retry-After`。
-- 超出项目月度配额时写接口返回 `429 quota_exceeded`，`details` 含 `used/limit/resetAt`，并附 `Retry-After`。
-
-### 9.5 导入导出与 OpenAPI
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/api/projects/{id}/export` | 导出项目（格式 `mnemos-export/v1`） |
-| `GET` | `/v1/export` | 导出当前 Key 所属项目 |
-| `POST` | `/v1/import` | 导入记忆（≤1000 条/次，去重计入 skipped） |
-| `GET` | `/openapi.json`、`/api/openapi.json` | OpenAPI 3.1 文档 |
-
-安全响应头（全局）：`Content-Security-Policy`、`X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`Referrer-Policy`、`Permissions-Policy`，可选 HSTS（`MNEMOS_HSTS=1`）。
-
----
-
-## 10. 事件订阅（Webhook）
-
-### 10.1 控制台 API（会话鉴权）
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET`/`POST` | `/api/projects/{id}/webhooks` | 列表 / 创建（创建返回一次性 `secret`） |
-| `PATCH`/`DELETE` | `/api/webhooks/{id}` | 更新 / 删除 |
-| `POST` | `/api/webhooks/{id}/rotate-secret` | 轮换签名密钥（返回一次性 `secret`） |
-| `POST` | `/api/webhooks/{id}/test` | 发送测试事件（不进入重试队列） |
-| `GET` | `/api/webhooks/{id}/deliveries?status=&page=&pageSize=` | 投递记录分页 |
-| `GET` | `/api/webhooks/deliveries/{deliveryId}` | 投递详情 |
-| `POST` | `/api/webhooks/deliveries/{deliveryId}/replay` | 重放 |
-| `GET` | `/api/projects/{id}/webhooks/stats` | 投递统计（成功率、平均延迟、近 24h） |
-| `GET` | `/api/webhooks/event-types` | 可订阅事件清单 |
-
-### 10.2 公开 API（API Key）
-
-`GET/POST /v1/webhooks`、`PATCH/DELETE /v1/webhooks/{id}`、`POST /v1/webhooks/{id}/rotate-secret`、
-`GET /v1/webhooks/{id}/deliveries`、`POST /v1/webhook-deliveries/{id}/replay`（snake_case）。
-
-### 10.3 投递协议
-
-```
-POST <url>
-content-type: application/json
-user-agent: Mnemos-Webhook/1.0
-x-mnemos-event: memory.created
-x-mnemos-delivery: whd_...
-x-mnemos-project: prj_...
-x-mnemos-timestamp: 1712345678
-x-mnemos-signature: t=1712345678,v1=<hex hmac_sha256(secret, "<t>.<rawBody>")>
-```
-
-- 事件：`memory.created` / `memory.updated` / `memory.deleted` / `task.finished` / `agent.registered` / `key.created` / `key.revoked` / `quota.exceeded`
-- 重试：5s → 30s → 2m → 10m → 1h → 6h（最多 6 次），耗尽转死信；连续失败 10 次自动暂停
-- 校验要求：时间戳容差 5 分钟，常量时间比较；用 `x-mnemos-delivery` 做去重
-- SSRF 防护：仅 http/https；DNS 解析后拒绝回环/私网/链路本地/云元数据（`MNEMOS_WEBHOOK_ALLOW_PRIVATE=1` 仅供本地测试）
-
-### 10.4 官方 SDK
-
-- TypeScript：`sdk/typescript`（`@mnemos/sdk`，零依赖，支持重试/幂等键）
-- Python：`sdk/python`（`mnemos-sdk`，零依赖，`urllib`）
-
-```ts
-import { MnemosClient } from '@mnemos/sdk';
-const client = new MnemosClient({ apiKey: process.env.MNEMOS_API_KEY!, baseUrl: 'http://127.0.0.1:4380' });
-const brief = await client.context.build({ agentId: 'agent-coder', taskId: 'task_orion_split_query' });
-```
-
-### 10.5 链路追踪
-
-开启 `MNEMOS_OTEL_ENABLED=1` 后，每个请求返回 `x-trace-id`（同时写入访问日志 `traceId`），
-span 通过 OTLP/HTTP 导出到 `MNEMOS_OTEL_ENDPOINT`（默认 `http://127.0.0.1:4318/v1/traces`）。
-
----
-
-## 11. 中立记忆服务 v5（分区 + 人）
-
-> 契约：[`neutral-memory-model.md`](neutral-memory-model.md)。模型说明：
-> [`agent-memory-model.md`](agent-memory-model.md)。旧接口迁移：
-> [`migration-v4-v5.md`](migration-v4-v5.md)。
-
-所有中立端点挂在 `/v1/partitions/:partition/...`，`/v1/projects/:partition/...` 是**全量别名**。
-
-- `:partition` 支持分区内部 id（`prj_…`）或 slug（如 `zhiwu-app`）；
-- JSON 一律 snake_case；
-- `project` key：`:partition` 必须等于自身分区；`org` key：可指定本组织任意分区；
-- 记忆按「人（person）」组织，`scope` ∈ `person` / `partition` / `session`；
-- 旧 `user_id` / `agent_id` / `visibility` 字段继续透传，并映射为 person/scope。
-
-### 11.1 分区
-
-#### `POST /v1/partitions`（org key + `admin`）
-
-按 `slug` 幂等 upsert：已存在时只补全显式提供的展示字段（`name` / `description` / `region` / `env`），
-不会覆盖已有设置。
-
-| 字段 | 类型 | 必填 | 说明 |
+| 方法 | 路径 | 作用域 | 说明 |
 | --- | --- | --- | --- |
-| `slug` | string | 是 | `^[a-z0-9][a-z0-9-]{0,47}$`，小写字母/数字/连字符 |
-| `name` | string | 否 | 展示名，缺省 = slug |
-| `description` | string | 否 | 描述（≤500） |
-| `region` | string | 否 | 区域，缺省 `cn-shanghai` |
-| `env` | string | 否 | `production` / `staging` / `development` 等 |
+| `POST` | `/v1/partitions` | `admin` + **org key** | 按 slug 幂等 upsert；返回分区（含 `stats`） |
+| `GET` | `/v1/partitions` | `memories:read` + **org key** | 本组织分区列表（每个带 `stats`） |
+| `GET` | `/v1/partitions/:partition` | `memories:read` | 分区信息（**不含** `stats`） |
+| `PATCH` | `/v1/partitions/:partition` | `admin` | 更新 name/description/status/settings |
+| `GET` | `/v1/partitions/:partition/stats` | `memories:read` | 分区统计（单行主键查询） |
+
+创建/更新分区：
 
 ```bash
-curl -X POST $BASE/v1/partitions \
-  -H "Authorization: Bearer $ORG_KEY" -H 'content-type: application/json' \
-  -d '{"slug":"zhiwu-app","name":"知物感恩 App","description":"消费类记忆场景"}'
+curl -s -X POST "$BASE/v1/partitions" \
+  -H "authorization: Bearer $ORG_KEY" -H 'content-type: application/json' \
+  -d '{"slug":"zhiwu-app","name":"知物感恩 App","settings":{"default_scope":"person","brief_max_chars":800}}'
 ```
 
-```json
-{
-  "partition": {
-    "id": "prj_zhiwu_app",
-    "partition_id": "prj_zhiwu_app",
-    "project_id": "prj_zhiwu_app",
-    "org_id": "org_yunshu",
-    "slug": "zhiwu-app",
-    "name": "知物感恩 App",
-    "description": "消费类记忆场景",
-    "status": "active",
-    "region": "cn-shanghai",
-    "env": "production",
-    "created_at": "2026-11-05T10:00:00.000Z",
-    "updated_at": "2026-11-05T10:00:00.000Z",
-    "archived_at": null
-  },
-  "created": true
-}
-```
+- `settings` 只传要改的字段（部分更新）；未传字段保留原值/默认值。
+- 分区 key 调用 `POST /v1/partitions` → `403`（需要 org key）。
 
-新建返回 `201`；命中已有分区返回 `200` + `created=false`。project key 调用返回 `403 FORBIDDEN`。
+### 5.2 人
 
-#### `GET /v1/partitions/:partition`（`memories:read`）
+| 方法 | 路径 | 作用域 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/v1/partitions/:p/persons` | `memories:read` | 游标列表；`cursor/limit/q/type/status/sort` |
+| `PUT` | `/v1/partitions/:p/persons/:externalId` | `memories:write` | 按 `(type, external_id)` 幂等建档/更新 |
+| `GET` | `/v1/partitions/:p/persons/:person` | `memories:read` | 详情；`person` = 内部 id 或 external_id |
+| `PATCH` | `/v1/partitions/:p/persons/:person` | `memories:write` | 更新 display_name/attributes/status/type |
+| `GET` | `/v1/partitions/:p/persons/:person/memories` | `memories:read` | 该人记忆：游标 + `scope/category/status/q` |
+| `POST` | `/v1/partitions/:p/persons/:person/memories` | `memories:write` | 写记忆（见 5.4） |
+| `GET` | `/v1/partitions/:p/persons/:person/brief` | `memories:read` | 人级简报（见 5.5） |
+| `POST` | `/v1/partitions/:p/persons/:person/context` | `memories:read` | 人级上下文（见 5.5） |
+| `GET` | `/v1/partitions/:p/persons/:person/dream` | `memories:read` | 人级做梦状态 |
+| `POST` | `/v1/partitions/:p/persons/:person/dream/run` | `memories:write` | 手动触发人级做梦 |
 
-返回 `{ "partition": { …同上… } }`（不含 `settings` 等敏感配置）。
-
-### 11.2 人（Person）
-
-#### `PUT /v1/partitions/:p/persons/:externalId`（`memories:write`）
-
-建人 / 更新人，按 `(partition, type, external_id)` 幂等 upsert。`externalId` 由调用方定义
-（App 的 `user_id`、Agent 的 id/name）。
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `type` | string | `human`（默认）/ `agent` / `service` / `other` |
-| `display_name` | string | 显示名，缺省 = externalId |
-| `attributes` | object | 自由字段（角色、模型、画像、标签等），传入时整体替换 |
-| `status` | string | `active`（默认）/ `archived` / `deleted` |
+建设/更新人：
 
 ```bash
-curl -X PUT $BASE/v1/partitions/zhiwu-app/persons/user-123 \
-  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{"type":"human","display_name":"用户 123","attributes":{"tier":"pro"}}'
+curl -s -X PUT "$BASE/v1/partitions/zhiwu-app/persons/user-123" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"type":"human","display_name":"用户 123","attributes":{"channel":"ios"}}'
 ```
 
-```json
-{
-  "person": {
-    "id": "prs_…",
-    "partition_id": "prj_zhiwu_app",
-    "project_id": "prj_zhiwu_app",
-    "external_id": "user-123",
-    "type": "human",
-    "display_name": "用户 123",
-    "attributes": { "tier": "pro" },
-    "status": "active",
-    "first_seen_at": "2026-11-05T10:00:00.000Z",
-    "last_seen_at": "2026-11-05T10:00:00.000Z",
-    "created_at": "2026-11-05T10:00:00.000Z",
-    "updated_at": "2026-11-05T10:00:00.000Z"
-  }
-}
+- 路径上的 `externalId` 优先；body 里 `external_id` 可省略。
+- `type` 默认 `human`；已存在同 `(type, external_id)` 时更新展示名/属性/状态并刷新 `last_seen_at`。
+- `PATCH` 允许改 `type`；改成已存在的 `(type, external_id)` 组合返回 `409 CONFLICT`。
+
+### 5.3 记忆列表 / 详情 / 管理
+
+| 方法 | 路径 | 作用域 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/v1/partitions/:p/memories` | `memories:read` | 分区记忆列表；`person_id`/`person_external_id`/`scope`/`category`/`status`/`q`/`cursor`/`limit` |
+| `POST` | `/v1/partitions/:p/memories/search` | `memories:read` | 兼容检索端点（body：`query`、`person_id`、`scope`、`category`、`top_k`） |
+| `GET` | `/v1/partitions/:p/memories/:id` | `memories:read` | 详情：`{ memory, person }` |
+| `PATCH` | `/v1/partitions/:p/memories/:id` | `memories:write` | 更新 content/category/importance/confidence/status/tags/metadata/expires_at |
+| `DELETE` | `/v1/partitions/:p/memories/:id` | `memories:write` | 删除，返回 `204`（无响应体） |
+
+检索（兼容端点）：
+
+```bash
+curl -s -X POST "$BASE/v1/partitions/mnemos-dev/memories/search" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"query":"data-v6","top_k":3}'
 ```
-
-#### `GET /v1/partitions/:p/persons`（`memories:read`）
-
-| 查询参数 | 类型 | 说明 |
-| --- | --- | --- |
-| `type` | string | `human` / `agent` / `service` / `other` |
-| `status` | string | `active` / `archived` / `deleted` |
-| `q` | string | 按 `display_name` / `external_id` 模糊搜索 |
-| `page` / `page_size` | number | 分页（默认 1 / 20，最大 100） |
-| `sort` | string | `recent`（默认）/ `name` / `memories` |
-
-响应（`results` 与 `items` 同内容）：
 
 ```json
 {
   "results": [
     {
-      "id": "prs_…", "partition_id": "prj_zhiwu_app", "external_id": "user-123",
-      "type": "human", "display_name": "用户 123", "status": "active",
-      "attributes": {}, "last_seen_at": "2026-11-05T10:00:00.000Z",
-      "stats": { "memories": 5, "shared_memories": 0, "sessions": 2, "last_memory_at": "2026-11-04T12:00:00.000Z" }
+      "id": "mem_4b40fcd0833b4b63",
+      "partition_id": "ptn_2c3dcb0f511c4c81",
+      "person_id": "prs_099a48a45bc84924",
+      "person_external_id": "mnemos-team",
+      "scope": "partition",
+      "category": "fact",
+      "content": "v6 使用 data-v6/ 作为数据目录，旧 data/ 不迁移。",
+      "importance": 0.9,
+      "source": "import",
+      "status": "active"
     }
   ],
-  "items": [ …同 results… ],
-  "count": 1, "total": 1, "page": 1, "page_size": 20, "total_pages": 1
+  "took_ms": 0,
+  "next_cursor": null,
+  "partition_stats": {
+    "partition_id": "ptn_2c3dcb0f511c4c81",
+    "persons_total": 5,
+    "persons_human": 1,
+    "persons_agent": 3,
+    "persons_service": 1,
+    "memories_total": 14,
+    "shared_total": 12,
+    "sessions_total": 0,
+    "updated_at": "2026-11-17T16:01:08.986Z"
+  }
 }
 ```
 
-#### `GET /v1/partitions/:p/persons/:person`（`memories:read`）
+- `query` 必填（1–2000 字符）；`top_k` 1–50，默认 8；`person_id` 是**作者过滤**。
+- 语义等价于 `GET /memories?q=…&limit=top_k`，只是响应包成 `{ results, took_ms }`（DSH 插件兼容）。
 
-`:person` 支持内部 `prs_…` id 或 `external_id`；同一 external_id 同时命中 human/agent 多类型时
-会 404，请改用内部 id。响应 `{ "person": { …, "stats": {…} } }`。
+### 5.4 写入记忆
 
-#### `PATCH /v1/partitions/:p/persons/:person`（`memories:write`）
+`POST /v1/partitions/:partition/persons/:person/memories`，`person` 支持内部 id 或 external_id。
+**路径上的人必须已存在**：v1 不会在写记忆时自动建人，未知人返回 `404 NOT_FOUND`；
+请先 `PUT /v1/partitions/:p/persons/:externalId` 建档（或由人的同步流程建档）。
 
-只更新显式提供的 `display_name` / `attributes` / `status`（`type` 与 `external_id` 不可改）；
-至少提供一个字段，否则 400。
+```bash
+curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/memories" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"text":"用户 123 喜欢黑咖啡，不加糖","scope":"person","category":"preference","importance":0.8,"tags":["drink"]}'
+```
 
-### 11.3 记忆（人级 / 分区共享）
-
-#### `POST /v1/partitions/:p/memories`（`memories:write`）
-
-在旧写入字段基础上新增（全部可选）：
+请求体：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `text` / `messages` | — | 二选一 |
-| `person_id` | string | 记忆主体：内部 id 或 external id |
-| `person_external_id` | string | 记忆主体 external id（与 `person_id` 二选一） |
-| `actor_person_id` | string | 写入者（缺省 = person） |
-| `scope` | string | `person` / `partition` / `session`；缺省取分区 `defaultScope` |
-| `session_id` | string | 会话；`scope=session` 时必填（旧 `task_id` 亦可） |
-| `category` | string | 记忆分类；显式提供时默认原文入库（`infer=false`） |
-| `tags` | string[] | 标签 |
-| 旧字段 | — | `user_id` / `agent_id` / `run_id` / `app_id` / `task_id` / `visibility` 继续可用 |
+| `text` / `content` | string(1–20000) | 二选一；`messages` 与二者至少给一个 |
+| `messages` | `[{role, content}]` | 最多 50 条；`system` 消息会被忽略，其余按行拼接 |
+| `scope` | `person`/`partition`/`session` | 缺省取分区 `default_scope` |
+| `session_id` | string(≤128) | `scope=session` 时必填；全局唯一，跨分区/跨人复用返回 409 |
+| `session_title` | string(≤200) | 首次创建会话时的标题 |
+| `category` | 枚举 | 默认 `fact` |
+| `importance` / `confidence` | number 0–1 | 默认 0.5 / 0.8 |
+| `source` | 枚举 | 默认 `api` |
+| `tags` | string[]（≤20，每个≤64） | 默认 `[]` |
+| `metadata` | object | 默认 `{}` |
+| `expires_at` | ISO/null | 过期时间 |
+| `infer` / `mode` | — | **接受但忽略**（v6 不做事实抽取） |
+
+响应 `201`：
+
+```json
+{
+  "memory": { "…": "Memory" },
+  "events": [{ "type": "ADD", "memory_id": "mem_3238ae7e145445c0", "at": "2026-11-17T16:01:05.801Z" }]
+}
+```
+
+校验失败示例（`scope=session` 缺 `session_id`，引擎错误码是 `VALIDATION`）：
+
+```json
+{ "error": { "code": "VALIDATION", "message": "scope=session 时必须提供 session_id", "requestId": "req_…" } }
+```
+
+### 5.5 人级简报 / 上下文 / 做梦
+
+**简报** `GET .../persons/:person/brief?max_chars=400&force=true`
+
+- `max_chars` 100–5000，缺省取分区 `brief_max_chars`；`force=true` 跳过缓存重算。
+- 来源：本人 `person/session` 记忆 + 相关分区共享记忆，按 importance/时间取最近 100 条。
+- 响应：`MemoryBrief`（见 4.5）。
+
+**上下文** `POST .../persons/:person/context`
 
 ```bash
-curl -X POST $BASE/v1/partitions/zhiwu-app/memories \
-  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{"text":"用户 123 喜欢黑咖啡，不加糖","person_id":"user-123","scope":"person","infer":false}'
+curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/context" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"query":"咖啡","budget_tokens":800,"include_partition":true}'
 ```
 
-响应与旧写入一致：`{results, events, extracted, merged, skipped, took_ms}`，`results[]` 带
-`person_id` / `person_external_id` / `scope` / `session_id` 等新字段。
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `query` | 空 | 用 FTS 缩小相关记忆（≤2000 字符） |
+| `budget_tokens` | 2000 | 60–32000；内部按 `tokens × 4` 截断字符 |
+| `include_partition` | true | 是否带分区共享知识 |
 
-语义校验：`scope=person` 必须能解析到人（person 不存在且分区 `personAutoCreate=false` 时 404）；
-`scope=session` 缺 `session_id` 返回 422；`infer=true` 抽取出的每条记忆继承人的归属与 scope。
-
-#### `GET /v1/partitions/:p/memories`（`memories:read`）
-
-| 查询参数 | 说明 |
-| --- | --- |
-| `person_id` / `person` | 按记忆主体过滤（内部 id 或 external id） |
-| `scope` | `person` / `partition` / `session` |
-| `category` / `status` | 分类 / 状态 |
-| `q` | 关键词（走服务端混合检索） |
-| `sort` | `recent` / `importance` / `accessed` |
-| `include_private` | 默认 false：调用方视角只看分区共享 + 本人私有；审计传 true |
-| `page` / `page_size` | 分页 |
-
-响应：`{results, items, count, total, page, page_size, total_pages}`。
-
-#### `POST /v1/partitions/:p/memories/search`（`memories:read`）
-
-请求：`{query, person_id?, person?, scope?, category?, top_k?, threshold?, include_private?}`。
-响应与旧检索一致，额外支持按人/scope 过滤：
-
-```json
-{
-  "results": [{ "id": "mem_…", "person_id": "prs_…", "person_external_id": "user-123",
-                "scope": "person", "session_id": null, "memory": "…", "score": 0.73, "signals": {…} }],
-  "count": 1, "total": 1, "took_ms": 6,
-  "signals": { "weights": {…}, "strategy": "hybrid", "query_terms": ["牛奶"] }
-}
-```
-
-#### `GET` / `PATCH` / `DELETE /v1/partitions/:p/memories/:id`（`memories:read` / `memories:write`）
-
-- `GET`：详情（含 `history` / `entities` / `relations` / `neighbors`）。
-- `PATCH`：`{content?, category?, importance?, status?, tags?, metadata?, expires_at?}`，返回更新后的记忆本体（snake_case）。
-- `DELETE`：软删除，返回 `{ "message": "deleted", "ok": true }`。
-
-### 11.4 人的简报 / 上下文 / 做梦
-
-#### `GET /v1/partitions/:p/persons/:person/brief`（`memories:read`）
-
-| 查询参数 | 说明 |
-| --- | --- |
-| `force` | `true` 忽略缓存重新生成 |
-| `max_chars` | 临时覆盖分区 `briefMaxChars`（服务端 clamp 100–5000） |
-
-返回 `MemoryBrief`（v5 平铺带 `person_id`）：
-
-```json
-{
-  "project_id": "prj_zhiwu_app", "partition_id": "prj_zhiwu_app", "person_id": "prs_…",
-  "text": "# 人的简报\n- [偏好] 用户 123 喜欢黑咖啡…",
-  "max_chars": 500, "count": 4, "model": "mnemos-condense", "cached": false,
-  "generated_at": "2026-11-05T10:00:00.000Z",
-  "recent": [{ "id": "mem_…", "content": "…", "category": "preference", "importance": 0.7,
-               "updated_at": "…", "person_id": "prs_…", "person_external_id": "user-123", "scope": "person" }]
-}
-```
-
-组成：该人 `scope=person` 记忆 + 与其相关的 `scope=partition` 记忆。
-
-#### `POST /v1/partitions/:p/persons/:person/context`（`memories:read`）
-
-请求：`{query?, budget_tokens?, include_partition?}`（`budget_tokens` 默认 1200，范围 60–32000）。
-
-响应：
-
-```json
-{
-  "person": { "id": "prs_…", "external_id": "user-123", "display_name": "用户 123", "stats": {…} },
-  "brief": { "text": "…", "max_chars": 500, "count": 4, "person_id": "prs_…" },
-  "memories": [ …与该人相关、按 query 排序的记忆… ],
-  "shared": [ …分区共享知识（scope=partition）… ],
-  "prompt": "# 人的上下文…\n可直接拼进 system prompt 的中文 Markdown",
-  "token_estimate": 603,
-  "citations": ["mem_…"],
-  "built_at": "2026-11-05T10:00:00.000Z"
-}
-```
-
-#### 做梦
+**做梦**：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/v1/partitions/:p/dream` | 分区级做梦状态（`scope=partition`） |
-| `POST` | `/v1/partitions/:p/dream/run` | 分区级手动做梦：`{person_id?, batch_size?}` |
-| `GET` | `/v1/partitions/:p/persons/:person/dream` | 人级做梦状态（`person_id` 为该人） |
-| `POST` | `/v1/partitions/:p/persons/:person/dream/run` | 人级手动做梦：`{batch_size?}` |
+| `GET` | `.../persons/:person/dream` | 状态：设置、待巩固数、最近 10 次运行 |
+| `POST` | `.../persons/:person/dream/run` | body `{"batch_size":50}`（1–200，默认 50） |
+| `GET` | `/v1/partitions/:p/dream` | 分区级状态 |
+| `POST` | `/v1/partitions/:p/dream/run` | 分区级手动做梦 |
 
-响应统一为 `{run, status}`（`GET` 只返回 `status`）：
+- 同一 `partition + person` 同时只允许一次做梦，重复触发返回 `409 DREAM_RUNNING`。
+- 没有待巩固记忆时返回 `status = "skipped"`，不产生洞见。
+- 分区级洞见归属系统人 `mnemos-dream`（`type=service`，不存在时自动创建）。
 
-```json
-{
-  "run": { "id": "dream_…", "partition_id": "prj_zhiwu_app", "person_id": "prs_…",
-           "trigger": "manual", "status": "completed", "input_count": 3, "insight_count": 1,
-           "started_at": "…", "finished_at": "…" },
-  "status": { "person_id": "prs_…", "settings": { "enabled": true, "interval_minutes": 1440 },
-              "pending_count": 0, "runs": [ …最近 10 次… ] }
-}
-```
+---
 
-同一人（或分区）正在做梦时返回 `409 CONFLICT`。
+## 6. 控制台 API（`/api`，会话鉴权）
 
-### 11.5 旧 → 新映射与兼容
+与 v1 同构，camelCase。权限沿用组织角色：viewer 读、developer 写、admin 管理密钥/设置、
+owner 管理组织与组织级 Key。
 
-| 旧 | 新 | 说明 |
+### 6.1 登录 / 会话
+
+| 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `user_id` | `person_id`（type=human） | 写入时自动建档（`personAutoCreate`） |
-| `agent_id` | `person_id`（type=agent） | agent 注册表名作为 display_name |
-| `visibility=project` | `scope=partition` | 双写旧列 |
-| `visibility=agent` | `scope=person` | 双写旧列 |
-| `visibility=task` | `scope=session` | `session_id = COALESCE(task_id, run_id)` |
-| `GET /v1/memories?user_id=` | `GET /v1/partitions/:p/memories?person_id=` | 旧端点保留（不新增 person 筛选） |
-| `POST /v1/context` | `POST /v1/partitions/:p/persons/:person/context` | 旧接口保留 |
-| `/v1/projects/:id/...` | `/v1/partitions/:id/...` | 全量别名，行为一致 |
+| `POST` | `/api/auth/login` | `{email,password}` → `{token,user,org}` |
+| `PATCH` | `/api/auth/password` | `{currentPassword,newPassword}`；新密码 ≥10 位且含字母+数字 |
+| `POST` | `/api/auth/logout` | 删除当前会话 |
+| `GET` | `/api/auth/me` | `{user, org, partitions}` |
 
-兼容承诺：v5 只增不改——旧端点、旧字段、旧 SDK 调用继续可用；新字段（`person_id` / `scope` /
-`session_id` / `partition_id`）在响应中增量出现。
+登录失败/锁定：
 
-### 11.6 SDK（TypeScript）
+- 连续 `MNEMOS_LOGIN_MAX_ATTEMPTS`（默认 5）次密码错误后账号被锁定 15 分钟：第 5 次仍返回
+  **401**（`details.locked=true`），**之后的尝试**返回 **423**，`code = account_locked`，带 `details.retryAfter`。
+- 登录接口另有 30 次/分钟/IP 限流，超限 **429**，`code = login_rate_limited`。
+- 账号禁用返回 **403**，`code = account_disabled`。
+- 会话令牌只存 SHA-256；默认有效期 `MNEMOS_SESSION_TTL_HOURS`（72h）。
 
-```ts
-import { MnemosClient } from '@mnemos/sdk';
+### 6.2 分区 / 人 / 记忆
 
-const client = new MnemosClient({ apiKey: process.env.MNEMOS_ORG_KEY! }); // org key
+| 方法 | 路径 | 角色 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/partitions` | viewer | 分区列表（带 `stats`） |
+| `POST` | `/api/partitions` | admin | 建分区（201） |
+| `GET` | `/api/partitions/:partition` | viewer | 分区详情（带 `stats`） |
+| `PATCH` | `/api/partitions/:partition` | admin | 更新分区（带 `stats` 返回） |
+| `GET` | `/api/partitions/:partition/stats` | viewer | 统计 |
+| `POST` | `/api/partitions/:partition/reconcile` | admin | 重算计数（批量导入后） |
+| `GET` | `/api/partitions/:partition/persons` | viewer | 人列表（游标，`q/type/status/sort`） |
+| `PUT` | `/api/partitions/:partition/persons/:externalId` | developer | 建档/更新人 |
+| `GET` | `/api/partitions/:partition/persons/:person` | viewer | 人详情 |
+| `PATCH` | `/api/partitions/:partition/persons/:person` | developer | 更新 `displayName/attributes/status`（**不能改 type/externalId**） |
+| `GET` | `/api/partitions/:partition/persons/:person/memories` | viewer | 该人记忆（游标 + scope/category/q） |
+| `POST` | `/api/partitions/:partition/persons/:person/memories` | developer | 写记忆，返回 `{ memory }`（无 events） |
+| `GET` | `/api/partitions/:partition/memories` | viewer | 分区记忆（`personId`/`scope`/`category`/`q`/游标） |
+| `GET` | `/api/partitions/:partition/memories/:id` | viewer | `{ memory, person }` |
+| `PATCH` | `/api/partitions/:partition/memories/:id` | developer | `{ memory }` |
+| `DELETE` | `/api/partitions/:partition/memories/:id` | developer | 204 |
 
-const { partition } = await client.partitions.create({ slug: 'zhiwu-app', name: '知物感恩 App' });
-await client.persons.upsert(partition.slug, 'user-123', { type: 'human', displayName: '用户 123' });
-await client.memories.add({
-  partition: partition.slug,
-  text: '用户 123 喜欢黑咖啡，不加糖',
-  personId: 'user-123',
-  scope: 'person',
-});
-const brief = await client.personBrief(partition.slug, 'user-123', { maxChars: 400 });
-const context = await client.personContext(partition.slug, 'user-123', { query: '咖啡偏好', budgetTokens: 800 });
-console.log(brief.text, context.prompt);
-```
+`GET /api/partitions/:partition` **带 `stats`**（v1 的同一路径不带），这是两套入口唯一的形状差异之一。
 
-> `memories.get/update/delete` 传 `{ partition }` 走中立分区端点；不传则保持旧 `/v1/memories` 行为。
-> 提供 `personId` / `scope` / `sessionId` 等字段时**必须**同时提供 `partition`，否则 SDK 直接抛
-> `TypeError`（避免旧端点静默忽略）。
+### 6.3 人级简报 / 上下文 / 做梦（控制台）
+
+| 方法 | 路径 | 角色 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/partitions/:p/persons/:person/brief` | viewer | query：`force`、`maxChars` |
+| `POST` | `/api/partitions/:p/persons/:person/context` | viewer | body：`query`、`budgetTokens`、`includePartition` |
+| `GET` | `/api/partitions/:p/persons/:person/dream` | viewer | 状态 |
+| `POST` | `/api/partitions/:p/persons/:person/dream/run` | developer | body：`batchSize` |
+| `GET` | `/api/partitions/:p/dream` | viewer | 分区级状态 |
+| `POST` | `/api/partitions/:p/dream/run` | developer | 分区级手动做梦 |
+
+### 6.4 用量 / 审计 / 密钥（分区）
+
+| 方法 | 路径 | 角色 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/partitions/:p/usage?days=30` | viewer | `days` 1–90；返回 points/byOperation/byChannel/byKey/latency/totals |
+| `GET` | `/api/partitions/:p/audit` | viewer | 游标列表（`cursor/limit`） |
+| `GET` | `/api/partitions/:p/keys` | admin | 分区 key 列表（不含 secret） |
+| `POST` | `/api/partitions/:p/keys` | admin | 创建；`{name,scopes,rateLimitPerMin?,expiresAt?,allowedIps?}`；响应含一次性 `secret` |
+| `POST` | `/api/partitions/:p/keys/:id/rotate` | admin | `{graceHours}`（0–168，仅审计）；**旧 key 立即吊销** |
+| `DELETE` | `/api/partitions/:p/keys/:id` | admin | 吊销，204 |
+
+### 6.5 组织 / 组织级密钥 / 运维
+
+| 方法 | 路径 | 角色 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/org` | viewer | `{ org, counts: { users, partitions } }` |
+| `GET` | `/api/org/users` | admin | 账号列表（含 `activeSessions`） |
+| `POST` | `/api/org/users` | admin | `{email,name,role,title?,password?}` → `{user,temporaryPassword}` |
+| `PATCH` | `/api/org/users/:id` | admin | 改 role/status/name/title；不能禁用自己 |
+| `POST` | `/api/org/users/:id/reset-password` | admin | 返回一次性临时密码，并清理该用户全部会话 |
+| `GET` | `/api/org/keys` | owner | 组织级 key 列表 |
+| `POST` | `/api/org/keys` | owner | 创建组织级 key；响应含一次性 `secret` |
+| `DELETE` | `/api/org/keys/:id` | owner | 吊销，204 |
+| `GET` | `/api/ops/status` | admin | 运行状态（版本/uptime/DB 文件与 WAL/schema/计数/配额/保留期/备份/维护/指标） |
+| `GET` | `/api/ops/maintenance` | admin | 维护历史 `?limit=20` |
+| `POST` | `/api/ops/maintenance` | admin | `{dryRun?,vacuum?}` |
+| `POST` | `/api/ops/backup` | admin | 立即在线备份（`VACUUM INTO`） |
+| `GET` | `/api/ops/backups` | admin | 备份列表 |
+| `GET` | `/api/ops/backups/:file` | admin | 下载备份（文件名白名单） |
+
+> 组织级 key 的创建 body 与分区 key 相同（`name/scopes/rateLimitPerMin/expiresAt/allowedIps`），
+> 不绑定分区。
+
+---
+
+## 7. 健康检查与运维端点
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/health` | 无 | 详细健康：`{ok,version,uptimeMs,schemaVersion,db,node}`；DB 异常 503 |
+| `GET` | `/api/health` | 无 | 同上（控制台用） |
+| `GET` | `/healthz` | 无 | 存活探针：`{ok:true}` |
+| `GET` | `/readyz` | 无 | 就绪探针：DB 可查询 → 200；否则 503 `{ok:false}` |
+| `GET` | `/metrics` | 无（内网） | Prometheus 文本；`MNEMOS_METRICS_ENABLED=0` 时 404 |
+
+探针不要暴露公网；`/metrics` 未鉴权，建议只在内网抓取。
+
+---
+
+## 8. 错误码
+
+`code` 为稳定标识；同一 HTTP 状态可能对应多个 code。
+
+| HTTP | code | 典型场景 |
+| --- | --- | --- |
+| 400 | `BAD_REQUEST` | 缺路径参数、请求不合法 |
+| 400 | `VALIDATION_ERROR` | zod 形状/范围校验失败（HTTP 层） |
+| 400 | `VALIDATION` | 引擎业务校验（如 `scope=session` 缺 `session_id`） |
+| 400 | `INVALID_JSON` | 请求体不是合法 JSON |
+| 400 | `INVALID_CURSOR` | 游标非法/过期，或与当前 `sort` 不匹配 |
+| 401 | `UNAUTHORIZED` | 缺会话/令牌、会话过期、密码错误 |
+| 401 | `INVALID_API_KEY` | 缺 API Key、格式不对、Key 不存在 |
+| 401 | `API_KEY_REVOKED` | Key 已被吊销 |
+| 401 | `KEY_EXPIRED` | Key 已过期 |
+| 401 | `ACCOUNT_DISABLED` | 会话鉴权时账号已被禁用 |
+| 403 | `account_disabled` | 登录时账号已被禁用（带 `details`） |
+| 403 | `FORBIDDEN` | 缺作用域/角色、分区归档、分区 key 越权建分区 |
+| 403 | `IP_NOT_ALLOWED` | 来源 IP 不在 Key 白名单 |
+| 403 | `PARTITION_ARCHIVED` | 向已归档分区写入 |
+| 404 | `NOT_FOUND` | 分区/人/记忆不存在（跨组织统一 404） |
+| 405 | `METHOD_NOT_ALLOWED` | 路径存在但不支持该 HTTP 方法 |
+| 409 | `CONFLICT` | 唯一键冲突（如人的 type/external_id、session 跨分区） |
+| 409 | `DREAM_RUNNING` | 同一分区/人正在做梦 |
+| 413 | `PAYLOAD_TOO_LARGE` | 请求体超过上限 |
+| 423 | `account_locked` | 登录失败次数过多（带 `details.retryAfter`） |
+| 429 | `RATE_LIMITED` | API Key 每分钟限流 |
+| 429 | `QUOTA_EXCEEDED` | 分区月配额超限（带 `details` 与 `retry-after`） |
+| 429 | `login_rate_limited` | 登录接口 IP 限流 |
+| 500 | `INTERNAL_ERROR` | 未预期异常 |
+| 503 | `SERVICE_UNAVAILABLE` | 服务未就绪（如鉴权关闭但库中无用户） |
+
+---
+
+## 9. 与 v5 的差异
+
+v6 是干净重建，**不兼容 v5 的端点与数据**：
+
+| v5 | v6 |
+| --- | --- |
+| `/v1/projects/...`、`/v1/agents/...`、`/v1/tasks/...` | 全部删除；统一 `/v1/partitions/:p/...` |
+| `/v1/memories`、`/v1/memories/search`、`/v1/context` | 删除；改用分区 + 人级端点 |
+| `POST /v1/partitions/:p/memories`（顶层写记忆） | 人级 `POST .../persons/:person/memories`（人必填） |
+| 分页 `page/page_size` + `total` | 游标 `cursor/limit` + `next_cursor`，无 total |
+| `visibility`（project/agent/task） | `scope`（partition/person/session） |
+| 记忆向量/图谱/实体/词项/任务简报 | v6 不提供 |
+| 数据目录 `data/`（v5） | `data-v6/`（v5 数据不迁移，保留在 `v5` 分支） |
+
+更完整的迁移说明见 [`v6-architecture.md`](v6-architecture.md)；v5 文档可从 `v5` 分支获取。

@@ -1,4 +1,13 @@
--- Mnemos schema (SQLite). 契约文件：字段名/语义由 Lead 维护，engine 可新增索引但不得重命名。
+-- Mnemos v6 schema（SQLite）。契约：docs/v6-architecture.md 第 2 节。
+--
+-- v6 是重建：只保留 分区（partitions）/ 人（persons）/ 记忆（memories）三个核心，
+-- 旧域（agents / tasks / 任务简报 / 项目记录 / 复盘 / reports / webhooks / graph /
+-- entities / relations / memory_terms）一律不建表、不做兼容。
+--
+-- 计数维护：persons / memories / sessions 的增删改由触发器维护
+-- partition_stats 与 persons.memory_count/shared_memory_count/last_memory_at，
+-- 列表页只读反规范化字段，不做 COUNT(*)；批量导入后调用 reconcile 校准。
+
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA synchronous = NORMAL;
@@ -8,58 +17,428 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS webhooks (
-  id              TEXT PRIMARY KEY,
-  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  name            TEXT NOT NULL,
-  url             TEXT NOT NULL,
-  secret          TEXT NOT NULL,
-  event_types     TEXT NOT NULL DEFAULT '[]',
-  enabled         INTEGER NOT NULL DEFAULT 1,
-  description     TEXT NOT NULL DEFAULT '',
-  created_by      TEXT,
-  created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL,
-  last_delivery_at TEXT,
-  last_status     INTEGER,
-  failure_count   INTEGER NOT NULL DEFAULT 0,
-  disabled_at     TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_webhooks_project ON webhooks(project_id, created_at DESC);
+/* ------------------------------------------------------------------ */
+/* 组织与控制台账号（仅用于登录 / 权限，与「人」无关）                  */
+/* ------------------------------------------------------------------ */
 
-CREATE TABLE IF NOT EXISTS webhook_deliveries (
-  id              TEXT PRIMARY KEY,
-  webhook_id      TEXT NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
-  project_id      TEXT NOT NULL,
-  event_type      TEXT NOT NULL,
-  event_id        TEXT,
-  payload         TEXT NOT NULL,
-  status          TEXT NOT NULL DEFAULT 'pending',
-  attempts        INTEGER NOT NULL DEFAULT 0,
-  max_attempts    INTEGER NOT NULL DEFAULT 6,
-  next_attempt_at TEXT,
-  response_status INTEGER,
-  response_body   TEXT,
-  latency_ms      INTEGER,
-  error           TEXT,
-  created_at      TEXT NOT NULL,
-  delivered_at    TEXT
+CREATE TABLE IF NOT EXISTS orgs (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  slug       TEXT NOT NULL UNIQUE,
+  plan       TEXT NOT NULL DEFAULT 'enterprise',
+  created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_deliveries_webhook ON webhook_deliveries(webhook_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_deliveries_pending ON webhook_deliveries(status, next_attempt_at);
 
-CREATE TABLE IF NOT EXISTS idempotency_keys (
-  key          TEXT NOT NULL,
-  project_id   TEXT NOT NULL,
-  endpoint     TEXT NOT NULL,
-  request_hash TEXT NOT NULL,
-  status_code  INTEGER NOT NULL,
-  response     TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS users (
+  id                    TEXT PRIMARY KEY,
+  org_id                TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  email                 TEXT NOT NULL UNIQUE,
+  name                  TEXT NOT NULL,
+  role                  TEXT NOT NULL DEFAULT 'viewer',
+  title                 TEXT,
+  avatar_color          TEXT NOT NULL DEFAULT 'violet',
+  password_hash         TEXT NOT NULL,
+  status                TEXT NOT NULL DEFAULT 'active',
+  password_changed_at   TEXT,
+  last_login_at         TEXT,
+  failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+  locked_until          TEXT,
+  created_at            TEXT NOT NULL,
+  last_seen_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_users_org ON users(org_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+  token_hash   TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at   TEXT NOT NULL,
   expires_at   TEXT NOT NULL,
-  PRIMARY KEY (key, project_id)
+  ip           TEXT,
+  user_agent   TEXT,
+  last_seen_at TEXT,
+  revoked_at   TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_keys(expires_at);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_expiry ON user_sessions(expires_at);
+
+/* ------------------------------------------------------------------ */
+/* 分区（Partition）：取代 v5 的 projects                               */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS partitions (
+  id          TEXT PRIMARY KEY,
+  org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  slug        TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status      TEXT NOT NULL DEFAULT 'active',
+  settings    TEXT NOT NULL DEFAULT '{}',
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  archived_at TEXT,
+  UNIQUE (org_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_partitions_org ON partitions(org_id, created_at ASC);
+
+/* ------------------------------------------------------------------ */
+/* 人（Person）：记忆的主体，分区内一等实体                            */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS persons (
+  id                  TEXT PRIMARY KEY,
+  partition_id        TEXT NOT NULL REFERENCES partitions(id) ON DELETE CASCADE,
+  external_id         TEXT NOT NULL,
+  type                TEXT NOT NULL DEFAULT 'human',
+  display_name        TEXT NOT NULL DEFAULT '',
+  attributes          TEXT NOT NULL DEFAULT '{}',
+  status              TEXT NOT NULL DEFAULT 'active',
+  -- 反规范化计数（触发器维护）：避免列表 N+1 / COUNT(*)
+  memory_count        INTEGER NOT NULL DEFAULT 0,
+  shared_memory_count INTEGER NOT NULL DEFAULT 0,
+  session_count       INTEGER NOT NULL DEFAULT 0,
+  last_memory_at      TEXT,
+  first_seen_at       TEXT NOT NULL,
+  last_seen_at        TEXT NOT NULL,
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL,
+  UNIQUE (partition_id, type, external_id)
+);
+
+-- 列表 / 搜索索引（百万级）
+-- 每种排序都准备「过滤 status」「不过滤 status」「type 过滤」三套，保证任意列表组合都能走索引排序。
+CREATE INDEX IF NOT EXISTS idx_persons_recent     ON persons(partition_id, status, last_seen_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_persons_new        ON persons(partition_id, status, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_persons_name       ON persons(partition_id, status, display_name, id);
+CREATE INDEX IF NOT EXISTS idx_persons_recent_all ON persons(partition_id, last_seen_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_persons_new_all    ON persons(partition_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_persons_name_all   ON persons(partition_id, display_name, id);
+CREATE INDEX IF NOT EXISTS idx_persons_type_recent ON persons(partition_id, type, last_seen_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_persons_ext         ON persons(partition_id, external_id);
+
+-- FTS5（外部内容表 + 同步触发器）：q 前缀检索 external_id / display_name
+CREATE VIRTUAL TABLE IF NOT EXISTS persons_fts USING fts5(
+  external_id,
+  display_name,
+  content = 'persons',
+  content_rowid = 'rowid',
+  tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS persons_fts_ai AFTER INSERT ON persons BEGIN
+  INSERT INTO persons_fts(rowid, external_id, display_name)
+  VALUES (new.rowid, new.external_id, new.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS persons_fts_ad AFTER DELETE ON persons BEGIN
+  INSERT INTO persons_fts(persons_fts, rowid, external_id, display_name)
+  VALUES ('delete', old.rowid, old.external_id, old.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS persons_fts_au AFTER UPDATE ON persons BEGIN
+  INSERT INTO persons_fts(persons_fts, rowid, external_id, display_name)
+  VALUES ('delete', old.rowid, old.external_id, old.display_name);
+  INSERT INTO persons_fts(rowid, external_id, display_name)
+  VALUES (new.rowid, new.external_id, new.display_name);
+END;
+
+/* ------------------------------------------------------------------ */
+/* 会话（可选分组：一次对话 / 任务）                                   */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id           TEXT PRIMARY KEY,
+  partition_id TEXT NOT NULL REFERENCES partitions(id) ON DELETE CASCADE,
+  person_id    TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+  title        TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'active',
+  started_at   TEXT NOT NULL,
+  ended_at     TEXT,
+  metadata     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_person ON sessions(partition_id, person_id, started_at DESC);
+
+/* ------------------------------------------------------------------ */
+/* 记忆                                                                */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS memories (
+  id              TEXT PRIMARY KEY,
+  partition_id    TEXT NOT NULL REFERENCES partitions(id) ON DELETE CASCADE,
+  person_id       TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+  actor_person_id TEXT,
+  scope           TEXT NOT NULL DEFAULT 'partition',
+  session_id      TEXT,
+  category        TEXT NOT NULL DEFAULT 'fact',
+  content         TEXT NOT NULL,
+  importance      REAL NOT NULL DEFAULT 0.5,
+  confidence      REAL NOT NULL DEFAULT 0.8,
+  source          TEXT NOT NULL DEFAULT 'api',
+  status          TEXT NOT NULL DEFAULT 'active',
+  tags            TEXT NOT NULL DEFAULT '[]',
+  metadata        TEXT NOT NULL DEFAULT '{}',
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  expires_at      TEXT,
+  dreamed_at      TEXT
+);
+-- 排序键放在 status 之前：列表默认不带 status 过滤，保证 ORDER BY created_at 可直接走索引。
+CREATE INDEX IF NOT EXISTS idx_memories_person ON memories(partition_id, person_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_scope  ON memories(partition_id, scope, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(partition_id, category, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(partition_id, status, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_recent ON memories(partition_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(partition_id, session_id);
+
+-- FTS5（检索用：content 全文）
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  content,
+  content = 'memories',
+  content_rowid = 'rowid',
+  tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+/* ------------------------------------------------------------------ */
+/* 简报 / 做梦                                                         */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS memory_briefs (
+  partition_id TEXT NOT NULL REFERENCES partitions(id) ON DELETE CASCADE,
+  scope_key    TEXT NOT NULL,
+  person_id    TEXT,
+  text         TEXT NOT NULL DEFAULT '',
+  max_chars    INTEGER NOT NULL,
+  model        TEXT NOT NULL,
+  source_hash  TEXT NOT NULL,
+  generated_at TEXT NOT NULL,
+  PRIMARY KEY (partition_id, scope_key)
+);
+
+CREATE TABLE IF NOT EXISTS dream_runs (
+  id            TEXT PRIMARY KEY,
+  partition_id  TEXT NOT NULL REFERENCES partitions(id) ON DELETE CASCADE,
+  person_id     TEXT,
+  trigger       TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  input_count   INTEGER NOT NULL DEFAULT 0,
+  insight_count INTEGER NOT NULL DEFAULT 0,
+  summary       TEXT,
+  error         TEXT,
+  started_at    TEXT NOT NULL,
+  finished_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dream_runs_partition ON dream_runs(partition_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dream_runs_person ON dream_runs(partition_id, person_id, started_at DESC);
+
+/* ------------------------------------------------------------------ */
+/* API Key（分区 / 组织）                                              */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id                 TEXT PRIMARY KEY,
+  partition_id       TEXT REFERENCES partitions(id) ON DELETE CASCADE,
+  org_id             TEXT REFERENCES orgs(id) ON DELETE CASCADE,
+  kind               TEXT NOT NULL DEFAULT 'partition',
+  name               TEXT NOT NULL,
+  prefix             TEXT NOT NULL,
+  key_hash           TEXT NOT NULL UNIQUE,
+  scopes             TEXT NOT NULL DEFAULT '[]',
+  created_by         TEXT,
+  created_at         TEXT NOT NULL,
+  last_used_at       TEXT,
+  revoked_at         TEXT,
+  rate_limit_per_min INTEGER NOT NULL DEFAULT 600,
+  expires_at         TEXT,
+  allowed_ips        TEXT NOT NULL DEFAULT '[]',
+  rotated_from       TEXT,
+  rotated_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_keys_partition ON api_keys(partition_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_keys_org ON api_keys(org_id, created_at DESC);
+
+/* ------------------------------------------------------------------ */
+/* 分区统计（头部聚合；触发器维护，列表页不再 COUNT(*)）                 */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS partition_stats (
+  partition_id    TEXT PRIMARY KEY REFERENCES partitions(id) ON DELETE CASCADE,
+  persons_total   INTEGER NOT NULL DEFAULT 0,
+  persons_human   INTEGER NOT NULL DEFAULT 0,
+  persons_agent   INTEGER NOT NULL DEFAULT 0,
+  persons_service INTEGER NOT NULL DEFAULT 0,
+  memories_total  INTEGER NOT NULL DEFAULT 0,
+  shared_total    INTEGER NOT NULL DEFAULT 0,
+  sessions_total  INTEGER NOT NULL DEFAULT 0,
+  updated_at      TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS partitions_stats_ai AFTER INSERT ON partitions BEGIN
+  INSERT OR IGNORE INTO partition_stats (partition_id, updated_at)
+  VALUES (new.id, new.created_at);
+END;
+
+/* --- persons 计数 --- */
+
+CREATE TRIGGER IF NOT EXISTS persons_stats_ai AFTER INSERT ON persons BEGIN
+  UPDATE partition_stats
+     SET persons_total   = persons_total + 1,
+         persons_human   = persons_human + (CASE WHEN new.type = 'human' THEN 1 ELSE 0 END),
+         persons_agent   = persons_agent + (CASE WHEN new.type = 'agent' THEN 1 ELSE 0 END),
+         persons_service = persons_service + (CASE WHEN new.type = 'service' THEN 1 ELSE 0 END),
+         updated_at      = new.created_at
+   WHERE partition_id = new.partition_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS persons_stats_ad AFTER DELETE ON persons BEGIN
+  UPDATE partition_stats
+     SET persons_total   = MAX(0, persons_total - 1),
+         persons_human   = MAX(0, persons_human - (CASE WHEN old.type = 'human' THEN 1 ELSE 0 END)),
+         persons_agent   = MAX(0, persons_agent - (CASE WHEN old.type = 'agent' THEN 1 ELSE 0 END)),
+         persons_service = MAX(0, persons_service - (CASE WHEN old.type = 'service' THEN 1 ELSE 0 END)),
+         updated_at      = old.updated_at
+   WHERE partition_id = old.partition_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS persons_stats_au AFTER UPDATE OF type ON persons BEGIN
+  UPDATE partition_stats
+     SET persons_human   = MAX(0, persons_human + (CASE WHEN new.type = 'human' THEN 1 ELSE 0 END) - (CASE WHEN old.type = 'human' THEN 1 ELSE 0 END)),
+         persons_agent   = MAX(0, persons_agent + (CASE WHEN new.type = 'agent' THEN 1 ELSE 0 END) - (CASE WHEN old.type = 'agent' THEN 1 ELSE 0 END)),
+         persons_service = MAX(0, persons_service + (CASE WHEN new.type = 'service' THEN 1 ELSE 0 END) - (CASE WHEN old.type = 'service' THEN 1 ELSE 0 END)),
+         updated_at      = new.updated_at
+   WHERE partition_id = new.partition_id;
+END;
+
+/* --- memories 计数 + 人的反规范化计数 --- */
+
+CREATE TRIGGER IF NOT EXISTS memories_stats_ai AFTER INSERT ON memories BEGIN
+  UPDATE partition_stats
+     SET memories_total = memories_total + 1,
+         shared_total   = shared_total + (CASE WHEN new.scope = 'partition' THEN 1 ELSE 0 END),
+         updated_at     = new.created_at
+   WHERE partition_id = new.partition_id;
+
+  UPDATE persons
+     SET memory_count        = memory_count + (CASE WHEN new.scope IN ('person', 'session') THEN 1 ELSE 0 END),
+         shared_memory_count = shared_memory_count + (CASE WHEN new.scope = 'partition' THEN 1 ELSE 0 END),
+         last_memory_at      = CASE
+                                 WHEN last_memory_at IS NULL OR last_memory_at < new.created_at THEN new.created_at
+                                 ELSE last_memory_at
+                               END,
+         last_seen_at        = CASE WHEN last_seen_at < new.created_at THEN new.created_at ELSE last_seen_at END,
+         updated_at          = CASE WHEN updated_at < new.created_at THEN new.created_at ELSE updated_at END
+   WHERE id = new.person_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_stats_ad AFTER DELETE ON memories BEGIN
+  UPDATE partition_stats
+     SET memories_total = MAX(0, memories_total - 1),
+         shared_total   = MAX(0, shared_total - (CASE WHEN old.scope = 'partition' THEN 1 ELSE 0 END)),
+         updated_at     = old.updated_at
+   WHERE partition_id = old.partition_id;
+
+  UPDATE persons
+     SET memory_count        = MAX(0, memory_count - (CASE WHEN old.scope IN ('person', 'session') THEN 1 ELSE 0 END)),
+         shared_memory_count = MAX(0, shared_memory_count - (CASE WHEN old.scope = 'partition' THEN 1 ELSE 0 END)),
+         updated_at          = old.updated_at
+   WHERE id = old.person_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_scope_au AFTER UPDATE OF scope ON memories BEGIN
+  UPDATE partition_stats
+     SET shared_total = MAX(0, shared_total
+           + (CASE WHEN new.scope = 'partition' THEN 1 ELSE 0 END)
+           - (CASE WHEN old.scope = 'partition' THEN 1 ELSE 0 END)),
+         updated_at = new.updated_at
+   WHERE partition_id = new.partition_id;
+
+  UPDATE persons
+     SET memory_count = MAX(0, memory_count
+           + (CASE WHEN new.scope IN ('person', 'session') THEN 1 ELSE 0 END)
+           - (CASE WHEN old.scope IN ('person', 'session') THEN 1 ELSE 0 END)),
+         shared_memory_count = MAX(0, shared_memory_count
+           + (CASE WHEN new.scope = 'partition' THEN 1 ELSE 0 END)
+           - (CASE WHEN old.scope = 'partition' THEN 1 ELSE 0 END)),
+         updated_at = new.updated_at
+   WHERE id = new.person_id;
+END;
+
+/* --- sessions 计数 --- */
+
+CREATE TRIGGER IF NOT EXISTS sessions_stats_ai AFTER INSERT ON sessions BEGIN
+  UPDATE partition_stats
+     SET sessions_total = sessions_total + 1,
+         updated_at     = new.started_at
+   WHERE partition_id = new.partition_id;
+
+  UPDATE persons
+     SET session_count = session_count + 1,
+         updated_at    = CASE WHEN updated_at < new.started_at THEN new.started_at ELSE updated_at END
+   WHERE id = new.person_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_stats_ad AFTER DELETE ON sessions BEGIN
+  UPDATE partition_stats
+     SET sessions_total = MAX(0, sessions_total - 1)
+   WHERE partition_id = old.partition_id;
+
+  UPDATE persons
+     SET session_count = MAX(0, session_count - 1)
+   WHERE id = old.person_id;
+END;
+
+/* ------------------------------------------------------------------ */
+/* 基础运营：审计 / 用量 / 维护                                        */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id            TEXT PRIMARY KEY,
+  org_id        TEXT,
+  partition_id  TEXT,
+  actor_type    TEXT NOT NULL,
+  actor_id      TEXT,
+  actor_label   TEXT NOT NULL,
+  action        TEXT NOT NULL,
+  resource_type TEXT NOT NULL,
+  resource_id   TEXT,
+  detail        TEXT NOT NULL DEFAULT '{}',
+  ip            TEXT,
+  user_agent    TEXT,
+  request_id    TEXT,
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_partition ON audit_logs(partition_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_org ON audit_logs(org_id, created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS usage_events (
+  id            TEXT PRIMARY KEY,
+  org_id        TEXT,
+  partition_id  TEXT NOT NULL,
+  api_key_id    TEXT,
+  channel       TEXT NOT NULL DEFAULT 'console',
+  operation     TEXT NOT NULL,
+  method        TEXT NOT NULL DEFAULT 'POST',
+  path          TEXT NOT NULL DEFAULT '',
+  status        INTEGER NOT NULL DEFAULT 200,
+  latency_ms    INTEGER NOT NULL DEFAULT 0,
+  result_count  INTEGER NOT NULL DEFAULT 0,
+  memory_tokens INTEGER NOT NULL DEFAULT 0,
+  actor         TEXT,
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_partition ON usage_events(partition_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_org ON usage_events(org_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS maintenance_runs (
   id          TEXT PRIMARY KEY,
@@ -73,310 +452,4 @@ CREATE TABLE IF NOT EXISTS maintenance_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_maintenance_started ON maintenance_runs(started_at DESC);
 
-CREATE TABLE IF NOT EXISTS orgs (
-  id         TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  slug       TEXT NOT NULL UNIQUE,
-  plan       TEXT NOT NULL DEFAULT 'enterprise',
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS users (
-  id            TEXT PRIMARY KEY,
-  org_id        TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
-  email         TEXT NOT NULL UNIQUE,
-  name          TEXT NOT NULL,
-  role          TEXT NOT NULL DEFAULT 'viewer',
-  title         TEXT,
-  avatar_color  TEXT NOT NULL DEFAULT 'violet',
-  password_hash TEXT NOT NULL,
-  status        TEXT NOT NULL DEFAULT 'active',
-  password_changed_at TEXT,
-  last_login_at TEXT,
-  failed_login_attempts INTEGER NOT NULL DEFAULT 0,
-  locked_until  TEXT,
-  created_at    TEXT NOT NULL,
-  last_seen_at  TEXT
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-  token_hash TEXT PRIMARY KEY,
-  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  ip         TEXT,
-  user_agent TEXT,
-  last_seen_at TEXT,
-  revoked_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS projects (
-  id          TEXT PRIMARY KEY,
-  org_id      TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
-  slug        TEXT NOT NULL,
-  name        TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  status      TEXT NOT NULL DEFAULT 'active',
-  region      TEXT NOT NULL DEFAULT 'cn-shanghai',
-  env         TEXT NOT NULL DEFAULT 'production',
-  settings    TEXT NOT NULL DEFAULT '{}',
-  created_at  TEXT NOT NULL,
-  updated_at  TEXT NOT NULL,
-  archived_at TEXT,
-  UNIQUE (org_id, slug)
-);
-
-CREATE TABLE IF NOT EXISTS project_members (
-  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role       TEXT NOT NULL DEFAULT 'developer',
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (project_id, user_id)
-);
-
-CREATE TABLE IF NOT EXISTS api_keys (
-  id                  TEXT PRIMARY KEY,
-  project_id          TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  name                TEXT NOT NULL,
-  prefix              TEXT NOT NULL,
-  key_hash            TEXT NOT NULL UNIQUE,
-  scopes              TEXT NOT NULL DEFAULT '[]',
-  created_by          TEXT,
-  created_at          TEXT NOT NULL,
-  last_used_at        TEXT,
-  revoked_at          TEXT,
-  rate_limit_per_min  INTEGER NOT NULL DEFAULT 600,
-  expires_at          TEXT,
-  allowed_ips         TEXT NOT NULL DEFAULT '[]',
-  rotated_from        TEXT,
-  rotated_at          TEXT,
-  kind                TEXT NOT NULL DEFAULT 'project',
-  org_id              TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_keys_project ON api_keys(project_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_keys_org ON api_keys(org_id, created_at DESC);
-
-/* ------------------------------------------------------------------ */
-/* 人（Person）：记忆的主体，分区内一等实体                            */
-/* ------------------------------------------------------------------ */
-
-CREATE TABLE IF NOT EXISTS persons (
-  id            TEXT PRIMARY KEY,
-  project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  external_id   TEXT NOT NULL,
-  type          TEXT NOT NULL DEFAULT 'human',
-  display_name  TEXT NOT NULL DEFAULT '',
-  attributes    TEXT NOT NULL DEFAULT '{}',
-  status        TEXT NOT NULL DEFAULT 'active',
-  first_seen_at TEXT NOT NULL,
-  last_seen_at  TEXT NOT NULL,
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL,
-  UNIQUE (project_id, type, external_id)
-);
-CREATE INDEX IF NOT EXISTS idx_persons_partition ON persons(project_id, status, last_seen_at DESC);
-CREATE INDEX IF NOT EXISTS idx_persons_external ON persons(project_id, external_id);
-
-CREATE TABLE IF NOT EXISTS memories (
-  id              TEXT PRIMARY KEY,
-  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  user_id         TEXT,
-  agent_id        TEXT,
-  run_id          TEXT,
-  app_id          TEXT,
-  task_id         TEXT,
-  visibility      TEXT NOT NULL DEFAULT 'project',
-  content         TEXT NOT NULL,
-  normalized_hash TEXT NOT NULL,
-  category        TEXT NOT NULL DEFAULT 'fact',
-  importance      REAL NOT NULL DEFAULT 0.5,
-  confidence      REAL NOT NULL DEFAULT 0.8,
-  source          TEXT NOT NULL DEFAULT 'api',
-  status          TEXT NOT NULL DEFAULT 'active',
-  tags            TEXT NOT NULL DEFAULT '[]',
-  metadata        TEXT NOT NULL DEFAULT '{}',
-  created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL,
-  last_accessed_at TEXT,
-  access_count    INTEGER NOT NULL DEFAULT 0,
-  expires_at      TEXT,
-  embedding       BLOB,
-  embedding_model TEXT,
-  dim             INTEGER,
-  dreamed_at      TEXT,
-  person_id       TEXT,
-  actor_person_id TEXT,
-  scope           TEXT NOT NULL DEFAULT 'partition',
-  session_id      TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(project_id, user_id, agent_id, status);
-CREATE INDEX IF NOT EXISTS idx_memories_recent ON memories(project_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(project_id, normalized_hash);
-CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(project_id, status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_memories_task ON memories(project_id, task_id);
-CREATE INDEX IF NOT EXISTS idx_memories_visibility ON memories(project_id, visibility, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_memories_person ON memories(project_id, person_id, status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_memories_scope2 ON memories(project_id, scope, updated_at DESC);
-
-CREATE TABLE IF NOT EXISTS memory_history (
-  id          TEXT PRIMARY KEY,
-  memory_id   TEXT NOT NULL,
-  project_id  TEXT NOT NULL,
-  event       TEXT NOT NULL,
-  old_content TEXT,
-  new_content TEXT,
-  actor       TEXT NOT NULL,
-  reason      TEXT,
-  meta        TEXT NOT NULL DEFAULT '{}',
-  created_at  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_history_memory ON memory_history(memory_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_history_project ON memory_history(project_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS agents (
-  id            TEXT PRIMARY KEY,
-  project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  name          TEXT NOT NULL,
-  role          TEXT NOT NULL DEFAULT 'assistant',
-  model         TEXT NOT NULL DEFAULT 'deepseek-chat',
-  description   TEXT NOT NULL DEFAULT '',
-  capabilities  TEXT NOT NULL DEFAULT '[]',
-  status        TEXT NOT NULL DEFAULT 'active',
-  metadata      TEXT NOT NULL DEFAULT '{}',
-  created_at    TEXT NOT NULL,
-  last_active_at TEXT,
-  UNIQUE (project_id, name)
-);
-CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project_id, status, last_active_at DESC);
-
-CREATE TABLE IF NOT EXISTS tasks (
-  id              TEXT PRIMARY KEY,
-  project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  title           TEXT NOT NULL,
-  goal            TEXT NOT NULL DEFAULT '',
-  status          TEXT NOT NULL DEFAULT 'active',
-  owner_agent_id  TEXT,
-  branch          TEXT,
-  summary         TEXT,
-  metadata        TEXT NOT NULL DEFAULT '{}',
-  created_at      TEXT NOT NULL,
-  started_at      TEXT NOT NULL,
-  ended_at        TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, status, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(project_id, owner_agent_id, started_at DESC);
-
-CREATE TABLE IF NOT EXISTS entities (
-  id            TEXT PRIMARY KEY,
-  project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  name          TEXT NOT NULL,
-  type          TEXT NOT NULL DEFAULT 'concept',
-  normalized    TEXT NOT NULL,
-  mention_count INTEGER NOT NULL DEFAULT 1,
-  created_at    TEXT NOT NULL,
-  UNIQUE (project_id, normalized, type)
-);
-CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project_id, mention_count DESC);
-
-CREATE TABLE IF NOT EXISTS memory_entities (
-  memory_id TEXT NOT NULL,
-  entity_id TEXT NOT NULL,
-  salience  REAL NOT NULL DEFAULT 1,
-  PRIMARY KEY (memory_id, entity_id)
-);
-CREATE INDEX IF NOT EXISTS idx_mementity_entity ON memory_entities(entity_id);
-
-CREATE TABLE IF NOT EXISTS relations (
-  id               TEXT PRIMARY KEY,
-  project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  source_entity_id TEXT NOT NULL,
-  target_entity_id TEXT NOT NULL,
-  relation         TEXT NOT NULL,
-  memory_id        TEXT,
-  weight           REAL NOT NULL DEFAULT 1,
-  created_at       TEXT NOT NULL,
-  UNIQUE (project_id, source_entity_id, target_entity_id, relation)
-);
-CREATE INDEX IF NOT EXISTS idx_relations_project ON relations(project_id, weight DESC);
-
-CREATE TABLE IF NOT EXISTS memory_terms (
-  memory_id  TEXT NOT NULL,
-  project_id TEXT NOT NULL,
-  term       TEXT NOT NULL,
-  tf         INTEGER NOT NULL DEFAULT 1,
-  PRIMARY KEY (memory_id, term)
-);
-CREATE INDEX IF NOT EXISTS idx_terms_lookup ON memory_terms(project_id, term);
-CREATE INDEX IF NOT EXISTS idx_terms_memory ON memory_terms(memory_id);
-
-CREATE TABLE IF NOT EXISTS audit_logs (
-  id            TEXT PRIMARY KEY,
-  org_id        TEXT,
-  project_id    TEXT,
-  actor_type    TEXT NOT NULL,
-  actor_id      TEXT,
-  actor_label   TEXT NOT NULL,
-  action        TEXT NOT NULL,
-  resource_type TEXT NOT NULL,
-  resource_id   TEXT,
-  detail        TEXT NOT NULL DEFAULT '{}',
-  ip            TEXT,
-  user_agent    TEXT,
-  request_id    TEXT,
-  created_at    TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_audit_project ON audit_logs(project_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_org ON audit_logs(org_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS usage_events (
-  id           TEXT PRIMARY KEY,
-  org_id       TEXT,
-  project_id   TEXT NOT NULL,
-  api_key_id   TEXT,
-  channel      TEXT NOT NULL DEFAULT 'console',
-  operation    TEXT NOT NULL,
-  method       TEXT NOT NULL DEFAULT 'POST',
-  path         TEXT NOT NULL DEFAULT '',
-  status       INTEGER NOT NULL DEFAULT 200,
-  latency_ms   INTEGER NOT NULL DEFAULT 0,
-  result_count INTEGER NOT NULL DEFAULT 0,
-  memory_tokens INTEGER NOT NULL DEFAULT 0,
-  actor        TEXT,
-  created_at   TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_usage_project ON usage_events(project_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_usage_org ON usage_events(org_id, created_at DESC);
-
-/* ------------------------------------------------------------------ */
-/* 记忆简报 / 做梦                                                      */
-/* ------------------------------------------------------------------ */
-
-CREATE TABLE IF NOT EXISTS memory_briefs (
-  project_id   TEXT NOT NULL,
-  scope        TEXT NOT NULL,
-  person_id    TEXT,
-  text         TEXT NOT NULL DEFAULT '',
-  max_chars    INTEGER NOT NULL,
-  model        TEXT NOT NULL,
-  source_hash  TEXT NOT NULL,
-  generated_at TEXT NOT NULL,
-  PRIMARY KEY (project_id, scope)
-);
-
-CREATE TABLE IF NOT EXISTS memory_dream_runs (
-  id            TEXT PRIMARY KEY,
-  project_id    TEXT NOT NULL,
-  trigger       TEXT NOT NULL,
-  status        TEXT NOT NULL,
-  input_count   INTEGER NOT NULL DEFAULT 0,
-  insight_count INTEGER NOT NULL DEFAULT 0,
-  summary       TEXT,
-  error         TEXT,
-  started_at    TEXT NOT NULL,
-  finished_at   TEXT,
-  person_id     TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_dream_runs_project ON memory_dream_runs(project_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_dream_runs_person ON memory_dream_runs(project_id, person_id, started_at DESC);
-
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '5');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '6');

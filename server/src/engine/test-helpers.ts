@@ -1,11 +1,9 @@
 /**
- * 测试夹具：内存 SQLite + 组织/项目行 + 服务实例（供 engine*.test.ts 共用）。
- * 建 org/project 行是为了满足 memories.project_id 的外键约束。
+ * 引擎测试夹具：内存 SQLite + 组织/分区行 + 服务实例。
  */
 
 import { DatabaseSync } from 'node:sqlite';
-
-import type { Actor, AddMemoryInput, MemoryService } from '../../../shared/src/types.ts';
+import type { Actor, AddMemoryInput, MemoryService, Partition } from '../../../shared/src/types.ts';
 import { migrate } from '../db/index.ts';
 import { createMemoryService } from './index.ts';
 
@@ -14,51 +12,47 @@ export const ACTOR: Actor = { type: 'user', id: 'usr_test', label: '测试用户
 export interface Fixture {
   db: DatabaseSync;
   svc: MemoryService;
-  projectId: string;
+  orgId: string;
+  partitionId: string;
+  partition: Partition;
   actor: Actor;
 }
 
-export function setup(options: { settings?: Record<string, unknown>; slug?: string } = {}): Fixture {
+export function setup(options: { settings?: Record<string, unknown>; slug?: string; orgId?: string } = {}): Fixture {
   const db = new DatabaseSync(':memory:');
   migrate(db);
   const at = new Date().toISOString();
-  const projectId = `proj_${options.slug ?? 'test'}`;
+  const orgId = options.orgId ?? 'org_test';
   db.prepare('INSERT INTO orgs (id, name, slug, plan, created_at) VALUES (?, ?, ?, ?, ?)').run(
-    'org_test',
+    orgId,
     '测试组织',
     `test-org-${options.slug ?? 'test'}`,
     'enterprise',
     at,
   );
-  db.prepare(
-    `INSERT INTO projects (id, org_id, slug, name, description, status, region, env, settings, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    projectId,
-    'org_test',
-    options.slug ?? 'test',
-    '测试项目',
-    '',
-    'active',
-    'cn-shanghai',
-    'production',
-    JSON.stringify(options.settings ?? {}),
-    at,
-    at,
-  );
-  return { db, svc: createMemoryService(db), projectId, actor: ACTOR };
+  const svc = createMemoryService(db);
+  const partition = svc.upsertPartition(orgId, {
+    slug: options.slug ?? 'test',
+    name: '测试分区',
+    settings: options.settings,
+  }, ACTOR);
+  return { db, svc, orgId, partitionId: partition.id, partition, actor: ACTOR };
 }
 
-/** 用默认 projectId / actor 调 add。 */
-export async function addMemory(
+/** 用默认 partitionId / actor 调 addMemory。 */
+export function addMemory(
   fx: Fixture,
-  input: Omit<Partial<AddMemoryInput>, 'projectId' | 'actor'> & { text: string },
+  input: Omit<AddMemoryInput, 'partitionId' | 'actor'> & { content: string },
 ) {
-  return fx.svc.add({ projectId: fx.projectId, actor: fx.actor, ...input });
+  return fx.svc.addMemory({ partitionId: fx.partitionId, actor: fx.actor, ...input });
 }
 
-export function setCreatedAt(db: DatabaseSync, id: string, iso: string): void {
-  db.prepare('UPDATE memories SET created_at = ? WHERE id = ?').run(iso, id);
+export function createPerson(fx: Fixture, externalId: string, type: 'human' | 'agent' | 'service' = 'human') {
+  return fx.svc.upsertPerson(fx.partitionId, { externalId, type, displayName: externalId }, fx.actor);
+}
+
+export function setCreatedAt(db: DatabaseSync, table: 'memories' | 'persons', id: string, iso: string): void {
+  db.prepare(`UPDATE ${table} SET created_at = ? WHERE id = ?`).run(iso, id);
 }
 
 /** 取单值聚合查询的数字结果。 */

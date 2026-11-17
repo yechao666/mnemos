@@ -1,31 +1,46 @@
 /**
- * 引擎领域错误。
- *
- * 引擎只负责抛出带 status/code 的领域错误，HTTP 层（http/engine.ts）统一映射为
- * `{ error: { code, message } }` 响应，避免把状态码语义散落进领域逻辑。
+ * 引擎错误：与 HTTP 层解耦，由 http/respond.ts 统一映射为错误响应。
  */
+export type EngineErrorCode =
+  | 'NOT_FOUND'
+  | 'VALIDATION'
+  | 'CONFLICT'
+  | 'DREAM_RUNNING'
+  | 'INVALID_CURSOR'
+  | 'PARTITION_ARCHIVED'
+  | 'INTERNAL';
 
-export class DomainError extends Error {
+export class EngineError extends Error {
+  readonly code: EngineErrorCode;
   readonly status: number;
-  readonly code: string;
+  readonly details?: unknown;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(code: EngineErrorCode, message: string, status = 400, details?: unknown) {
     super(message);
-    this.name = 'DomainError';
-    this.status = status;
+    this.name = 'EngineError';
     this.code = code;
+    this.status = status;
+    this.details = details;
   }
 }
 
-export function notFound(message: string): DomainError {
-  return new DomainError(404, 'NOT_FOUND', message);
-}
-
-export function conflict(message: string): DomainError {
-  return new DomainError(409, 'CONFLICT', message);
-}
-
-/** 语义不合法但 JSON 形状合法（如 visibility=task 却缺少 taskId）。 */
-export function unprocessable(message: string): DomainError {
-  return new DomainError(422, 'UNPROCESSABLE_ENTITY', message);
-}
+export const engineErrors = {
+  notFound(message = '资源不存在'): EngineError {
+    return new EngineError('NOT_FOUND', message, 404);
+  },
+  validation(message = '请求参数不合法', details?: unknown): EngineError {
+    return new EngineError('VALIDATION', message, 400, details);
+  },
+  conflict(message: string, details?: unknown): EngineError {
+    return new EngineError('CONFLICT', message, 409, details);
+  },
+  dreamRunning(message = '该作用域正在做梦，请稍后重试'): EngineError {
+    return new EngineError('DREAM_RUNNING', message, 409);
+  },
+  invalidCursor(message = '游标无效或已过期'): EngineError {
+    return new EngineError('INVALID_CURSOR', message, 400);
+  },
+  archivedPartition(message = '分区已归档，无法写入'): EngineError {
+    return new EngineError('PARTITION_ARCHIVED', message, 403);
+  },
+};

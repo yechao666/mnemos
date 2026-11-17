@@ -1,5 +1,5 @@
 /**
- * Agent 工具集合（8 个 `mnemos_*`，新版中立记忆服务 v5）。
+ * Agent 工具集合（8 个 `mnemos_*`，Mnemos v6）。
  *
  * 设计约束（与旧插件 dsh-mnemos 保持一致，原因见 `src/dsh-types.d.ts`）：
  * - 参数与输出都是**手写原始 JSON Schema**，不在运行时 import `@deepseek-ai/dsh-tools`；
@@ -12,12 +12,21 @@
  * 首次调用 `POST /v1/partitions` 幂等建分区（客户端内缓存分区 id，进程内只建一次）。
  * 人 = 记忆主体：`person_id` 缺省 / `self` 表示配置里的默认人；写路径会先 `PUT persons/:externalId`
  * 建档（服务端 lazy upsert），读路径只传人标识、不产生写副作用。
+ *
+ * v6 变化：
+ * - 人 / 记忆列表改为**游标分页**（`cursor` / `limit`，响应 `{ items, next_cursor, partition_stats }`），
+ *   工具参数与输出里的 `page` 换成 `cursor` / `next_cursor`；
+ * - 写记忆走人级端点 `POST /v1/partitions/:p/persons/:person/memories`；
+ * - 分区统计读 `GET /v1/partitions/:p/stats`（partition_stats），人的计数读 persons 行上的
+ *   `memory_count / shared_memory_count / session_count`，不做 COUNT(*)。
  */
 
 import type { ContentBlock, ToolDefinition, ToolRunContextLike } from './dsh-types.js'
 import type { MnemosConfig, PersonType } from './config.js'
 import {
+  DEFAULT_LIST_LIMIT,
   DEFAULT_TOP_K,
+  MAX_LIST_LIMIT,
   MAX_TOP_K,
   MnemosApiError,
   MnemosClient,
@@ -114,19 +123,7 @@ function renderFailure(toolName: string, value: { error?: string; action?: strin
   return `${toolName} 失败：${value.error ?? '未知错误'}${action}`
 }
 
-/** 从响应里取数组：容忍 `results` / `memories` / `people` / 裸数组。 */
-function listFrom(payload: unknown, ...keys: string[]): unknown[] {
-  const record = asRecord(payload)
-  if (record !== undefined) {
-    for (const key of keys) {
-      const value = record[key]
-      if (Array.isArray(value)) return value
-    }
-  }
-  return Array.isArray(payload) ? payload : []
-}
-
-/** 记忆正文：v5 用 `content`，旧 v1 读视图用 `memory`。 */
+/** 记忆正文：v6 用 `content`（旧 v1 读视图的 `memory` 仍兼容）。 */
 function memoryContent(memory: MnemosMemory | undefined): string {
   const value = memory?.content ?? memory?.memory
   return typeof value === 'string' && value !== '' ? value : '(空内容)'
@@ -158,19 +155,23 @@ function renderMemoryList(memories: MnemosMemory[]): string {
 /** 分区摘要（喂给工具结果 / 渲染）。 */
 function summarizePartition(payload: unknown, fallback: PartitionInfo): Record<string, unknown> {
   const root = asRecord(payload)
-  const node = asRecord(root?.partition) ?? asRecord(root?.project) ?? root ?? {}
+  const node = asRecord(root?.partition) ?? root ?? {}
   const summary: Record<string, unknown> = {
     slug: stringField(node, 'slug') ?? fallback.slug,
     name: stringField(node, 'name') ?? fallback.name,
   }
-  const id = stringField(node, 'id', 'partition_id', 'project_id') ?? fallback.id
+  const id = stringField(node, 'id', 'partition_id') ?? fallback.id
   if (id !== undefined) summary.id = id
   const description = stringField(node, 'description')
   if (description !== undefined) summary.description = description
+  const status = stringField(node, 'status')
+  if (status !== undefined) summary.status = status
+  const settings = asRecord(node.settings)
+  if (settings !== undefined) summary.settings = settings
   return summary
 }
 
-/** 人摘要（喂给工具结果 / 渲染）：详情接口可能把 stats 放在 `{ person, stats }` 外层。 */
+/** 人摘要（喂给工具结果 / 渲染）：v6 计数在 persons 行上（memory_count 等）。 */
 function summarizePerson(payload: unknown): Record<string, unknown> {
   const root = asRecord(payload) ?? {}
   const node = asRecord(root.person) ?? root
@@ -185,11 +186,43 @@ function summarizePerson(payload: unknown): Record<string, unknown> {
   if (displayName !== undefined) summary.display_name = displayName
   const status = stringField(node, 'status')
   if (status !== undefined) summary.status = status
-  const stats = asRecord(node.stats) ?? asRecord(root.stats)
-  if (stats !== undefined) summary.stats = stats
   const attributes = asRecord(node.attributes)
   if (attributes !== undefined) summary.attributes = attributes
+  // v6 反规范化计数（列表页不再逐行查 stats）。
+  for (const key of [
+    'memory_count',
+    'shared_memory_count',
+    'session_count',
+    'first_seen_at',
+    'last_seen_at',
+    'last_memory_at',
+    'created_at',
+    'updated_at',
+  ]) {
+    const value = node[key]
+    if (value !== undefined) summary[key] = value
+  }
+  // 兼容：旧版把计数放在 stats 里。
+  const stats = asRecord(node.stats) ?? asRecord(root.stats)
+  if (stats !== undefined) summary.stats = stats
   return summary
+}
+
+/** 人的记忆数 / 共享数（v6 字段优先，旧 stats 兜底）。 */
+function personCount(person: Record<string, unknown>, key: 'memories' | 'shared_memories' | 'sessions'): number | undefined {
+  const stats = asRecord(person.stats)
+  const map = {
+    memories: ['memory_count', 'memories'],
+    shared_memories: ['shared_memory_count', 'shared_memories', 'sharedMemories'],
+    sessions: ['session_count', 'sessions'],
+  } as const
+  for (const field of map[key]) {
+    const direct = person[field]
+    if (typeof direct === 'number') return direct
+    const fallback = stats?.[field]
+    if (typeof fallback === 'number') return fallback
+  }
+  return undefined
 }
 
 /** `person_id` 归一：空 / `self` → 配置里的默认人；其它原样。 */
@@ -252,6 +285,18 @@ function clampTopK(value: unknown): number {
   const number = typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : DEFAULT_TOP_K
   if (number < 1) return DEFAULT_TOP_K
   return Math.min(number, MAX_TOP_K)
+}
+
+/** 把 limit 限制在 v6 游标分页允许范围（默认 50，最大 200）。 */
+function clampLimit(value: unknown): number {
+  const number = typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : DEFAULT_LIST_LIMIT
+  if (number < 1) return DEFAULT_LIST_LIMIT
+  return Math.min(number, MAX_LIST_LIMIT)
+}
+
+/** 游标参数归一：空串视为未传。 */
+function cursorOf(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
 }
 
 /** 规整 messages：允许字符串或 [{ role, content }]，空内容丢弃。 */
@@ -348,7 +393,14 @@ export function mnemosWorkspaceTool(
           personPayload = await client.getPerson(ensured.info.slug, personId)
         }
         const person = personPayload === undefined ? { external_id: personId } : summarizePerson(personPayload)
-        const stats = asRecord(person.stats) ?? {}
+        // v6 分区统计直接读 partition_stats（O(1)）；老服务没有该端点时降级为「暂无统计」。
+        let stats: Record<string, unknown> = {}
+        try {
+          stats = await client.getPartitionStats(ensured.info.slug)
+        } catch (error) {
+          if (!(error instanceof MnemosApiError) || (error.status !== 404 && error.status !== 405)) throw error
+          warning = warning ?? '分区统计接口不可用（404/405）：确认 Mnemos 已升级到 v6。'
+        }
         const result: WorkspaceResult = { ok: true, partition, person, stats }
         if (warning !== undefined) result.warning = warning
         return result
@@ -367,13 +419,30 @@ function renderWorkspace(value: WorkspaceResult): string {
     `Mnemos 分区已就绪：${partition.slug ?? '(未知 slug)'}（${partition.name ?? '-'}${partition.id ? `，id=${partition.id}` : ''}）`,
     `默认人：${person.external_id ?? person.display_name ?? '-'}（type=${person.type ?? '-'}${person.id ? `，id=${person.id}` : ''}）`,
   ]
+  const people = typeof stats.persons_total === 'number' ? `人 ${stats.persons_total}` : ''
+  const breakdown = [
+    typeof stats.persons_human === 'number' ? `human ${stats.persons_human}` : '',
+    typeof stats.persons_agent === 'number' ? `agent ${stats.persons_agent}` : '',
+    typeof stats.persons_service === 'number' ? `service ${stats.persons_service}` : '',
+  ]
+    .filter(Boolean)
+    .join('/')
   const parts = [
-    typeof stats.memories === 'number' ? `记忆 ${stats.memories}` : '',
-    typeof stats.shared_memories === 'number' ? `分区共享 ${stats.shared_memories}` : '',
-    typeof stats.sessions === 'number' ? `会话 ${stats.sessions}` : '',
-    typeof stats.last_memory_at === 'string' ? `最近写入 ${stats.last_memory_at}` : '',
+    people === '' ? '' : `${people}${breakdown === '' ? '' : `（${breakdown}）`}`,
+    typeof stats.memories_total === 'number' ? `记忆 ${stats.memories_total}` : '',
+    typeof stats.shared_total === 'number' ? `分区共享 ${stats.shared_total}` : '',
+    typeof stats.sessions_total === 'number' ? `会话 ${stats.sessions_total}` : '',
   ].filter(Boolean)
   lines.push(parts.length > 0 ? `统计：${parts.join(' · ')}` : '统计：暂无')
+  const own = personCount(person, 'memories')
+  const shared = personCount(person, 'shared_memories')
+  const sessions = personCount(person, 'sessions')
+  const personParts = [
+    own === undefined ? '' : `记忆 ${own}`,
+    shared === undefined ? '' : `分区共享 ${shared}`,
+    sessions === undefined ? '' : `会话 ${sessions}`,
+  ].filter(Boolean)
+  if (personParts.length > 0) lines.push(`默认人计数：${personParts.join(' · ')}`)
   if (value.warning !== undefined) lines.push(`注意：${value.warning}`)
   return lines.join('\n')
 }
@@ -391,7 +460,6 @@ interface AddArgs {
   category?: string
   tags?: string[]
   metadata?: Record<string, unknown>
-  infer?: boolean
 }
 
 interface AddResult {
@@ -415,14 +483,14 @@ export function mnemosAddTool(
   return {
     name: 'mnemos_add',
     description:
-      '把值得沉淀的结论 / 决策 / 约束 / 踩坑经验写进 Mnemos（默认原文入库，infer=true 才走事实抽取）。' +
+      '把值得沉淀的结论 / 决策 / 约束 / 踩坑经验写进 Mnemos（v6 按原文入库，不做事实抽取）。' +
       'text 与 messages 二选一；person_id 缺省为默认人（self）。' +
       'scope：person=仅该人可见，partition=分区共享（协作知识），session=仅当前会话（必须带 session_id，缺省用当前会话）。' +
       '触发词：记住 / 记下来 / 写入记忆 / 沉淀结论 / save to memory / remember this.',
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: '要写入的记忆正文（最长约 8000 字）。' },
+        text: { type: 'string', description: '要写入的记忆正文（最长 20000 字符）。' },
         messages: {
           description: '对话式写入：字符串按 user 角色，或 [{role, content}] 数组。与 text 二选一。',
           anyOf: [
@@ -452,11 +520,10 @@ export function mnemosAddTool(
         },
         category: {
           type: 'string',
-          description: '记忆分类，如 fact / preference / identity / constraint / skill / plan / event / insight / context。',
+          description: '记忆分类，如 fact / preference / identity / constraint / skill / plan / event / insight / decision / context。',
         },
         tags: { type: 'array', items: { type: 'string' }, description: '标签，便于后续过滤。' },
         metadata: { type: 'object', additionalProperties: true, description: '自由元数据（来源、分支、工单号等）。' },
-        infer: { type: 'boolean', description: 'true=先做事实抽取再入库；默认 false（原文入库，保真度最高）。' },
       },
     },
     output: {
@@ -516,22 +583,20 @@ export function mnemosAddTool(
           type: personId === settings.personId ? settings.personType : undefined,
         })
 
-        const body: Parameters<MnemosClient['addMemory']>[1] = {}
+        // v6：写记忆走人级端点 `POST /persons/:person/memories`，person 在路径里。
+        // 路径优先用内部 id（服务端支持 id 或 external），避免同 external_id 多 type 的歧义。
+        const body: Parameters<MnemosClient['addMemory']>[2] = {}
         if (textValue !== undefined && messages === undefined) body.text = textValue
         if (messages !== undefined) body.messages = messages
-        body.person_id = person.id ?? person.externalId
         if (scope !== undefined) body.scope = scope
         if (sessionId !== undefined) body.session_id = sessionId
         if (typeof args.category === 'string' && args.category !== '') body.category = args.category
         if (Array.isArray(args.tags) && args.tags.length > 0) body.tags = args.tags
         if (args.metadata !== undefined && asRecord(args.metadata) !== undefined) body.metadata = args.metadata
-        if (args.infer !== undefined) body.infer = args.infer
 
-        const payload = await client.addMemory(ensured.info.slug, body)
-        const results = listFrom(payload, 'results', 'memories').filter(
-          (item): item is MnemosMemory => asRecord(item) !== undefined,
-        )
-        const events = listFrom(payload, 'events')
+        const written = await client.addMemory(ensured.info.slug, person.id ?? person.externalId, body)
+        const results = written.memories
+        const events = written.events
         const result: AddResult = { ok: true, added: results.length > 0 ? results.length : events.length, results, events }
         if (ensured.warning !== undefined) result.warning = ensured.warning
         return result
@@ -631,14 +696,9 @@ export function mnemosSearchTool(
         if (typeof args.category === 'string' && args.category !== '') body.category = args.category
 
         const payload = await client.searchMemories(ensured.info.slug, body)
-        const results = listFrom(payload, 'results', 'memories').filter(
-          (item): item is MnemosMemory => asRecord(item) !== undefined,
-        )
-        const record = asRecord(payload)
-        const tookMs =
-          typeof record?.took_ms === 'number' ? record.took_ms : typeof record?.tookMs === 'number' ? record.tookMs : undefined
+        const results = payload.results
         const result: SearchResult = { ok: true, count: results.length, results }
-        if (tookMs !== undefined) result.took_ms = tookMs
+        if (payload.took_ms !== undefined) result.took_ms = payload.took_ms
         if (ensured.warning !== undefined) result.warning = ensured.warning
         return result
       } catch (error) {
@@ -669,7 +729,8 @@ interface GetArgs {
   person_id?: string
   scope?: 'person' | 'partition' | 'session'
   category?: string
-  page?: number
+  cursor?: string
+  limit?: number
 }
 
 interface GetResult {
@@ -680,10 +741,11 @@ interface GetResult {
   memory?: MnemosMemory
   results?: MnemosMemory[]
   count?: number
-  page?: number
+  next_cursor?: string
+  partition_stats?: Record<string, unknown>
 }
 
-/** 读一条记忆详情，或按人 / 范围分页列出记忆。 */
+/** 读一条记忆详情，或按人 / 范围用游标列出记忆。 */
 export function mnemosGetTool(
   client: MnemosClient,
   config: ConfigSource,
@@ -692,8 +754,9 @@ export function mnemosGetTool(
   return {
     name: 'mnemos_get',
     description:
-      '读取 Mnemos 记忆：传 id 取一条详情；不传 id 则按人 / 可见范围 / 分类分页列出。' +
-      '列表默认按默认人（self）过滤；scope=partition 时列分区共享记忆（不按人过滤）。',
+      '读取 Mnemos 记忆：传 id 取一条详情；不传 id 则按人 / 可见范围 / 分类用游标分页列出（v6 游标分页）。' +
+      '列表默认按默认人（self）过滤；scope=partition 时列分区共享记忆（不按人过滤）。' +
+      '响应里的 next_cursor 传给下一页的 cursor 参数即可继续翻页。',
     parameters: {
       type: 'object',
       properties: {
@@ -705,7 +768,8 @@ export function mnemosGetTool(
           description: '列表按可见范围过滤；scope=partition 时不按人过滤。',
         },
         category: { type: 'string', description: '列表按分类过滤。' },
-        page: { type: 'integer', description: '分页页码（从 1 开始），默认 1。' },
+        cursor: { type: 'string', description: '游标：传上一页响应里的 next_cursor，缺省从第一页开始。' },
+        limit: { type: 'integer', description: `每页条数，默认 ${DEFAULT_LIST_LIMIT}，最大 ${MAX_LIST_LIMIT}。` },
       },
     },
     output: {
@@ -717,7 +781,8 @@ export function mnemosGetTool(
           memory: OBJECT_SCHEMA,
           results: OBJECT_ARRAY_SCHEMA,
           count: { type: 'integer' },
-          page: { type: 'integer' },
+          next_cursor: { type: 'string' },
+          partition_stats: OBJECT_SCHEMA,
         },
         required: ['ok'],
       },
@@ -738,19 +803,23 @@ export function mnemosGetTool(
           return result
         }
 
-        const page = typeof args.page === 'number' && args.page > 0 ? Math.trunc(args.page) : 1
-        const query: Parameters<MnemosClient['listMemories']>[1] = { page }
-        if (args.scope !== undefined) query.scope = args.scope
-        if (args.scope !== 'partition') query.person_id = resolvePersonId(args.person_id, settings)
-        if (typeof args.category === 'string' && args.category !== '') query.category = args.category
+        const cursor = cursorOf(args.cursor)
+        const limit = clampLimit(args.limit)
+        const category = typeof args.category === 'string' && args.category !== '' ? args.category : undefined
+        // v6：按人列出走 `GET .../persons/:person/memories`；scope=partition 走分区级记忆列表。
+        const page =
+          args.scope === 'partition'
+            ? await client.listMemories(ensured.info.slug, { scope: 'partition', category, cursor, limit })
+            : await client.listPersonMemories(ensured.info.slug, resolvePersonId(args.person_id, settings), {
+                scope: args.scope,
+                category,
+                cursor,
+                limit,
+              })
 
-        const payload = await client.listMemories(ensured.info.slug, query)
-        const results = listFrom(payload, 'results', 'memories').filter(
-          (item): item is MnemosMemory => asRecord(item) !== undefined,
-        )
-        const record = asRecord(payload)
-        const count = typeof record?.count === 'number' ? record.count : results.length
-        const result: GetResult = { ok: true, results, count, page }
+        const result: GetResult = { ok: true, results: page.items, count: page.items.length }
+        if (page.next_cursor !== undefined) result.next_cursor = page.next_cursor
+        if (page.partition_stats !== undefined) result.partition_stats = page.partition_stats
         if (ensured.warning !== undefined) result.warning = ensured.warning
         return result
       } catch (error) {
@@ -772,7 +841,8 @@ function renderGet(value: GetResult): string {
     return lines.join('\n')
   }
   const results = value.results ?? []
-  const head = `Mnemos 记忆列表（第 ${value.page ?? 1} 页，共 ${value.count ?? results.length} 条）`
+  const more = value.next_cursor !== undefined ? '，还有下一页（把 next_cursor 传给 cursor 继续）' : ''
+  const head = `Mnemos 记忆列表（${value.count ?? results.length} 条${more}）`
   if (results.length === 0) return `${head}\n（没有记忆：先 mnemos_add 写入，或换 person_id / scope / category）`
   const lines = [head, renderMemoryList(results)]
   if (value.warning !== undefined) lines.push(`注意：${value.warning}`)
@@ -993,7 +1063,8 @@ interface PersonArgs {
   attributes?: Record<string, unknown>
   status?: string
   q?: string
-  page?: number
+  cursor?: string
+  limit?: number
 }
 
 interface PersonResult {
@@ -1005,10 +1076,11 @@ interface PersonResult {
   person?: Record<string, unknown>
   people?: Record<string, unknown>[]
   count?: number
-  page?: number
+  next_cursor?: string
+  partition_stats?: Record<string, unknown>
 }
 
-/** 人管理：list（列表）/ get（详情）/ upsert（建档或更新资料）。 */
+/** 人管理：list（游标列表）/ get（详情）/ upsert（建档或更新资料）。 */
 export function mnemosPersonTool(
   client: MnemosClient,
   config: ConfigSource,
@@ -1017,7 +1089,7 @@ export function mnemosPersonTool(
   return {
     name: 'mnemos_person',
     description:
-      '管理 Mnemos 里的「人」：action=list 列人（按 type / status / q / 分页），action=get 取人详情，' +
+      '管理 Mnemos 里的「人」：action=list 用游标列人（按 type / status / q 筛选，v6 游标分页），action=get 取人详情，' +
       'action=upsert 用 external_id 建档或更新展示名 / 类型 / 属性。' +
       '人不是登录账号：human 是 App 用户 / 员工，agent 是智能体。',
     parameters: {
@@ -1032,8 +1104,9 @@ export function mnemosPersonTool(
         display_name: { type: 'string', description: 'upsert：展示名（控制台里看到的名字）。' },
         attributes: { type: 'object', additionalProperties: true, description: 'upsert：角色、模型、标签等自由属性。' },
         status: { type: 'string', description: 'list：按状态过滤（active / archived / deleted）。' },
-        q: { type: 'string', description: 'list：按 external_id / 展示名模糊搜索。' },
-        page: { type: 'integer', description: 'list：分页页码，从 1 开始。' },
+        q: { type: 'string', description: 'list：按 external_id / 展示名全文搜索（FTS 前缀匹配）。' },
+        cursor: { type: 'string', description: 'list：游标，传上一页响应里的 next_cursor；缺省从第一页开始。' },
+        limit: { type: 'integer', description: `list：每页条数，默认 ${DEFAULT_LIST_LIMIT}，最大 ${MAX_LIST_LIMIT}。` },
       },
       required: ['action'],
     },
@@ -1047,7 +1120,8 @@ export function mnemosPersonTool(
           person: OBJECT_SCHEMA,
           people: OBJECT_ARRAY_SCHEMA,
           count: { type: 'integer' },
-          page: { type: 'integer' },
+          next_cursor: { type: 'string' },
+          partition_stats: OBJECT_SCHEMA,
         },
         required: ['ok'],
       },
@@ -1069,19 +1143,22 @@ export function mnemosPersonTool(
         const ensured = await ensurePartition(client, settings, resolveWorkspacePath, exec)
 
         if (action === 'list') {
-          const page = typeof args.page === 'number' && args.page > 0 ? Math.trunc(args.page) : 1
-          const payload = await client.listPersons(ensured.info.slug, {
+          // v6：游标分页，响应带 next_cursor 与 partition_stats（头部统计不用 COUNT(*)）。
+          const page = await client.listPersons(ensured.info.slug, {
             type: args.type,
             status: typeof args.status === 'string' && args.status !== '' ? args.status : undefined,
             q: typeof args.q === 'string' && args.q !== '' ? args.q : undefined,
-            page,
+            cursor: cursorOf(args.cursor),
+            limit: clampLimit(args.limit),
           })
-          const people = listFrom(payload, 'results', 'persons', 'people')
-            .filter((item) => asRecord(item) !== undefined)
-            .map((item) => summarizePerson(item))
-          const record = asRecord(payload)
-          const count = typeof record?.count === 'number' ? record.count : people.length
-          const result: PersonResult = { ok: true, action_name: 'list', people, count, page }
+          const result: PersonResult = {
+            ok: true,
+            action_name: 'list',
+            people: page.items.map((item) => summarizePerson(item)),
+            count: page.items.length,
+          }
+          if (page.next_cursor !== undefined) result.next_cursor = page.next_cursor
+          if (page.partition_stats !== undefined) result.partition_stats = page.partition_stats
           if (ensured.warning !== undefined) result.warning = ensured.warning
           return result
         }
@@ -1126,27 +1203,27 @@ export function mnemosPersonTool(
 function renderPerson(value: PersonResult): string {
   if (value.action_name === 'list') {
     const people = value.people ?? []
-    const head = `Mnemos 人列表（第 ${value.page ?? 1} 页，共 ${value.count ?? people.length} 人）`
+    const more = value.next_cursor !== undefined ? '，还有下一页（把 next_cursor 传给 cursor 继续）' : ''
+    const head = `Mnemos 人列表（${value.count ?? people.length} 人${more}）`
     if (people.length === 0) return `${head}\n（没有匹配的人：先 mnemos_add / mnemos_workspace 建档，或放宽 type / q）`
     const lines = people.map((person, index) => {
       const externalId = person.external_id ?? '(未知 external_id)'
       const name = person.display_name !== undefined ? ` · ${String(person.display_name)}` : ''
-      const stats = asRecord(person.stats)
-      const memories = typeof stats?.memories === 'number' ? ` · 记忆 ${stats.memories}` : ''
+      const memoriesValue = personCount(person, 'memories')
+      const memories = memoriesValue === undefined ? '' : ` · 记忆 ${memoriesValue}`
       return `${index + 1}. ${externalId}（type=${String(person.type ?? '-')}${name}${memories}）${person.id ? ` id=${String(person.id)}` : ''}`
     })
     return [head, ...lines, ...(value.warning !== undefined ? [`注意：${value.warning}`] : [])].join('\n')
   }
   const person = value.person ?? {}
-  const stats = asRecord(person.stats) ?? {}
   const lines = [
     `Mnemos 人：${person.external_id ?? person.display_name ?? '-'}（type=${person.type ?? '-'}${person.id ? `，id=${person.id}` : ''}）`,
     `展示名：${person.display_name ?? '-'} · 状态：${person.status ?? '-'}`,
   ]
   const parts = [
-    typeof stats.memories === 'number' ? `记忆 ${stats.memories}` : '',
-    typeof stats.shared_memories === 'number' ? `分区共享 ${stats.shared_memories}` : '',
-    typeof stats.sessions === 'number' ? `会话 ${stats.sessions}` : '',
+    personCount(person, 'memories') === undefined ? '' : `记忆 ${personCount(person, 'memories')}`,
+    personCount(person, 'shared_memories') === undefined ? '' : `分区共享 ${personCount(person, 'shared_memories')}`,
+    personCount(person, 'sessions') === undefined ? '' : `会话 ${personCount(person, 'sessions')}`,
   ].filter(Boolean)
   if (parts.length > 0) lines.push(`统计：${parts.join(' · ')}`)
   if (value.warning !== undefined) lines.push(`注意：${value.warning}`)

@@ -5,20 +5,19 @@ import { tx } from '../db/index.ts';
 import type { Env } from '../env.ts';
 import { writeAudit } from '../lib/audit.ts';
 import { newId, nowIso } from '../lib/ids.ts';
+import { parseSettings, type PartitionRow } from '../engine/rows.ts';
 
 /**
- * 数据维护调度器：过期记忆归档、保留期归档、软删除物理清理、
- * 幂等键/会话过期清理，以及 WAL checkpoint 与可选 VACUUM。
- *
- * - 首次运行延迟 60s，之后按 env.maintenanceIntervalMs 周期执行；
- * - 数据变更在单个事务内完成，checkpoint/VACUUM 在事务外执行；
- * - 失败只写 failed 记录与日志，不向调度器抛出（手动调用仍会向上抛出）。
+ * 数据维护调度器（v6）：
+ *  - 过期记忆（expires_at）归档；
+ *  - 分区 retentionDays 之外的记忆归档；
+ *  - 软删除（status=deleted）满 30 天物理清理；
+ *  - 过期控制台会话（user_sessions）清理；
+ *  - WAL checkpoint 与可选 VACUUM。
  */
 
 const FIRST_RUN_DELAY_MS = 60_000;
-const DEFAULT_RETENTION_DAYS = 365;
 const SOFT_DELETE_RETENTION_DAYS = 30;
-const DELETE_CHUNK = 400;
 
 export interface MaintenanceDeps {
   db: DatabaseSync;
@@ -27,16 +26,10 @@ export interface MaintenanceDeps {
   metrics: Metrics;
 }
 
-interface ProjectRetentionRow {
-  id: string;
-  settings: string;
-}
-
 interface SummaryCounts {
   expiredArchived: number;
   retentionArchived: number;
   deletedPurged: number;
-  idempotencyPurged: number;
   sessionsPurged: number;
   walCheckpointed: boolean;
   vacuumed: boolean;
@@ -51,17 +44,6 @@ interface MaintenanceRow {
   error: string | null;
   started_at: string;
   finished_at: string | null;
-}
-
-function parseRetentionDays(raw: string | null | undefined): number {
-  if (!raw) return DEFAULT_RETENTION_DAYS;
-  try {
-    const parsed = JSON.parse(raw) as { retentionDays?: unknown };
-    const value = Number(parsed.retentionDays);
-    return Number.isFinite(value) ? Math.trunc(value) : DEFAULT_RETENTION_DAYS;
-  } catch {
-    return DEFAULT_RETENTION_DAYS;
-  }
 }
 
 function isoDaysAgo(days: number, from = Date.now()): string {
@@ -87,18 +69,6 @@ function toRun(row: MaintenanceRow): MaintenanceRun {
   };
 }
 
-function chunkedIds(ids: string[]): string[][] {
-  const chunks: string[][] = [];
-  for (let index = 0; index < ids.length; index += DELETE_CHUNK) {
-    chunks.push(ids.slice(index, index + DELETE_CHUNK));
-  }
-  return chunks;
-}
-
-function placeholders(count: number): string {
-  return Array.from({ length: count }, () => '?').join(', ');
-}
-
 export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceController {
   const { db, env, logger, metrics } = deps;
 
@@ -120,9 +90,7 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
     error?: string,
   ): void {
     db.prepare(
-      `UPDATE maintenance_runs
-          SET status = ?, summary = ?, error = ?, finished_at = ?
-        WHERE id = ?`,
+      `UPDATE maintenance_runs SET status = ?, summary = ?, error = ?, finished_at = ? WHERE id = ?`,
     ).run(status, JSON.stringify(summary), error ?? null, nowIso(), id);
   }
 
@@ -142,8 +110,8 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
     }
   }
 
-  function retentionProjects(): ProjectRetentionRow[] {
-    return db.prepare('SELECT id, settings FROM projects').all() as unknown as ProjectRetentionRow[];
+  function retentionPartitions(): PartitionRow[] {
+    return db.prepare('SELECT * FROM partitions').all() as unknown as PartitionRow[];
   }
 
   function countExpired(now: string): number {
@@ -158,15 +126,15 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
 
   function countRetention(now: string): number {
     let total = 0;
-    for (const project of retentionProjects()) {
-      const days = parseRetentionDays(project.settings);
+    for (const partition of retentionPartitions()) {
+      const days = parseSettings(partition.settings).retentionDays;
       if (days <= 0) continue;
       const row = db
         .prepare(
           `SELECT COUNT(*) AS c FROM memories
-            WHERE project_id = ? AND status = 'active' AND created_at < ?`,
+            WHERE partition_id = ? AND status = 'active' AND created_at < ?`,
         )
-        .get(project.id, isoDaysAgo(days, Date.parse(now))) as unknown as { c: number } | undefined;
+        .get(partition.id, isoDaysAgo(days, Date.parse(now))) as unknown as { c: number } | undefined;
       total += row?.c ?? 0;
     }
     return total;
@@ -179,29 +147,11 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
     return row?.c ?? 0;
   }
 
-  function countWhere(table: string, cutoff: string): number {
-    // table 仅来自内部常量，不接受外部输入。
-    const row = db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE expires_at < ?`).get(cutoff) as unknown as
-      | { c: number }
-      | undefined;
+  function countExpiredSessions(now: string): number {
+    const row = db
+      .prepare('SELECT COUNT(*) AS c FROM user_sessions WHERE expires_at < ?')
+      .get(now) as unknown as { c: number } | undefined;
     return row?.c ?? 0;
-  }
-
-  function purgeDeleted(now: string): number {
-    const cutoff = isoDaysAgo(SOFT_DELETE_RETENTION_DAYS, Date.parse(now));
-    const rows = db
-      .prepare("SELECT id FROM memories WHERE status = 'deleted' AND updated_at < ?")
-      .all(cutoff) as unknown as { id: string }[];
-    let purged = 0;
-    for (const chunk of chunkedIds(rows.map((row) => row.id))) {
-      if (chunk.length === 0) continue;
-      const marks = placeholders(chunk.length);
-      db.prepare(`DELETE FROM memory_entities WHERE memory_id IN (${marks})`).run(...chunk);
-      db.prepare(`DELETE FROM memory_terms WHERE memory_id IN (${marks})`).run(...chunk);
-      db.prepare(`DELETE FROM relations WHERE memory_id IN (${marks})`).run(...chunk);
-      purged += Number(db.prepare(`DELETE FROM memories WHERE id IN (${marks})`).run(...chunk).changes);
-    }
-    return purged;
   }
 
   async function execute(
@@ -221,8 +171,7 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
             expiredArchived: countExpired(startedAt),
             retentionArchived: countRetention(startedAt),
             deletedPurged: countDeleted(isoDaysAgo(SOFT_DELETE_RETENTION_DAYS, Date.parse(startedAt))),
-            idempotencyPurged: countWhere('idempotency_keys', startedAt),
-            sessionsPurged: countWhere('sessions', startedAt),
+            sessionsPurged: countExpiredSessions(startedAt),
             walCheckpointed: false,
             vacuumed: false,
           }
@@ -231,41 +180,39 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
             const expiredArchived = Number(
               db
                 .prepare(
-                  `UPDATE memories
-                      SET status = 'archived', updated_at = ?
+                  `UPDATE memories SET status = 'archived', updated_at = ?
                     WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <> '' AND expires_at < ?`,
                 )
                 .run(now, now).changes,
             );
 
             let retentionArchived = 0;
-            for (const project of retentionProjects()) {
-              const days = parseRetentionDays(project.settings);
+            for (const partition of retentionPartitions()) {
+              const days = parseSettings(partition.settings).retentionDays;
               if (days <= 0) continue;
               retentionArchived += Number(
                 db
                   .prepare(
-                    `UPDATE memories
-                        SET status = 'archived', updated_at = ?
-                      WHERE project_id = ? AND status = 'active' AND created_at < ?`,
+                    `UPDATE memories SET status = 'archived', updated_at = ?
+                      WHERE partition_id = ? AND status = 'active' AND created_at < ?`,
                   )
-                  .run(now, project.id, isoDaysAgo(days, Date.parse(now))).changes,
+                  .run(now, partition.id, isoDaysAgo(days, Date.parse(now))).changes,
               );
             }
 
-            const deletedPurged = purgeDeleted(now);
-            const idempotencyPurged = Number(
-              db.prepare('DELETE FROM idempotency_keys WHERE expires_at < ?').run(now).changes,
+            const deletedPurged = Number(
+              db
+                .prepare("DELETE FROM memories WHERE status = 'deleted' AND updated_at < ?")
+                .run(isoDaysAgo(SOFT_DELETE_RETENTION_DAYS, Date.parse(now))).changes,
             );
             const sessionsPurged = Number(
-              db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now).changes,
+              db.prepare('DELETE FROM user_sessions WHERE expires_at < ?').run(now).changes,
             );
 
             return {
               expiredArchived,
               retentionArchived,
               deletedPurged,
-              idempotencyPurged,
               sessionsPurged,
               walCheckpointed: false,
               vacuumed: false,
@@ -295,7 +242,6 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
         dryRun,
         expiredArchived: counts.expiredArchived + counts.retentionArchived,
         deletedPurged: counts.deletedPurged,
-        idempotencyPurged: counts.idempotencyPurged,
         sessionsPurged: counts.sessionsPurged,
         walCheckpointed: counts.walCheckpointed,
         vacuumed: counts.vacuumed,
@@ -318,7 +264,6 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
         durationMs,
         expiredArchived: result.expiredArchived,
         deletedPurged: result.deletedPurged,
-        idempotencyPurged: result.idempotencyPurged,
         sessionsPurged: result.sessionsPurged,
         walCheckpointed: result.walCheckpointed,
         vacuumed: result.vacuumed,
@@ -329,7 +274,7 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
       try {
         finishRun(runId, 'failed', { durationMs: Date.now() - startedWall }, message);
       } catch {
-        /* 数据库可能已不可用，忽略记录失败 */
+        /* 数据库可能已不可用 */
       }
       metrics.counter('mnemos_maintenance_runs_total', { status: 'failed', dryRun: String(dryRun) });
       logger.error('maintenance.failed', { runId, kind, error });
@@ -338,10 +283,7 @@ export function createMaintenanceController(deps: MaintenanceDeps): MaintenanceC
   }
 
   async function tick(kind: string): Promise<void> {
-    if (running) {
-      logger.debug('maintenance.skipped', { reason: 'previous run still in progress' });
-      return;
-    }
+    if (running) return;
     running = true;
     try {
       await execute({}, undefined, kind);

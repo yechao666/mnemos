@@ -90,39 +90,6 @@ groups:
           runbook_url: "docs/observability.md#mnemosratelimitedspike"
 
       # ------------------------------------------------------------------
-      # Webhook 投递
-      # ------------------------------------------------------------------
-      - alert: MnemosWebhookFailures
-        expr: >-
-          100 * sum(rate(mnemos_webhook_deliveries_total{job="mnemos",status=~"failed|dead"}[10m]))
-          / clamp_min(sum(rate(mnemos_webhook_deliveries_total{job="mnemos"}[10m])), 0.001) > 20
-        for: 5m
-        labels:
-          severity: warning
-          service: mnemos
-        annotations:
-          summary: "Mnemos Webhook 失败率超过 20%"
-          description: >-
-            最近 10 分钟 failed + dead 投递占比为 {{ printf "%.2f" $value }}%（阈值 20%）。
-            检查目标端可用性、签名/密钥、网络出口与 SSRF 白名单；
-            dead 表示已超过最大重试次数，需要手动补投或让订阅方重新注册。
-          runbook_url: "docs/observability.md#mnemoswebhookfailures"
-
-      - alert: MnemosWebhookQueueBacklog
-        expr: max(mnemos_webhook_queue_depth{job="mnemos"}) > 100
-        for: 10m
-        labels:
-          severity: warning
-          service: mnemos
-        annotations:
-          summary: "Mnemos Webhook 队列积压（> 100）"
-          description: >-
-            待投递队列长度为 {{ printf "%.0f" $value }}，已持续 10 分钟。
-            说明投递吞吐不足或目标端持续超时；检查 worker 日志、目标端限流与
-            webhook 超时配置，必要时扩容或暂停低优先级订阅。
-          runbook_url: "docs/observability.md#mnemoswebhookqueuebacklog"
-
-      # ------------------------------------------------------------------
       # 维护任务
       # ------------------------------------------------------------------
       - alert: MnemosMaintenanceFailure

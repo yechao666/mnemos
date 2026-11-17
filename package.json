@@ -16,7 +16,11 @@
     "seed": "node server/src/seed/run-seed.ts --force",
     "test": "node --test 'server/src/**/*.test.ts'",
     "typecheck": "tsc -p server/tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
-    "verify": "pnpm run typecheck && pnpm run test && pnpm run build"
+    "verify": "pnpm run typecheck && pnpm run test && pnpm run build",
+    "seed:scale": "node scripts/seed-scale.ts",
+    "perf:persons": "node scripts/perf-persons.ts",
+    "typecheck:server": "tsc -p server/tsconfig.json --noEmit",
+    "typecheck:scripts": "tsc -p scripts/tsconfig.json --noEmit"
   },
   "pnpm": {
     "onlyBuiltDependencies": []

@@ -1,10 +1,9 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@lib/auth.tsx';
-import { fmtRelative } from '@lib/format.ts';
 import { EmptyState, Icon, Kbd, useToast, type IconName } from '@ui';
 import { NAV_ENTRIES } from './nav.ts';
-import { projectStatusLabel } from './util.ts';
+import { partitionStatusLabel } from './util.ts';
 
 interface PaletteCommand {
   id: string;
@@ -25,7 +24,7 @@ export interface CommandPaletteProps {
 }
 
 export function CommandPalette({ open, onClose }: CommandPaletteProps) {
-  const { projects, logout } = useAuth();
+  const { partitions, logout } = useAuth();
   const navigate = useNavigate();
   const toast = useToast();
   const [query, setQuery] = useState('');
@@ -58,10 +57,6 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
     navigate(to);
   };
 
-  const recentProject = [...projects].sort(
-    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-  )[0];
-
   const groups: PaletteGroup[] = [
     {
       title: '页面导航',
@@ -74,36 +69,32 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
       })),
     },
     {
-      title: '项目',
-      items: projects.map((project) => ({
-        id: `project-${project.id}`,
-        label: project.name,
-        meta: `${project.slug} · ${projectStatusLabel(project.status)}`,
-        icon: 'folder',
-        run: () => go(`/projects/${project.id}`),
+      title: '分区',
+      items: partitions.map((partition) => ({
+        id: `partition-${partition.id}`,
+        label: partition.name,
+        meta: `${partition.slug} · ${partitionStatusLabel(partition.status)}`,
+        icon: 'layers',
+        run: () => go(`/partitions/${partition.id}`),
       })),
     },
     {
       title: '快捷操作',
       items: [
         {
-          id: 'action-create-project',
-          label: '新建项目',
-          meta: '前往项目列表',
+          id: 'action-create-partition',
+          label: '新建分区',
+          meta: '前往分区列表',
           icon: 'plus',
-          run: () => go('/projects'),
+          run: () => go('/partitions'),
         },
-        ...(recentProject
-          ? [
-              {
-                id: 'action-recent-project',
-                label: `打开最近项目：${recentProject.name}`,
-                meta: fmtRelative(recentProject.updatedAt),
-                icon: 'clock' as IconName,
-                run: () => go(`/projects/${recentProject.id}`),
-              },
-            ]
-          : []),
+        {
+          id: 'action-org-keys',
+          label: '组织密钥',
+          meta: '组织设置',
+          icon: 'key',
+          run: () => go('/org'),
+        },
         {
           id: 'action-logout',
           label: '退出登录',
@@ -188,7 +179,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={onInputKeyDown}
-            placeholder="搜索页面、项目或操作…"
+            placeholder="搜索页面、分区或操作…"
             aria-label="命令搜索"
             autoComplete="off"
           />
@@ -197,12 +188,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
 
         <div className="cmdk-list" ref={listRef} role="listbox" aria-label="命令列表">
           {flatItems.length === 0 ? (
-            <EmptyState
-              compact
-              icon="search"
-              title="没有匹配的结果"
-              description="试试页面名称、项目名称或操作关键词。"
-            />
+            <EmptyState compact icon="search" title="没有匹配的结果" description="试试页面名称、分区名称或操作关键词。" />
           ) : (
             visibleGroups.map((group, groupIndex) => (
               <div key={group.title}>

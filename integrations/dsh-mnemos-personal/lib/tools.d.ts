@@ -1,5 +1,5 @@
 /**
- * Agent 工具集合（8 个 `mnemos_*`，新版中立记忆服务 v5）。
+ * Agent 工具集合（8 个 `mnemos_*`，Mnemos v6）。
  *
  * 设计约束（与旧插件 dsh-mnemos 保持一致，原因见 `src/dsh-types.d.ts`）：
  * - 参数与输出都是**手写原始 JSON Schema**，不在运行时 import `@deepseek-ai/dsh-tools`；
@@ -12,6 +12,13 @@
  * 首次调用 `POST /v1/partitions` 幂等建分区（客户端内缓存分区 id，进程内只建一次）。
  * 人 = 记忆主体：`person_id` 缺省 / `self` 表示配置里的默认人；写路径会先 `PUT persons/:externalId`
  * 建档（服务端 lazy upsert），读路径只传人标识、不产生写副作用。
+ *
+ * v6 变化：
+ * - 人 / 记忆列表改为**游标分页**（`cursor` / `limit`，响应 `{ items, next_cursor, partition_stats }`），
+ *   工具参数与输出里的 `page` 换成 `cursor` / `next_cursor`；
+ * - 写记忆走人级端点 `POST /v1/partitions/:p/persons/:person/memories`；
+ * - 分区统计读 `GET /v1/partitions/:p/stats`（partition_stats），人的计数读 persons 行上的
+ *   `memory_count / shared_memory_count / session_count`，不做 COUNT(*)。
  */
 import type { ToolDefinition } from './dsh-types.js';
 import type { MnemosConfig } from './config.js';
@@ -48,7 +55,6 @@ interface AddArgs {
     category?: string;
     tags?: string[];
     metadata?: Record<string, unknown>;
-    infer?: boolean;
 }
 interface AddResult {
     ok: boolean;
@@ -84,7 +90,8 @@ interface GetArgs {
     person_id?: string;
     scope?: 'person' | 'partition' | 'session';
     category?: string;
-    page?: number;
+    cursor?: string;
+    limit?: number;
 }
 interface GetResult {
     ok: boolean;
@@ -94,9 +101,10 @@ interface GetResult {
     memory?: MnemosMemory;
     results?: MnemosMemory[];
     count?: number;
-    page?: number;
+    next_cursor?: string;
+    partition_stats?: Record<string, unknown>;
 }
-/** 读一条记忆详情，或按人 / 范围分页列出记忆。 */
+/** 读一条记忆详情，或按人 / 范围用游标列出记忆。 */
 export declare function mnemosGetTool(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): ToolDefinition<GetArgs, GetResult>;
 interface BriefArgs {
     person_id?: string;
@@ -140,7 +148,8 @@ interface PersonArgs {
     attributes?: Record<string, unknown>;
     status?: string;
     q?: string;
-    page?: number;
+    cursor?: string;
+    limit?: number;
 }
 interface PersonResult {
     ok: boolean;
@@ -151,9 +160,10 @@ interface PersonResult {
     person?: Record<string, unknown>;
     people?: Record<string, unknown>[];
     count?: number;
-    page?: number;
+    next_cursor?: string;
+    partition_stats?: Record<string, unknown>;
 }
-/** 人管理：list（列表）/ get（详情）/ upsert（建档或更新资料）。 */
+/** 人管理：list（游标列表）/ get（详情）/ upsert（建档或更新资料）。 */
 export declare function mnemosPersonTool(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): ToolDefinition<PersonArgs, PersonResult>;
 interface StatusResult {
     ok: boolean;

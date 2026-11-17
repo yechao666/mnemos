@@ -1,1462 +1,894 @@
 /**
- * TypeScript SDK 测试：使用本地 node:http mock server（随机端口）。
+ * Mnemos v6 TypeScript SDK 测试（mock fetch，不启动真实服务）。
  *
- * 运行：node --test sdk/typescript/test/*.test.ts
- * 覆盖：鉴权头、请求体、查询参数、错误映射、幂等键、429/5xx 重试、
- *       Retry-After、超时、非幂等 POST 不重试、导出/导入、webhook（beta）。
+ * 运行：node --test test/*.test.ts
+ *
+ * 覆盖：v6 端点路径 / snake_case 请求体 / 游标分页查询 /
+ *       响应归一化 / 错误映射 / 幂等键 / 429·5xx 重试 / 超时与取消。
  */
 
 import assert from 'node:assert/strict';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
 
 import { MnemosApiError, MnemosClient } from '../src/index.ts';
 
-interface CapturedRequest {
-  method: string;
+/* ------------------------------------------------------------------ */
+/* mock fetch                                                          */
+/* ------------------------------------------------------------------ */
+
+interface CapturedCall {
   url: string;
-  headers: IncomingMessage['headers'];
-  body: string;
+  path: string;
+  method: string;
+  headers: Headers;
+  body: unknown;
 }
 
-type MockHandler = (req: CapturedRequest, res: ServerResponse) => void | Promise<void>;
+type MockHandler = (call: CapturedCall, index: number) => Response | Promise<Response>;
 
-interface MockServer {
-  baseUrl: string;
-  requests: CapturedRequest[];
-  close: () => Promise<void>;
+interface FetchMock {
+  fetchImpl: typeof fetch;
+  calls: CapturedCall[];
 }
 
-async function startMock(handler: MockHandler): Promise<MockServer> {
-  const requests: CapturedRequest[] = [];
-  const server = createServer((incoming, response) => {
-    const chunks: Buffer[] = [];
-    incoming.on('data', (chunk: Buffer) => chunks.push(chunk));
-    incoming.on('end', () => {
-      const captured: CapturedRequest = {
-        method: incoming.method ?? '',
-        url: incoming.url ?? '',
-        headers: incoming.headers,
-        body: Buffer.concat(chunks).toString('utf8'),
-      };
-      requests.push(captured);
-      void (async () => {
-        try {
-          await handler(captured, response);
-        } catch (error) {
-          if (!response.headersSent) response.writeHead(500, { 'content-type': 'application/json' });
-          try {
-            response.end(JSON.stringify({ error: { code: 'mock_failure', message: String(error) } }));
-          } catch {
-            /* 客户端可能已断开（超时用例） */
-          }
-        }
-      })();
-    });
-  });
-
-  await new Promise<void>((resolve) => {
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  const address = server.address() as AddressInfo;
-  return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
-    requests,
-    close: async () => {
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections();
-      });
-    },
+function createFetchMock(handler: MockHandler): FetchMock {
+  const calls: CapturedCall[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const request = new Request(input as RequestInfo, init);
+    const rawBody = await request.text();
+    const url = new URL(request.url);
+    const call: CapturedCall = {
+      url: request.url,
+      path: url.pathname,
+      method: request.method,
+      headers: request.headers,
+      body: rawBody === '' ? undefined : (JSON.parse(rawBody) as unknown),
+    };
+    calls.push(call);
+    return handler(call, calls.length - 1);
   };
+  return { fetchImpl, calls };
 }
 
-function sendJson(
-  response: ServerResponse,
-  status: number,
-  payload: unknown,
-  headers: Record<string, string> = {},
-): void {
-  const body = JSON.stringify(payload);
-  response.writeHead(status, {
-    'content-type': 'application/json',
-    'content-length': String(Buffer.byteLength(body)),
-    ...headers,
+function json(payload: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { 'content-type': 'application/json', ...headers },
   });
-  response.end(body);
 }
 
-function clientFor(server: MockServer, overrides: Partial<ConstructorParameters<typeof MnemosClient>[0]> = {}): MnemosClient {
+function empty(status = 204): Response {
+  return new Response(null, { status });
+}
+
+function clientFor(mock: FetchMock, overrides: Partial<ConstructorParameters<typeof MnemosClient>[0]> = {}): MnemosClient {
   return new MnemosClient({
-    apiKey: 'mnemos_live_demo_atlas_ci',
-    baseUrl: server.baseUrl,
+    apiKey: 'mnemos_live_demo_v6',
+    baseUrl: 'http://mnemos.test',
+    fetchImpl: mock.fetchImpl,
     ...overrides,
   });
 }
 
+function queryOf(call: CapturedCall): URLSearchParams {
+  return new URL(call.url).searchParams;
+}
+
+/* ------------------------------------------------------------------ */
+/* fixtures（服务端 snake_case 响应）                                   */
+/* ------------------------------------------------------------------ */
+
+const partitionFixture = {
+  id: 'prt_demo',
+  org_id: 'org_demo',
+  slug: 'ws-demo',
+  name: '演示分区',
+  description: 'v6 演示',
+  status: 'active',
+  settings: {
+    default_scope: 'partition',
+    brief_max_chars: 1200,
+    brief_enabled: true,
+    dream_enabled: true,
+    dream_interval_minutes: 1440,
+    retention_days: 0,
+    monthly_quota: 0,
+    person_auto_create: true,
+    locale: 'zh-CN',
+  },
+  created_at: '2026-11-01T00:00:00.000Z',
+  updated_at: '2026-11-02T00:00:00.000Z',
+  archived_at: null,
+  stats: {
+    partition_id: 'prt_demo',
+    persons_total: 12,
+    persons_human: 10,
+    persons_agent: 2,
+    persons_service: 0,
+    memories_total: 34,
+    shared_total: 8,
+    sessions_total: 5,
+    updated_at: '2026-11-02T00:00:00.000Z',
+  },
+};
+
+const personFixture = {
+  id: 'per_1',
+  partition_id: 'prt_demo',
+  external_id: 'user-1',
+  type: 'human',
+  display_name: '周野',
+  attributes: { role: 'dev' },
+  status: 'active',
+  memory_count: 3,
+  shared_memory_count: 1,
+  session_count: 2,
+  last_memory_at: '2026-11-03T10:00:00.000Z',
+  first_seen_at: '2026-11-01T00:00:00.000Z',
+  last_seen_at: '2026-11-03T10:00:00.000Z',
+  created_at: '2026-11-01T00:00:00.000Z',
+  updated_at: '2026-11-03T10:00:00.000Z',
+};
+
 const memoryFixture = {
   id: 'mem_1',
-  projectId: 'prj_atlas',
-  userId: 'u-1',
-  agentId: 'agent-1',
-  taskId: null,
-  visibility: 'project',
-  content: '周野偏好用中文写评审意见。',
+  partition_id: 'prt_demo',
+  person_id: 'per_1',
+  person_external_id: 'user-1',
+  actor_person_id: 'per_1',
+  scope: 'partition',
+  session_id: null,
   category: 'preference',
+  content: '周野偏好用中文写评审意见。',
   importance: 0.7,
   confidence: 0.9,
   source: 'api',
   status: 'active',
   tags: ['偏好'],
   metadata: { channel: 'test' },
-  createdAt: '2026-11-05T10:00:00.000Z',
-  updatedAt: '2026-11-05T10:00:00.000Z',
-  accessCount: 2,
+  created_at: '2026-11-03T10:00:00.000Z',
+  updated_at: '2026-11-03T10:00:00.000Z',
+  expires_at: null,
+  dreamed_at: null,
 };
 
-/* ------------------------------------------------------------------ */
-/* 1. 写入：鉴权头 / 请求体 / camelCase 响应归一化                     */
-/* ------------------------------------------------------------------ */
-
-test('写入记忆：Bearer 头、snake_case 请求体、响应归一化为 snake_case', async () => {
-  const server = await startMock((req, res) => {
-    sendJson(res, 200, {
-      results: [memoryFixture],
-      events: [{ type: 'ADD', memoryId: 'mem_1', content: memoryFixture.content, at: '2026-11-05T10:00:00.000Z' }],
-      tookMs: 3,
-    });
-  });
-  try {
-    const client = clientFor(server);
-    const result = await client.memories.add({
-      text: '周野偏好用中文写评审意见。',
-      userId: 'u-1',
-      agentId: 'agent-1',
-      metadata: { channel: 'test' },
-      infer: false,
-    });
-
-    assert.equal(server.requests.length, 1);
-    const request = server.requests[0];
-    assert.ok(request);
-    assert.equal(request.method, 'POST');
-    assert.equal(request.url, '/v1/memories');
-    assert.equal(request.headers.authorization, 'Bearer mnemos_live_demo_atlas_ci');
-    assert.match(String(request.headers['content-type']), /application\/json/);
-    assert.deepEqual(JSON.parse(request.body), {
-      text: '周野偏好用中文写评审意见。',
-      user_id: 'u-1',
-      agent_id: 'agent-1',
-      metadata: { channel: 'test' },
-      infer: false,
-    });
-
-    assert.equal(result.took_ms, 3);
-    assert.equal(result.results[0]?.id, 'mem_1');
-    assert.equal(result.results[0]?.content, memoryFixture.content);
-    assert.equal(result.results[0]?.memory, memoryFixture.content, 'content 与 memory 互为别名');
-    assert.equal(result.results[0]?.user_id, 'u-1');
-    assert.equal(result.results[0]?.created_at, memoryFixture.createdAt);
-    assert.equal(result.results[0]?.access_count, 2);
-    assert.equal(result.events[0]?.memory_id, 'mem_1');
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 2. 列表：查询参数拼接                                               */
-/* ------------------------------------------------------------------ */
-
-test('列表：查询参数使用 snake_case、跳过 undefined 并正确编码', async () => {
-  const server = await startMock((_req, res) => {
-    sendJson(res, 200, { results: [memoryFixture], count: 1, page: 2, page_size: 50 });
-  });
-  try {
-    const client = clientFor(server);
-    const result = await client.memories.list({
-      userId: '用户 1',
-      page: 2,
-      pageSize: 50,
-      visibility: 'project',
-    });
-
-    assert.equal(server.requests.length, 1);
-    const url = new URL(server.requests[0]?.url ?? '', 'http://127.0.0.1');
-    assert.equal(url.pathname, '/v1/memories');
-    assert.equal(url.searchParams.get('user_id'), '用户 1');
-    assert.equal(url.searchParams.get('page'), '2');
-    assert.equal(url.searchParams.get('page_size'), '50');
-    assert.equal(url.searchParams.get('visibility'), 'project');
-    assert.equal(url.searchParams.has('agent_id'), false);
-
-    assert.equal(result.count, 1);
-    assert.equal(result.results[0]?.content, memoryFixture.content);
-    assert.equal(result.page_size, 50);
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 3. 检索：请求体与 filters                                          */
-/* ------------------------------------------------------------------ */
-
-test('检索：snake_case 请求体、filters 与命中的 memory/matched_on 归一化', async () => {
-  const server = await startMock((_req, res) => {
-    sendJson(res, 200, {
-      results: [
-        {
-          ...memoryFixture,
-          content: undefined,
-          memory: memoryFixture.content,
-          score: 0.73,
-          signals: { semantic: 0.68, keyword: 0.52, entity: 0.4, recency: 0.81, importance: 0.74 },
-          matched_on: ['semantic', 'keyword'],
-          entities: ['周野'],
-        },
-      ],
-      total: 1,
-      took_ms: 6,
-      signals: { strategy: 'hybrid', query_terms: ['评审'] },
-    });
-  });
-  try {
-    const client = clientFor(server);
-    const result = await client.memories.search({
-      query: '评审偏好',
-      agentId: 'agent-1',
-      taskId: 'task-1',
-      topK: 5,
-      threshold: 0.2,
-      includePrivate: false,
-      filters: {
-        category: 'preference',
-        createdAfter: '2026-01-01T00:00:00.000Z',
-        minImportance: 0.3,
-        tags: ['偏好'],
-      },
-    });
-
-    const body = JSON.parse(server.requests[0]?.body ?? '{}');
-    assert.deepEqual(body, {
-      query: '评审偏好',
-      agent_id: 'agent-1',
-      task_id: 'task-1',
-      top_k: 5,
-      threshold: 0.2,
-      include_private: false,
-      filters: {
-        category: 'preference',
-        tags: ['偏好'],
-        created_after: '2026-01-01T00:00:00.000Z',
-        min_importance: 0.3,
-      },
-    });
-
-    assert.equal(result.results[0]?.content, memoryFixture.content);
-    assert.equal(result.results[0]?.score, 0.73);
-    assert.deepEqual(result.results[0]?.matched_on, ['semantic', 'keyword']);
-    assert.equal(result.results[0]?.signals.keyword, 0.52);
-    assert.equal(result.took_ms, 6);
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 4. 错误映射                                                        */
-/* ------------------------------------------------------------------ */
-
-test('错误映射：status/code/message/details/requestId 与响应头兜底', async () => {
-  const server = await startMock((req, res) => {
-    if (req.url === '/v1/memories/bad') {
-      sendJson(res, 400, {
-        error: {
-          code: 'validation_error',
-          message: '参数不合法',
-          details: [{ path: 'query', message: '不能为空' }],
-          requestId: 'req_body',
-        },
-      });
-      return;
-    }
-    sendJson(
-      res,
-      404,
-      { error: { code: 'not_found', message: '记忆不存在' } },
-      { 'x-request-id': 'req_header' },
-    );
-  });
-  try {
-    const client = clientFor(server);
-
-    await assert.rejects(
-      () => client.memories.get('bad'),
-      (error: unknown) => {
-        assert.ok(error instanceof MnemosApiError);
-        assert.equal(error.status, 400);
-        assert.equal(error.code, 'validation_error');
-        assert.equal(error.message, '参数不合法');
-        assert.equal(error.requestId, 'req_body');
-        assert.deepEqual(error.details, [{ path: 'query', message: '不能为空' }]);
-        return true;
-      },
-    );
-
-    await assert.rejects(
-      () => client.memories.get('missing'),
-      (error: unknown) => {
-        assert.ok(error instanceof MnemosApiError);
-        assert.equal(error.status, 404);
-        assert.equal(error.code, 'not_found');
-        assert.equal(error.requestId, 'req_header', '错误体缺 requestId 时取 x-request-id');
-        return true;
-      },
-    );
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 5. 幂等键                                                          */
-/* ------------------------------------------------------------------ */
-
-test('幂等键：显式传入才发送 Idempotency-Key', async () => {
-  const server = await startMock((req, res) => {
-    if (req.method === 'POST') {
-      sendJson(res, 200, { results: [memoryFixture], events: [], tookMs: 1 });
-      return;
-    }
-    sendJson(res, 200, { nodes: [], edges: [] });
-  });
-  try {
-    const client = clientFor(server);
-
-    await client.memories.add({ text: '有幂等键' }, { idempotencyKey: 'idem-key-12345678' });
-    await client.memories.add({ text: '无幂等键' });
-
-    assert.equal(server.requests[0]?.headers['idempotency-key'], 'idem-key-12345678');
-    assert.equal(server.requests[1]?.headers['idempotency-key'], undefined);
-
-    await client.graph(10);
-    assert.equal(server.requests[2]?.headers['idempotency-key'], undefined);
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 6. 429 重试 + Retry-After                                          */
-/* ------------------------------------------------------------------ */
-
-test('429：按 Retry-After 等待后重试成功', async () => {
-  let attempts = 0;
-  const server = await startMock((_req, res) => {
-    attempts += 1;
-    if (attempts === 1) {
-      sendJson(
-        res,
-        429,
-        { error: { code: 'rate_limited', message: '请求过于频繁', requestId: 'req_429' } },
-        { 'retry-after': '1' },
-      );
-      return;
-    }
-    sendJson(res, 200, { results: [memoryFixture], count: 1, page: 1, page_size: 20 });
-  });
-  try {
-    const client = clientFor(server, { maxRetries: 2 });
-    const startedAt = Date.now();
-    const result = await client.memories.list();
-    const elapsed = Date.now() - startedAt;
-
-    assert.equal(attempts, 2);
-    assert.ok(elapsed >= 900, `应等待 Retry-After ≈1s，实际 ${elapsed}ms`);
-    assert.equal(result.results[0]?.id, 'mem_1');
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 7. GET 5xx 重试（指数退避）                                        */
-/* ------------------------------------------------------------------ */
-
-test('503：GET 指数退避重试，第二次成功', async () => {
-  let attempts = 0;
-  const server = await startMock((_req, res) => {
-    attempts += 1;
-    if (attempts === 1) {
-      sendJson(res, 503, { error: { code: 'service_unavailable', message: '稍后重试' } });
-      return;
-    }
-    sendJson(res, 200, { metrics: { total_memories: 3 } });
-  });
-  try {
-    const client = clientFor(server, { maxRetries: 1 });
-    const startedAt = Date.now();
-    const stats = await client.stats();
-    const elapsed = Date.now() - startedAt;
-
-    assert.equal(attempts, 2);
-    assert.ok(elapsed >= 150, '应至少经历一次指数退避');
-    assert.equal(stats.metrics.total_memories, 3);
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 8. 非幂等 POST 不重试 / 带幂等键才重试                              */
-/* ------------------------------------------------------------------ */
-
-test('非幂等 POST：默认不重试；提供 idempotencyKey 后重试并复用同一个 key', async () => {
-  const taskRequests: CapturedRequest[] = [];
-  const server = await startMock((req, res) => {
-    taskRequests.push(req);
-    sendJson(res, 503, { error: { code: 'service_unavailable', message: '稍后重试' } });
-  });
-  try {
-    const client = clientFor(server, { maxRetries: 2 });
-
-    await assert.rejects(
-      () => client.tasks.create({ title: '拆分查询服务' }),
-      (error: unknown) => {
-        assert.ok(error instanceof MnemosApiError);
-        assert.equal(error.status, 503);
-        return true;
-      },
-    );
-    assert.equal(taskRequests.length, 1, '无幂等键的 POST 不应重试');
-
-    await assert.rejects(
-      () => client.tasks.create({ title: '拆分查询服务' }, { idempotencyKey: 'idem-task-0001' }),
-      (error: unknown) => {
-        assert.ok(error instanceof MnemosApiError);
-        assert.equal(error.status, 503);
-        return true;
-      },
-    );
-    const retried = taskRequests.slice(1);
-    assert.equal(retried.length, 3, '带幂等键应重试到 maxRetries');
-    for (const request of retried) {
-      assert.equal(request.headers['idempotency-key'], 'idem-task-0001');
-    }
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 9. 超时                                                            */
-/* ------------------------------------------------------------------ */
-
-test('超时：AbortSignal.timeout 中断请求并抛出 code=timeout', async () => {
-  const server = await startMock(async (_req, res) => {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    if (!res.destroyed) {
-      sendJson(res, 200, { results: [], count: 0, page: 1, page_size: 20 });
-    }
-  });
-  try {
-    const client = clientFor(server, { timeoutMs: 40, maxRetries: 0 });
-    await assert.rejects(
-      () => client.memories.list(),
-      (error: unknown) => {
-        assert.ok(error instanceof MnemosApiError);
-        assert.equal(error.status, 0);
-        assert.equal(error.code, 'timeout');
-        return true;
-      },
-    );
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 10. 任务结束 / 简报                                                */
-/* ------------------------------------------------------------------ */
-
-test('任务结束与简报：snake_case 请求体、嵌套模型归一化', async () => {
-  const server = await startMock((req, res) => {
-    if (req.url === '/v1/tasks/task-1/finish') {
-      sendJson(res, 200, {
-        task: {
-          id: 'task-1',
-          project_id: 'prj_atlas',
-          title: '拆分查询服务',
-          goal: '完成首期',
-          status: 'done',
-          owner_agent_id: 'agent-1',
-          owner_agent_name: '开发 Agent',
-          branch: 'feat/split',
-          summary: '完成首期',
-          metadata: {},
-          created_at: '2026-11-05T09:00:00.000Z',
-          started_at: '2026-11-05T09:00:00.000Z',
-          ended_at: '2026-11-05T10:00:00.000Z',
-          memory_count: 2,
-          agent_count: 1,
-        },
-        memories: [
-          {
-            id: 'mem_2',
-            memory: '查询走只读副本。',
-            user_id: null,
-            agent_id: 'agent-1',
-            visibility: 'project',
-            category: 'fact',
-            importance: 0.8,
-            confidence: 0.9,
-            source: 'agent',
-            status: 'active',
-            tags: [],
-            metadata: {},
-            created_at: '2026-11-05T10:00:00.000Z',
-            updated_at: '2026-11-05T10:00:00.000Z',
-            access_count: 0,
-          },
-        ],
-      });
-      return;
-    }
-    sendJson(res, 200, {
-      project: { id: 'prj_atlas', name: 'Atlas', description: '研发助手' },
-      agent: null,
-      task: null,
-      sections: [
-        { key: 'project', title: '项目背景', description: '项目描述', hits: [] },
-      ],
-      prompt: '# 项目背景\n',
-      tokenEstimate: 128,
-      citations: ['mem_2'],
-      builtAt: '2026-11-05T10:00:00.000Z',
-      tookMs: 12,
-      brief: { text: '最近约定：查询走只读副本。', maxChars: 500, count: 3 },
-    });
-  });
-  try {
-    const client = clientFor(server);
-
-    const finished = await client.tasks.finish(
-      'task-1',
-      { summary: '完成首期', decisions: ['查询走只读副本'], agentId: 'agent-1' },
-      { idempotencyKey: 'idem-finish-0001' },
-    );
-    assert.deepEqual(JSON.parse(server.requests[0]?.body ?? '{}'), {
-      summary: '完成首期',
-      decisions: ['查询走只读副本'],
-      agent_id: 'agent-1',
-    });
-    assert.equal(finished.task.status, 'done');
-    assert.equal(finished.task.memory_count, 2);
-    assert.equal(finished.memories[0]?.content, '查询走只读副本。');
-
-    const briefing = await client.context.build({ agentId: 'agent-1', taskId: 'task-1', budgetTokens: 500 });
-    assert.deepEqual(JSON.parse(server.requests[1]?.body ?? '{}'), {
-      agent_id: 'agent-1',
-      task_id: 'task-1',
-      budget_tokens: 500,
-    });
-    assert.equal(briefing.token_estimate, 128);
-    assert.equal(briefing.built_at, '2026-11-05T10:00:00.000Z');
-    assert.equal(briefing.sections[0]?.key, 'project');
-    assert.equal(briefing.agent, null);
-    assert.equal(briefing.brief?.max_chars, 500);
-    assert.equal(briefing.brief?.count, 3);
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 11. 导出 / 导入                                                    */
-/* ------------------------------------------------------------------ */
-
-test('导出归一化后可直接回灌 import（自动转回 camelCase 导入格式）', async () => {
-  const server = await startMock((req, res) => {
-    if (req.method === 'GET' && req.url === '/v1/export') {
-      sendJson(res, 200, {
-        format: 'mnemos-export/v1',
-        exportedAt: '2026-11-05T10:00:00.000Z',
-        project: { id: 'prj_atlas', slug: 'atlas-copilot', name: 'Atlas' },
-        agents: [],
-        tasks: [],
-        memories: [memoryFixture],
-      });
-      return;
-    }
-    sendJson(res, 200, { imported: 1, skipped: 0, failed: 0, errors: [] });
-  });
-  try {
-    const client = clientFor(server);
-    const document = await client.export();
-    assert.equal(document.exported_at, '2026-11-05T10:00:00.000Z');
-    assert.equal(document.memories[0]?.content, memoryFixture.content);
-
-    const result = await client.import(document);
-    assert.equal(result.imported, 1);
-    const importBody = JSON.parse(server.requests[1]?.body ?? '{}');
-    assert.equal(importBody.format, 'mnemos-export/v1');
-    assert.deepEqual(importBody.memories, [
-      {
-        content: memoryFixture.content,
-        visibility: 'project',
-        tags: ['偏好'],
-        metadata: { channel: 'test' },
-        userId: 'u-1',
-        agentId: 'agent-1',
-      },
-    ]);
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 12. webhook（beta）                                                */
-/* ------------------------------------------------------------------ */
-
-test('webhook（beta）：列表 / 创建 / 轮换密钥 / 投递 / 重放路径', async () => {
-  const server = await startMock((req, res) => {
-    if (req.method === 'GET' && req.url === '/v1/webhooks') {
-      sendJson(res, 200, [
-          {
-            id: 'wh_1',
-            project_id: 'prj_atlas',
-            name: 'CI 回调',
-            url: 'https://ci.example.com/hook',
-            event_types: ['memory.created'],
-            enabled: true,
-            description: '',
-            created_by: 'usr_1',
-            created_at: '2026-11-05T10:00:00.000Z',
-            updated_at: '2026-11-05T10:00:00.000Z',
-            last_delivery_at: null,
-            last_status: null,
-            failure_count: 0,
-            disabled_at: null,
-          },
-      ]);
-      return;
-    }
-    if (req.method === 'POST' && req.url === '/v1/webhooks') {
-      sendJson(res, 200, {
-        id: 'wh_2',
-        project_id: 'prj_atlas',
-        name: '新回调',
-        url: 'https://example.com/hook',
-        secret: 'whsec_abc',
-        event_types: ['memory.created'],
-        enabled: true,
-        description: '',
-        created_by: null,
-        created_at: '2026-11-05T10:00:00.000Z',
-        updated_at: '2026-11-05T10:00:00.000Z',
-        last_delivery_at: null,
-        last_status: null,
-        failure_count: 0,
-        disabled_at: null,
-      });
-      return;
-    }
-    if (req.url === '/v1/webhooks/wh_2/rotate-secret') {
-      sendJson(res, 200, {
-        id: 'wh_2',
-        project_id: 'prj_atlas',
-        name: '新回调',
-        url: 'https://example.com/hook',
-        secret: 'whsec_rotated',
-        event_types: ['memory.created'],
-        enabled: true,
-        description: '',
-        created_by: null,
-        created_at: '2026-11-05T10:00:00.000Z',
-        updated_at: '2026-11-05T11:00:00.000Z',
-        last_delivery_at: null,
-        last_status: null,
-        failure_count: 0,
-        disabled_at: null,
-      });
-      return;
-    }
-    if (req.url === '/v1/webhooks/wh_2/deliveries?page=1&page_size=5&status=failed') {
-      sendJson(res, 200, {
-        items: [
-          {
-            id: 'del_1',
-            webhook_id: 'wh_2',
-            project_id: 'prj_atlas',
-            event_type: 'memory.created',
-            event_id: 'evt_1',
-            status: 'failed',
-            attempts: 3,
-            max_attempts: 6,
-            next_attempt_at: null,
-            response_status: 500,
-            response_body: 'boom',
-            latency_ms: 120,
-            error: 'HTTP 500',
-            created_at: '2026-11-05T10:00:00.000Z',
-            delivered_at: null,
-          },
-        ],
-        page: 1,
-        page_size: 5,
-        total: 1,
-        total_pages: 1,
-      });
-      return;
-    }
-    if (req.url === '/v1/webhook-deliveries/del_1/replay') {
-      sendJson(res, 200, {
-        id: 'del_1',
-        webhook_id: 'wh_2',
-        project_id: 'prj_atlas',
-        event_type: 'memory.created',
-        event_id: 'evt_1',
-        status: 'pending',
-        attempts: 0,
-        max_attempts: 6,
-        next_attempt_at: null,
-        response_status: null,
-        response_body: null,
-        latency_ms: null,
-        error: null,
-        created_at: '2026-11-05T10:00:00.000Z',
-        delivered_at: null,
-      });
-      return;
-    }
-    sendJson(res, 404, { error: { code: 'not_found', message: 'mock 未实现' } });
-  });
-  try {
-    const client = clientFor(server);
-
-    const list = await client.webhooks.list();
-    assert.equal(list.count, 1);
-    assert.equal(list.results[0]?.event_types[0], 'memory.created');
-
-    const created = await client.webhooks.create({
-      name: '新回调',
-      url: 'https://example.com/hook',
-      eventTypes: ['memory.created'],
-    });
-    assert.equal(created.secret, 'whsec_abc');
-    assert.deepEqual(JSON.parse(server.requests[1]?.body ?? '{}'), {
-      name: '新回调',
-      url: 'https://example.com/hook',
-      event_types: ['memory.created'],
-    });
-
-    const rotated = await client.webhooks.rotateSecret('wh_2');
-    assert.equal(rotated.secret, 'whsec_rotated');
-    assert.equal(server.requests[2]?.method, 'POST');
-    assert.equal(server.requests[2]?.url, '/v1/webhooks/wh_2/rotate-secret');
-
-    const deliveries = await client.webhooks.deliveries('wh_2', { page: 1, pageSize: 5, status: 'failed' });
-    assert.equal(deliveries.items[0]?.status, 'failed');
-    assert.equal(deliveries.items[0]?.attempts, 3);
-    assert.equal(deliveries.items[0]?.max_attempts, 6);
-    assert.equal(deliveries.total_pages, 1);
-
-    const replayed = await client.webhooks.replay('del_1');
-    assert.equal(replayed.status, 'pending');
-    assert.equal(server.requests[4]?.url, '/v1/webhook-deliveries/del_1/replay');
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 13. 详情 / 历史 / 反馈与 Agent 注册表                               */
-/* ------------------------------------------------------------------ */
-
-test('详情、历史、反馈与 Agent 注册表：嵌套字段归一化', async () => {
-  const agentFixture = {
-    id: 'agent-1',
-    project_id: 'prj_atlas',
-    name: '开发 Agent',
-    role: 'assistant',
-    model: 'deepseek-chat',
-    description: '',
-    capabilities: ['code-review'],
-    status: 'active',
-    metadata: {},
-    created_at: '2026-06-20T00:00:00.000Z',
-    last_active_at: null,
-    stats: { memories: 2, private_memories: 1, tasks: 1, last_task_at: null },
-  };
-
-  const server = await startMock((req, res) => {
-    if (req.method === 'GET' && req.url === '/v1/memories/mem_1') {
-      sendJson(res, 200, {
-        ...memoryFixture,
-        content: undefined,
-        memory: memoryFixture.content,
-        history: [
-          {
-            id: 'hist_1',
-            memory_id: 'mem_1',
-            event: 'UPDATE',
-            old_memory: '旧正文',
-            new_memory: memoryFixture.content,
-            actor: 'api_key:key_1',
-            reason: null,
-            created_at: '2026-11-05T10:00:00.000Z',
-            meta: {},
-          },
-        ],
-        entities: [{ id: 'ent_1', name: '周野', type: 'person', mention_count: 3 }],
-        relations: [],
-        neighbors: [],
-      });
-      return;
-    }
-    if (req.method === 'GET' && req.url === '/v1/memories/mem_1/history') {
-      sendJson(res, 200, {
-        results: [
-          {
-            id: 'hist_2',
-            memory_id: 'mem_1',
-            event: 'ADD',
-            old_memory: null,
-            new_memory: '初始正文',
-            actor: 'system',
-            reason: 'seed',
-            created_at: '2026-11-04T10:00:00.000Z',
-            meta: { channel: 'seed' },
-          },
-        ],
-      });
-      return;
-    }
-    if (req.method === 'POST' && req.url === '/v1/memories/mem_1/feedback') {
-      sendJson(res, 200, { ...memoryFixture, importance: 0.9 });
-      return;
-    }
-    if (req.method === 'GET' && req.url === '/v1/agents') {
-      sendJson(res, 200, { results: [agentFixture], count: 1 });
-      return;
-    }
-    if (req.method === 'POST' && req.url === '/v1/agents') {
-      sendJson(res, 200, agentFixture);
-      return;
-    }
-    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
-  });
-  try {
-    const client = clientFor(server);
-
-    const detail = await client.memories.get('mem_1');
-    assert.equal(detail.content, memoryFixture.content);
-    assert.equal(detail.history[0]?.old_content, '旧正文');
-    assert.equal(detail.history[0]?.new_content, memoryFixture.content);
-    assert.equal(detail.entities[0]?.mention_count, 3);
-
-    const history = await client.memories.history('mem_1');
-    assert.equal(history.results[0]?.event, 'ADD');
-    assert.equal(history.results[0]?.new_content, '初始正文');
-    assert.equal(history.results[0]?.reason, 'seed');
-
-    const feedback = await client.memories.feedback('mem_1', { helpful: true, query: '评审' });
-    assert.equal(feedback.importance, 0.9);
-    assert.deepEqual(JSON.parse(server.requests[2]?.body ?? '{}'), { helpful: true, query: '评审' });
-
-    const agents = await client.agents.list();
-    assert.equal(agents.count, 1);
-    assert.equal(agents.results[0]?.stats.private_memories, 1);
-    assert.deepEqual(agents.results[0]?.capabilities, ['code-review']);
-
-    const created = await client.agents.create({ name: '开发 Agent', capabilities: ['code-review'] });
-    assert.equal(created.id, 'agent-1');
-    assert.deepEqual(JSON.parse(server.requests[4]?.body ?? '{}'), {
-      name: '开发 Agent',
-      capabilities: ['code-review'],
-    });
-  } finally {
-    await server.close();
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* 14. 记忆简报与做梦（控制台 API）                                    */
-/* ------------------------------------------------------------------ */
-
 const briefFixture = {
-  projectId: 'prj_atlas',
-  text: '最近约定：查询走只读副本；支付回调必须带幂等键。',
-  maxChars: 500,
-  count: 2,
+  partition_id: 'prt_demo',
+  person_id: 'per_1',
+  scope_key: 'person:per_1',
+  text: '周野偏好用中文写评审意见。',
+  max_chars: 1200,
+  count: 1,
   model: 'mnemos-condense',
   cached: false,
-  generatedAt: '2026-11-05T12:00:00.000Z',
+  source_hash: 'hash_1',
+  generated_at: '2026-11-04T00:00:00.000Z',
   recent: [
     {
       id: 'mem_1',
-      content: '查询走只读副本。',
-      category: 'fact',
-      importance: 0.8,
-      updatedAt: '2026-11-05T11:00:00.000Z',
-      taskId: 'task-1',
-      agentId: 'agent-1',
+      content: '周野偏好用中文写评审意见。',
+      category: 'preference',
+      importance: 0.7,
+      scope: 'partition',
+      updated_at: '2026-11-03T10:00:00.000Z',
+      person_id: 'per_1',
+      person_external_id: 'user-1',
     },
   ],
 };
 
 const dreamRunFixture = {
-  id: 'dream_1',
-  projectId: 'prj_atlas',
+  id: 'dr_1',
+  partition_id: 'prt_demo',
+  person_id: 'per_1',
   trigger: 'manual',
   status: 'completed',
-  inputCount: 4,
-  insightCount: 2,
-  summary: '已整理 4 条新记忆，形成 2 条洞见',
-  startedAt: '2026-11-05T12:00:00.000Z',
-  finishedAt: '2026-11-05T12:00:03.000Z',
+  input_count: 4,
+  insight_count: 1,
+  summary: '巩固 4 条记忆',
+  error: null,
+  started_at: '2026-11-04T00:00:00.000Z',
+  finished_at: '2026-11-04T00:00:01.000Z',
 };
 
-function dreamStatusFixture() {
-  return {
-    settings: { enabled: true, intervalMinutes: 1440, lastAt: '2026-11-05T12:00:03.000Z' },
-    pendingCount: 4,
-    lastRun: dreamRunFixture,
-    runs: [dreamRunFixture],
-  };
-}
+const dreamStatusFixture = {
+  settings: { enabled: true, interval_minutes: 1440, last_at: '2026-11-04T00:00:00.000Z' },
+  person_id: 'per_1',
+  pending_count: 2,
+  last_run: dreamRunFixture,
+  runs: [dreamRunFixture],
+};
 
-test('记忆简报：GET 查询参数、camelCase 响应归一化为 snake_case', async () => {
-  const server = await startMock((req, res) => {
-    if (req.method === 'GET' && req.url?.startsWith('/api/projects/prj_atlas/memory/brief')) {
-      sendJson(res, 200, briefFixture);
-      return;
-    }
-    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+/* ------------------------------------------------------------------ */
+/* 1. 分区：create / get / update / stats / list                       */
+/* ------------------------------------------------------------------ */
+
+test('partitions.create：snake_case 请求体、settings 归一化、响应驼峰兼容', async () => {
+  const mock = createFetchMock(() => json(partitionFixture));
+  const client = clientFor(mock);
+
+  const partition = await client.partitions.create({
+    slug: 'ws-demo',
+    name: '演示分区',
+    description: 'v6 演示',
+    settings: { defaultScope: 'person', briefMaxChars: 800, locale: 'zh-CN' },
   });
-  try {
-    const client = clientFor(server);
-    const brief = await client.brief('prj_atlas', {
-      force: true,
-      agentId: 'agent-coder',
-      maxChars: 800,
-    });
 
-    const url = new URL(server.requests[0]?.url ?? '', 'http://127.0.0.1');
-    assert.equal(url.pathname, '/api/projects/prj_atlas/memory/brief');
-    assert.equal(url.searchParams.get('force'), 'true');
-    assert.equal(url.searchParams.get('agentId'), 'agent-coder');
-    assert.equal(url.searchParams.get('maxChars'), '800');
-    assert.equal(url.searchParams.has('includePrivate'), false);
+  assert.equal(mock.calls.length, 1);
+  const call = mock.calls[0];
+  assert.ok(call);
+  assert.equal(call.method, 'POST');
+  assert.equal(call.path, '/v1/partitions');
+  assert.equal(call.headers.get('authorization'), 'Bearer mnemos_live_demo_v6');
+  assert.match(String(call.headers.get('x-mnemos-sdk')), /^typescript\//);
+  assert.deepEqual(call.body, {
+    slug: 'ws-demo',
+    name: '演示分区',
+    description: 'v6 演示',
+    settings: { default_scope: 'person', brief_max_chars: 800, locale: 'zh-CN' },
+  });
 
-    assert.equal(brief.project_id, 'prj_atlas');
-    assert.equal(brief.max_chars, 500);
-    assert.equal(brief.count, 2);
-    assert.equal(brief.model, 'mnemos-condense');
-    assert.equal(brief.cached, false);
-    assert.equal(brief.generated_at, '2026-11-05T12:00:00.000Z');
-    assert.equal(brief.recent[0]?.updated_at, '2026-11-05T11:00:00.000Z');
-    assert.equal(brief.recent[0]?.task_id, 'task-1');
-    assert.equal(brief.recent[0]?.agent_id, 'agent-1');
-  } finally {
-    await server.close();
-  }
+  assert.equal(partition.slug, 'ws-demo');
+  assert.equal(partition.settings.default_scope, 'partition');
+  assert.equal(partition.stats?.persons_total, 12);
+  assert.equal(partition.stats?.shared_total, 8);
+  assert.equal(partition.archived_at, null);
 });
 
-test('记忆简报：PATCH 发送 maxChars，返回更新后的 MemoryBrief', async () => {
-  const server = await startMock((req, res) => {
-    if (req.method === 'PATCH') {
-      sendJson(res, 200, { ...briefFixture, maxChars: 1200 });
-      return;
-    }
-    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+test('partitions.get / stats / list / update：路径与字段', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.method === 'GET' && call.path === '/v1/partitions') return json([partitionFixture]);
+    if (call.method === 'PATCH') return json({ ...partitionFixture, name: '改名后' });
+    if (call.path.endsWith('/stats')) return json(partitionFixture.stats);
+    return json(partitionFixture);
   });
-  try {
-    const client = clientFor(server);
-    const brief = await client.updateBriefSettings('prj_atlas', 1200);
+  const client = clientFor(mock);
 
-    assert.equal(server.requests[0]?.method, 'PATCH');
-    assert.equal(server.requests[0]?.url, '/api/projects/prj_atlas/memory/brief');
-    assert.deepEqual(JSON.parse(server.requests[0]?.body ?? '{}'), { maxChars: 1200 });
-    assert.equal(brief.max_chars, 1200);
-    assert.equal(brief.count, 2);
-  } finally {
-    await server.close();
-  }
-});
+  const list = await client.partitions.list();
+  assert.equal(list.length, 1);
+  assert.equal(list[0]?.id, 'prt_demo');
 
-test('做梦：状态 / 设置 / 手动运行 / 409 正在做梦', async () => {
-  let runCalls = 0;
-  const server = await startMock((req, res) => {
-    const path = (req.url ?? '').split('?')[0];
-    if (req.method === 'GET' && path === '/api/projects/prj_atlas/memory/dream') {
-      sendJson(res, 200, dreamStatusFixture());
-      return;
-    }
-    if (req.method === 'PATCH' && path === '/api/projects/prj_atlas/memory/dream') {
-      sendJson(res, 200, {
-        ...dreamStatusFixture(),
-        settings: { enabled: false, intervalMinutes: 120 },
-      });
-      return;
-    }
-    if (req.method === 'POST' && path === '/api/projects/prj_atlas/memory/dream/run') {
-      runCalls += 1;
-      if (runCalls === 1) {
-        sendJson(res, 200, { run: dreamRunFixture, status: dreamStatusFixture() });
-        return;
-      }
-      sendJson(res, 409, { error: { code: 'dream_in_progress', message: '该项目正在做梦' } });
-      return;
-    }
-    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+  const partition = await client.partitions.get('ws demo');
+  assert.equal(mock.calls[1]?.path, '/v1/partitions/ws%20demo');
+  assert.equal(partition.name, '演示分区');
+
+  const stats = await client.partitions.stats('ws-demo');
+  assert.equal(mock.calls[2]?.path, '/v1/partitions/ws-demo/stats');
+  assert.equal(stats.memories_total, 34);
+  assert.equal(stats.sessions_total, 5);
+
+  const updated = await client.partitions.update('ws-demo', {
+    name: '改名后',
+    settings: { dreamIntervalMinutes: 60 },
   });
-  try {
-    const client = clientFor(server);
-
-    const status = await client.dream('prj_atlas');
-    assert.equal(status.pending_count, 4);
-    assert.equal(status.settings.interval_minutes, 1440);
-    assert.equal(status.settings.last_at, '2026-11-05T12:00:03.000Z');
-    assert.equal(status.last_run?.insight_count, 2);
-    assert.equal(status.runs[0]?.trigger, 'manual');
-
-    const updated = await client.updateDreamSettings('prj_atlas', { enabled: false, intervalMinutes: 120 });
-    assert.deepEqual(JSON.parse(server.requests[1]?.body ?? '{}'), {
-      enabled: false,
-      intervalMinutes: 120,
-    });
-    assert.equal(updated.settings.enabled, false);
-    assert.equal(updated.settings.interval_minutes, 120);
-
-    const result = await client.runDream('prj_atlas');
-    assert.equal(server.requests[2]?.method, 'POST');
-    assert.equal(server.requests[2]?.url, '/api/projects/prj_atlas/memory/dream/run');
-    assert.equal(result.run?.id, 'dream_1');
-    assert.equal(result.run?.input_count, 4);
-    assert.equal(result.run?.finished_at, '2026-11-05T12:00:03.000Z');
-    assert.equal(result.status.pending_count, 4);
-
-    // 第二次触发返回 409：SDK 返回 { run: null, status } 并回读状态。
-    const busy = await client.runDream('prj_atlas');
-    assert.equal(busy.run, null);
-    assert.equal(busy.status.pending_count, 4);
-    assert.equal(server.requests[4]?.method, 'GET');
-    assert.equal(server.requests[4]?.url, '/api/projects/prj_atlas/memory/dream');
-  } finally {
-    await server.close();
-  }
+  assert.equal(mock.calls[3]?.method, 'PATCH');
+  assert.deepEqual(mock.calls[3]?.body, { name: '改名后', settings: { dream_interval_minutes: 60 } });
+  assert.equal(updated.name, '改名后');
 });
 
 /* ------------------------------------------------------------------ */
-/* 17. 中立记忆服务 v5：分区 / 人 / 人级简报与做梦 / 人级记忆           */
+/* 2. 人：list 游标 / get / upsert / update                            */
 /* ------------------------------------------------------------------ */
 
-const partitionFixture = {
-  id: 'prj_ws_demo',
-  partition_id: 'prj_ws_demo',
-  project_id: 'prj_ws_demo',
-  org_id: 'org_yunshu',
-  slug: 'ws-demo',
-  name: '演示工作区',
-  description: 'DSH 工作区',
-  status: 'active',
-  region: 'cn-shanghai',
-  env: 'production',
-  created_at: '2026-11-05T10:00:00.000Z',
-  updated_at: '2026-11-05T10:00:00.000Z',
-  archived_at: null,
-};
+test('persons.list：cursor/limit/q/type/status/sort 查询与分页归一化', async () => {
+  const mock = createFetchMock(() =>
+    json({
+      items: [personFixture],
+      next_cursor: 'cursor_2',
+      partition_stats: partitionFixture.stats,
+    }),
+  );
+  const client = clientFor(mock);
 
-const personFixture = {
-  id: 'prs_alice',
-  partition_id: 'prj_ws_demo',
-  project_id: 'prj_ws_demo',
-  external_id: 'alice',
-  type: 'human',
-  display_name: 'Alice',
-  attributes: { tier: 'pro' },
-  status: 'active',
-  first_seen_at: '2026-10-01T08:00:00.000Z',
-  last_seen_at: '2026-11-05T09:00:00.000Z',
-  created_at: '2026-10-01T08:00:00.000Z',
-  updated_at: '2026-11-05T09:00:00.000Z',
-  stats: {
-    memories: 3,
-    shared_memories: 1,
-    sessions: 2,
-    last_memory_at: '2026-11-04T12:00:00.000Z',
-  },
-};
-
-test('分区：create 按 slug 幂等 upsert、get 支持 id/slug（snake_case 请求与归一化）', async () => {
-  const server = await startMock((req, res) => {
-    if (req.method === 'POST' && req.url === '/v1/partitions') {
-      sendJson(res, 201, { partition: partitionFixture, created: true });
-      return;
-    }
-    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo') {
-      sendJson(res, 200, { partition: partitionFixture });
-      return;
-    }
-    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+  const page = await client.persons.list('ws-demo', {
+    type: 'human',
+    status: 'active',
+    q: '周',
+    sort: 'recent',
+    cursor: 'cursor_1',
+    limit: 50,
   });
-  try {
-    const client = clientFor(server);
-    const created = await client.partitions.create({ slug: 'ws-demo', name: '演示工作区', env: 'production' });
-    assert.deepEqual(JSON.parse(server.requests[0]?.body ?? '{}'), {
-      slug: 'ws-demo',
-      name: '演示工作区',
-      env: 'production',
-    });
-    assert.equal(created.created, true);
-    assert.equal(created.partition.id, 'prj_ws_demo');
-    assert.equal(created.partition.partition_id, 'prj_ws_demo');
-    assert.equal(created.partition.org_id, 'org_yunshu');
-    assert.equal(created.partition.slug, 'ws-demo');
-    assert.equal(created.partition.archived_at, null);
 
-    const partition = await client.partitions.get('ws-demo');
-    assert.equal(server.requests[1]?.url, '/v1/partitions/ws-demo');
-    assert.equal(partition.name, '演示工作区');
-    assert.equal(partition.project_id, 'prj_ws_demo');
-  } finally {
-    await server.close();
-  }
+  assert.equal(mock.calls[0]?.path, '/v1/partitions/ws-demo/persons');
+  const query = queryOf(mock.calls[0] as CapturedCall);
+  assert.equal(query.get('type'), 'human');
+  assert.equal(query.get('status'), 'active');
+  assert.equal(query.get('q'), '周');
+  assert.equal(query.get('sort'), 'recent');
+  assert.equal(query.get('cursor'), 'cursor_1');
+  assert.equal(query.get('limit'), '50');
+
+  assert.equal(page.items.length, 1);
+  assert.equal(page.next_cursor, 'cursor_2');
+  assert.equal(page.partition_stats?.persons_total, 12);
+  assert.equal(page.items[0]?.memory_count, 3);
+  assert.equal(page.items[0]?.last_memory_at, '2026-11-03T10:00:00.000Z');
 });
 
-test('人：upsert/list/get/update 走分区路径并归一化 stats', async () => {
-  const server = await startMock((req, res) => {
-    if (req.method === 'PUT' && req.url === '/v1/partitions/ws-demo/persons/alice') {
-      sendJson(res, 200, { person: personFixture });
-      return;
+test('persons.get / upsert / update：路径编码、camelCase 请求体转 snake_case', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.method === 'PUT') {
+      return json({ ...personFixture, external_id: 'user 1', display_name: '周野（更新）' });
     }
-    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/persons?type=human&q=ali&page_size=10&sort=recent') {
-      sendJson(res, 200, {
-        results: [personFixture],
-        items: [personFixture],
-        count: 1,
-        total: 1,
-        page: 1,
-        page_size: 10,
-        total_pages: 1,
-      });
-      return;
-    }
-    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/persons/alice') {
-      sendJson(res, 200, { person: personFixture });
-      return;
-    }
-    if (req.method === 'PATCH' && req.url === '/v1/partitions/ws-demo/persons/alice') {
-      sendJson(res, 200, { person: { ...personFixture, display_name: 'Alice Chen' } });
-      return;
-    }
-    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+    if (call.method === 'PATCH') return json({ ...personFixture, status: 'archived' });
+    return json(personFixture);
   });
-  try {
-    const client = clientFor(server);
+  const client = clientFor(mock);
 
-    const upserted = await client.persons.upsert('ws-demo', 'alice', {
-      type: 'human',
-      displayName: 'Alice',
-      attributes: { tier: 'pro' },
-    });
-    assert.deepEqual(JSON.parse(server.requests[0]?.body ?? '{}'), {
-      type: 'human',
-      display_name: 'Alice',
-      attributes: { tier: 'pro' },
-    });
-    assert.equal(upserted.external_id, 'alice');
-    assert.equal(upserted.partition_id, 'prj_ws_demo');
-    assert.equal(upserted.stats?.memories, 3);
-    assert.equal(upserted.stats?.shared_memories, 1);
-    assert.equal(upserted.stats?.sessions, 2);
-    assert.equal(upserted.stats?.last_memory_at, '2026-11-04T12:00:00.000Z');
+  const person = await client.persons.get('ws-demo', 'per_1');
+  assert.equal(mock.calls[0]?.path, '/v1/partitions/ws-demo/persons/per_1');
+  assert.equal(person.external_id, 'user-1');
 
-    const page = await client.persons.list('ws-demo', { type: 'human', q: 'ali', pageSize: 10, sort: 'recent' });
-    assert.equal(page.count, 1);
-    assert.equal(page.items[0]?.external_id, 'alice');
-    assert.equal(page.total_pages, 1);
+  await client.persons.upsert('ws-demo', 'user 1', {
+    type: 'agent',
+    displayName: '周野（更新）',
+    attributes: { team: 'core' },
+  });
+  const upsertCall = mock.calls[1] as CapturedCall;
+  assert.equal(upsertCall.method, 'PUT');
+  assert.equal(upsertCall.path, '/v1/partitions/ws-demo/persons/user%201');
+  assert.deepEqual(upsertCall.body, {
+    type: 'agent',
+    display_name: '周野（更新）',
+    attributes: { team: 'core' },
+  });
 
-    const person = await client.persons.get('ws-demo', 'alice');
-    assert.equal(person.display_name, 'Alice');
-
-    const updated = await client.persons.update('ws-demo', 'alice', { displayName: 'Alice Chen' });
-    assert.deepEqual(JSON.parse(server.requests[3]?.body ?? '{}'), { display_name: 'Alice Chen' });
-    assert.equal(updated.display_name, 'Alice Chen');
-  } finally {
-    await server.close();
-  }
+  await client.persons.update('ws-demo', 'user-1', { status: 'archived' });
+  const updateCall = mock.calls[2] as CapturedCall;
+  assert.equal(updateCall.method, 'PATCH');
+  assert.deepEqual(updateCall.body, { status: 'archived' });
 });
 
-test('人级简报 / 上下文 / 做梦：snake_case 字段与 409 回读', async () => {
-  const server = await startMock((req, res) => {
-    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/persons/alice/brief?force=true&max_chars=800') {
-      sendJson(res, 200, {
-        project_id: 'prj_ws_demo',
-        partition_id: 'prj_ws_demo',
-        person_id: 'prs_alice',
-        text: '# 人的简报\n- [偏好] Alice 偏好中文',
-        max_chars: 800,
-        count: 1,
-        model: 'mnemos-condense',
-        cached: false,
-        generated_at: '2026-11-05T10:00:00.000Z',
-        recent: [
-          {
-            id: 'mem_1',
-            content: 'Alice 偏好中文',
-            category: 'preference',
-            importance: 0.7,
-            updated_at: '2026-11-05T09:00:00.000Z',
-            person_id: 'prs_alice',
-            person_external_id: 'alice',
-            scope: 'person',
+test('persons.update：空 PATCH 体在客户端直接拒绝', async () => {
+  const mock = createFetchMock(() => json(personFixture));
+  const client = clientFor(mock);
+  await assert.rejects(() => client.persons.update('ws-demo', 'user-1', {}), /至少提供一个待更新字段/);
+  assert.equal(mock.calls.length, 0);
+});
+
+/* ------------------------------------------------------------------ */
+/* 3. 记忆：按人 list/add、全局 list、search、get/update/delete         */
+/* ------------------------------------------------------------------ */
+
+test('memories.add：按人路径、snake_case 请求体与响应事件归一化', async () => {
+  const mock = createFetchMock(() =>
+    json(
+      {
+        memory: memoryFixture,
+        events: [{ type: 'ADD', memory_id: 'mem_1', at: '2026-11-03T10:00:00.000Z' }],
+      },
+      201,
+    ),
+  );
+  const client = clientFor(mock);
+
+  const result = await client.memories.add('ws-demo', 'user-1', {
+    text: '周野偏好用中文写评审意见。',
+    scope: 'partition',
+    category: 'preference',
+    importance: 0.7,
+    sessionId: 'ses_1',
+    sessionTitle: '评审',
+    tags: ['偏好'],
+    metadata: { channel: 'test' },
+  });
+
+  const call = mock.calls[0] as CapturedCall;
+  assert.equal(call.method, 'POST');
+  assert.equal(call.path, '/v1/partitions/ws-demo/persons/user-1/memories');
+  assert.deepEqual(call.body, {
+    text: '周野偏好用中文写评审意见。',
+    scope: 'partition',
+    session_id: 'ses_1',
+    session_title: '评审',
+    category: 'preference',
+    importance: 0.7,
+    tags: ['偏好'],
+    metadata: { channel: 'test' },
+  });
+
+  assert.equal(result.memory.id, 'mem_1');
+  assert.equal(result.memory.person_external_id, 'user-1');
+  assert.equal(result.memory.dreamed_at, null);
+  assert.deepEqual(result.events, [
+    { type: 'ADD', memory_id: 'mem_1', at: '2026-11-03T10:00:00.000Z' },
+  ]);
+});
+
+test('memories.add：text/messages 都缺失时客户端报错', async () => {
+  const mock = createFetchMock(() => json({ memory: memoryFixture }));
+  const client = clientFor(mock);
+  await assert.rejects(() => client.memories.add('ws-demo', 'user-1', {}), /至少提供一个/);
+  assert.equal(mock.calls.length, 0);
+});
+
+test('memories.listByPerson：scope/category 查询、不重复 person_id', async () => {
+  const mock = createFetchMock(() =>
+    json({ items: [memoryFixture], next_cursor: null, partition_stats: partitionFixture.stats }),
+  );
+  const client = clientFor(mock);
+
+  const page = await client.memories.listByPerson('ws-demo', 'per_1', {
+    scope: 'partition',
+    category: 'preference',
+    q: '评审',
+    cursor: 'c1',
+    limit: 20,
+  });
+
+  const call = mock.calls[0] as CapturedCall;
+  assert.equal(call.path, '/v1/partitions/ws-demo/persons/per_1/memories');
+  const query = queryOf(call);
+  assert.equal(query.get('scope'), 'partition');
+  assert.equal(query.get('category'), 'preference');
+  assert.equal(query.get('q'), '评审');
+  assert.equal(query.get('cursor'), 'c1');
+  assert.equal(query.get('limit'), '20');
+  assert.equal(query.has('person_id'), false);
+  assert.equal(query.has('person_external_id'), false);
+
+  assert.equal(page.items[0]?.content, '周野偏好用中文写评审意见。');
+  assert.equal(page.next_cursor, null);
+});
+
+test('memories.list：全局游标列表，person_id / person_external_id 过滤', async () => {
+  const mock = createFetchMock(() => json({ items: [memoryFixture], next_cursor: 'next_1' }));
+  const client = clientFor(mock);
+
+  const page = await client.memories.list('ws-demo', {
+    personId: 'per_1',
+    personExternalId: 'user-1',
+    status: 'active',
+    limit: 100,
+  });
+
+  const call = mock.calls[0] as CapturedCall;
+  assert.equal(call.path, '/v1/partitions/ws-demo/memories');
+  const query = queryOf(call);
+  assert.equal(query.get('person_id'), 'per_1');
+  assert.equal(query.get('person_external_id'), 'user-1');
+  assert.equal(query.get('status'), 'active');
+  assert.equal(query.get('limit'), '100');
+  assert.equal(page.next_cursor, 'next_1');
+  assert.equal(page.items[0]?.id, 'mem_1');
+});
+
+test('memories.list：limit 越界由客户端拦截', async () => {
+  const mock = createFetchMock(() => json({ items: [], next_cursor: null }));
+  const client = clientFor(mock);
+  await assert.rejects(() => client.memories.list('ws-demo', { limit: 500 }), /limit 必须是 1–200/);
+  assert.equal(mock.calls.length, 0);
+});
+
+test('memories.search：POST /memories/search、top_k 转换与结果归一化', async () => {
+  const mock = createFetchMock(() =>
+    json({
+      results: [memoryFixture],
+      took_ms: 4,
+      next_cursor: 'cursor_search',
+      partition_stats: partitionFixture.stats,
+    }),
+  );
+  const client = clientFor(mock);
+
+  const response = await client.memories.search('ws-demo', {
+    query: '评审偏好',
+    personId: 'per_1',
+    scope: 'partition',
+    category: 'preference',
+    topK: 5,
+  });
+
+  const call = mock.calls[0] as CapturedCall;
+  assert.equal(call.method, 'POST');
+  assert.equal(call.path, '/v1/partitions/ws-demo/memories/search');
+  assert.deepEqual(call.body, {
+    query: '评审偏好',
+    person_id: 'per_1',
+    scope: 'partition',
+    category: 'preference',
+    top_k: 5,
+  });
+  assert.equal(response.took_ms, 4);
+  assert.equal(response.results[0]?.id, 'mem_1');
+  assert.equal(response.next_cursor, 'cursor_search');
+  assert.equal(response.partition_stats?.memories_total, 34);
+});
+
+test('memories.get / update / delete：详情、PATCH 体与 204', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.method === 'GET') return json({ memory: memoryFixture, person: personFixture });
+    if (call.method === 'PATCH') {
+      return json({ memory: { ...memoryFixture, content: '更新后的正文', status: 'archived' } });
+    }
+    return empty(204);
+  });
+  const client = clientFor(mock);
+
+  const detail = await client.memories.get('ws-demo', 'mem_1');
+  assert.equal(mock.calls[0]?.path, '/v1/partitions/ws-demo/memories/mem_1');
+  assert.equal(detail.memory.id, 'mem_1');
+  assert.equal(detail.person?.external_id, 'user-1');
+
+  const updated = await client.memories.update('ws-demo', 'mem_1', {
+    content: '更新后的正文',
+    status: 'archived',
+    expiresAt: null,
+  });
+  assert.deepEqual(mock.calls[1]?.body, {
+    content: '更新后的正文',
+    status: 'archived',
+    expires_at: null,
+  });
+  assert.equal(updated.memory.content, '更新后的正文');
+
+  const deleted = await client.memories.delete('ws-demo', 'mem_1');
+  assert.equal(deleted, undefined);
+  assert.equal(mock.calls[2]?.method, 'DELETE');
+});
+
+/* ------------------------------------------------------------------ */
+/* 4. 人级简报 / 上下文 / 做梦                                          */
+/* ------------------------------------------------------------------ */
+
+test('personBrief：force/max_chars 查询与 recent 归一化', async () => {
+  const mock = createFetchMock(() => json(briefFixture));
+  const client = clientFor(mock);
+
+  const brief = await client.personBrief('ws-demo', 'user-1', { force: true, maxChars: 800 });
+  const call = mock.calls[0] as CapturedCall;
+  assert.equal(call.path, '/v1/partitions/ws-demo/persons/user-1/brief');
+  const query = queryOf(call);
+  assert.equal(query.get('force'), 'true');
+  assert.equal(query.get('max_chars'), '800');
+
+  assert.equal(brief.scope_key, 'person:per_1');
+  assert.equal(brief.cached, false);
+  assert.equal(brief.recent[0]?.person_external_id, 'user-1');
+});
+
+test('personContext：snake_case 请求体与 prompt/citations 归一化', async () => {
+  const mock = createFetchMock(() =>
+    json({
+      person: personFixture,
+      brief: briefFixture,
+      memories: [memoryFixture],
+      shared: [{ ...memoryFixture, id: 'mem_shared', scope: 'partition' }],
+      prompt: '你是周野的助手。',
+      token_estimate: 128,
+      citations: ['mem_1', 'mem_shared'],
+      built_at: '2026-11-04T00:00:00.000Z',
+    }),
+  );
+  const client = clientFor(mock);
+
+  const context = await client.personContext('ws-demo', 'per_1', {
+    query: '评审偏好',
+    budgetTokens: 800,
+    includePartition: true,
+  });
+
+  const call = mock.calls[0] as CapturedCall;
+  assert.equal(call.method, 'POST');
+  assert.equal(call.path, '/v1/partitions/ws-demo/persons/per_1/context');
+  assert.deepEqual(call.body, {
+    query: '评审偏好',
+    budget_tokens: 800,
+    include_partition: true,
+  });
+  assert.equal(context.person.display_name, '周野');
+  assert.equal(context.token_estimate, 128);
+  assert.deepEqual(context.citations, ['mem_1', 'mem_shared']);
+  assert.equal(context.shared.length, 1);
+});
+
+test('personDream / personDreamRun：状态与手动运行归一化', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.method === 'POST') return json({ run: dreamRunFixture, status: dreamStatusFixture });
+    return json(dreamStatusFixture);
+  });
+  const client = clientFor(mock);
+
+  const status = await client.personDream('ws-demo', 'user-1');
+  assert.equal(mock.calls[0]?.path, '/v1/partitions/ws-demo/persons/user-1/dream');
+  assert.equal(status.settings.interval_minutes, 1440);
+  assert.equal(status.pending_count, 2);
+  assert.equal(status.last_run?.input_count, 4);
+
+  const result = await client.personDreamRun('ws-demo', 'user-1', { batchSize: 20 });
+  const runCall = mock.calls[1] as CapturedCall;
+  assert.equal(runCall.path, '/v1/partitions/ws-demo/persons/user-1/dream/run');
+  assert.deepEqual(runCall.body, { batch_size: 20 });
+  assert.equal(result.run?.insight_count, 1);
+  assert.equal(result.status.runs.length, 1);
+});
+
+/* ------------------------------------------------------------------ */
+/* 5. API Key（控制台端点，camelCase 响应归一化）                       */
+/* ------------------------------------------------------------------ */
+
+const keyFixture = {
+  id: 'key_1',
+  partitionId: 'prt_demo',
+  orgId: null,
+  kind: 'partition',
+  name: 'CI',
+  prefix: 'mnemos_live_ab12',
+  scopes: ['memories:read', 'memories:write'],
+  createdBy: 'usr_1',
+  createdAt: '2026-11-01T00:00:00.000Z',
+  lastUsedAt: null,
+  revokedAt: null,
+  expiresAt: null,
+  allowedIps: ['10.0.0.0/8'],
+  rotatedFrom: null,
+  rotatedAt: null,
+  rateLimitPerMin: 600,
+};
+
+test('keys：分区 key list/create/rotate/revoke 与 org key', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.method === 'GET' && call.path === '/api/org/keys') {
+      return json([{ ...keyFixture, kind: 'org', partitionId: null, orgId: 'org_demo' }]);
+    }
+    if (call.method === 'POST' && call.path === '/api/org/keys') {
+      return json({ ...keyFixture, id: 'key_org', kind: 'org', partitionId: null, orgId: 'org_demo', secret: 'mnemos_live_org_secret' }, 201);
+    }
+    if (call.method === 'GET') return json([keyFixture]);
+    if (call.method === 'POST' && call.path.endsWith('/rotate')) {
+      return json({ ...keyFixture, id: 'key_2', secret: 'mnemos_live_new_secret' }, 201);
+    }
+    if (call.method === 'POST') return json({ ...keyFixture, secret: 'mnemos_live_secret' }, 201);
+    return empty(204);
+  });
+  const client = clientFor(mock);
+
+  const list = await client.keys.list('ws-demo');
+  assert.equal(mock.calls[0]?.path, '/api/partitions/ws-demo/keys');
+  assert.equal(list[0]?.partition_id, 'prt_demo');
+  assert.equal(list[0]?.rate_limit_per_min, 600);
+  assert.deepEqual(list[0]?.allowed_ips, ['10.0.0.0/8']);
+
+  const created = await client.keys.create('ws-demo', {
+    name: 'CI',
+    scopes: ['memories:read', 'memories:write'],
+    rateLimitPerMin: 600,
+    allowedIps: ['10.0.0.0/8'],
+  });
+  assert.deepEqual(mock.calls[1]?.body, {
+    name: 'CI',
+    scopes: ['memories:read', 'memories:write'],
+    rateLimitPerMin: 600,
+    allowedIps: ['10.0.0.0/8'],
+  });
+  assert.equal(created.secret, 'mnemos_live_secret');
+
+  const rotated = await client.keys.rotate('ws-demo', 'key_1', { graceHours: 0 });
+  assert.equal(mock.calls[2]?.path, '/api/partitions/ws-demo/keys/key_1/rotate');
+  assert.deepEqual(mock.calls[2]?.body, { graceHours: 0 });
+  assert.equal(rotated.secret, 'mnemos_live_new_secret');
+
+  await client.keys.revoke('ws-demo', 'key_2');
+  assert.equal(mock.calls[3]?.path, '/api/partitions/ws-demo/keys/key_2');
+
+  const orgKeys = await client.keys.org.list();
+  assert.equal(orgKeys[0]?.kind, 'org');
+  assert.equal(orgKeys[0]?.org_id, 'org_demo');
+
+  const orgKey = await client.keys.org.create({ name: 'org', scopes: ['admin'] });
+  assert.equal(orgKey.secret, 'mnemos_live_org_secret');
+
+  await client.keys.org.revoke('key_org');
+  assert.equal(mock.calls[6]?.path, '/api/org/keys/key_org');
+});
+
+/* ------------------------------------------------------------------ */
+/* 6. 健康检查                                                         */
+/* ------------------------------------------------------------------ */
+
+test('health：GET /health 且 camelCase 归一化', async () => {
+  const mock = createFetchMock(() =>
+    json({ ok: true, version: '6.0.0', uptimeMs: 1234, schemaVersion: 6, db: 'ok', node: 'v26.11.1' }),
+  );
+  const client = clientFor(mock);
+
+  const health = await client.health();
+  assert.equal(mock.calls[0]?.path, '/health');
+  assert.equal(health.ok, true);
+  assert.equal(health.uptime_ms, 1234);
+  assert.equal(health.schema_version, 6);
+  assert.equal(health.db, 'ok');
+});
+
+/* ------------------------------------------------------------------ */
+/* 7. 错误映射                                                         */
+/* ------------------------------------------------------------------ */
+
+test('错误映射：status/code/message/details/requestId（响应头兜底）', async () => {
+  const mock = createFetchMock((call) => {
+    if (call.path.endsWith('/bad')) {
+      return json(
+        {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: '参数不合法',
+            details: [{ path: 'query', message: '不能为空' }],
+            requestId: 'req_body',
           },
-        ],
-      });
-      return;
-    }
-    if (req.method === 'POST' && req.url === '/v1/partitions/ws-demo/persons/alice/context') {
-      sendJson(res, 200, {
-        person: personFixture,
-        brief: {
-          project_id: 'prj_ws_demo',
-          person_id: 'prs_alice',
-          text: '# 人的简报',
-          max_chars: 500,
-          count: 1,
-          model: 'mnemos-condense',
-          cached: false,
-          generated_at: '2026-11-05T10:00:00.000Z',
-          recent: [],
         },
-        memories: [memoryFixture],
-        shared: [],
-        prompt: '# 人的上下文\n- Alice',
-        token_estimate: 128,
-        citations: ['mem_1'],
-        built_at: '2026-11-05T10:00:00.000Z',
-      });
-      return;
+        400,
+      );
     }
-    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/persons/alice/dream') {
-      sendJson(res, 200, {
-        person_id: 'prs_alice',
-        settings: { enabled: true, interval_minutes: 1440 },
-        pending_count: 2,
-        runs: [
-          {
-            id: 'dream_1',
-            project_id: 'prj_ws_demo',
-            partition_id: 'prj_ws_demo',
-            person_id: 'prs_alice',
-            trigger: 'manual',
-            status: 'completed',
-            input_count: 2,
-            insight_count: 1,
-            started_at: '2026-11-05T08:00:00.000Z',
-            finished_at: '2026-11-05T08:00:01.000Z',
-          },
-        ],
-      });
-      return;
-    }
-    if (req.method === 'POST' && req.url === '/v1/partitions/ws-demo/persons/alice/dream/run') {
-      sendJson(res, 409, { error: { code: 'CONFLICT', message: '该人正在复盘总结，请稍后再试' } });
-      return;
-    }
-    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+    return json({ error: { code: 'NOT_FOUND', message: '记忆不存在' } }, 404, {
+      'x-request-id': 'req_header',
+    });
   });
-  try {
-    const client = clientFor(server);
+  const client = clientFor(mock);
 
-    const brief = await client.personBrief('ws-demo', 'alice', { force: true, maxChars: 800 });
-    assert.equal(brief.person_id, 'prs_alice');
-    assert.equal(brief.max_chars, 800);
-    assert.equal(brief.recent[0]?.person_id, 'prs_alice');
-    assert.equal(brief.recent[0]?.person_external_id, 'alice');
-    assert.equal(brief.recent[0]?.scope, 'person');
+  await assert.rejects(
+    () => client.memories.get('ws-demo', 'bad'),
+    (error: unknown) => {
+      assert.ok(error instanceof MnemosApiError);
+      assert.equal(error.status, 400);
+      assert.equal(error.code, 'VALIDATION_ERROR');
+      assert.equal(error.message, '参数不合法');
+      assert.equal(error.requestId, 'req_body');
+      assert.deepEqual(error.details, [{ path: 'query', message: '不能为空' }]);
+      return true;
+    },
+  );
 
-    const context = await client.personContext('ws-demo', 'alice', { query: '偏好', budgetTokens: 800 });
-    assert.equal(server.requests[1]?.url, '/v1/partitions/ws-demo/persons/alice/context');
-    assert.deepEqual(JSON.parse(server.requests[1]?.body ?? '{}'), { query: '偏好', budget_tokens: 800 });
-    assert.equal(context.person.external_id, 'alice');
-    assert.equal(context.memories[0]?.content, memoryFixture.content);
-    assert.equal(context.token_estimate, 128);
-    assert.equal(context.built_at, '2026-11-05T10:00:00.000Z');
-
-    const status = await client.personDream('ws-demo', 'alice');
-    assert.equal(status.person_id, 'prs_alice');
-    assert.equal(status.pending_count, 2);
-    assert.equal(status.runs[0]?.person_id, 'prs_alice');
-
-    // 正在做梦 → 409，SDK 回读状态并返回 { run: null, status }。
-    const busy = await client.personDreamRun('ws-demo', 'alice');
-    assert.equal(busy.run, null);
-    assert.equal(busy.status.pending_count, 2);
-    assert.equal(server.requests.at(-1)?.method, 'GET');
-    assert.equal(server.requests.at(-1)?.url, '/v1/partitions/ws-demo/persons/alice/dream');
-  } finally {
-    await server.close();
-  }
+  await assert.rejects(
+    () => client.memories.get('ws-demo', 'missing'),
+    (error: unknown) => {
+      assert.ok(error instanceof MnemosApiError);
+      assert.equal(error.status, 404);
+      assert.equal(error.code, 'NOT_FOUND');
+      assert.equal(error.requestId, 'req_header');
+      return true;
+    },
+  );
 });
 
-test('人级记忆：personId/scope/sessionId 序列化、分区路径与详情/更新/删除路由', async () => {
-  const server = await startMock((req, res) => {
-    if (req.method === 'POST' && req.url === '/v1/partitions/ws-demo/memories') {
-      sendJson(res, 200, {
-        results: [memoryFixture],
-        events: [{ type: 'ADD', memory_id: 'mem_1', content: memoryFixture.content, at: '2026-11-05T10:00:00.000Z' }],
-        extracted: 1,
-        merged: 0,
-        skipped: 0,
-        took_ms: 4,
-      });
-      return;
+/* ------------------------------------------------------------------ */
+/* 8. 重试 / 幂等 / 超时 / 取消                                        */
+/* ------------------------------------------------------------------ */
+
+test('429：按 Retry-After 重试后成功', async () => {
+  const mock = createFetchMock((_call, index) => {
+    if (index === 0) {
+      return json(
+        { error: { code: 'RATE_LIMITED', message: '请求过于频繁', requestId: 'req_429' } },
+        429,
+        { 'retry-after': '0' },
+      );
     }
-    if (
-      req.method === 'GET' &&
-      req.url ===
-        '/v1/partitions/ws-demo/memories?person_id=alice&scope=person&status=active&q=%E7%89%9B%E5%A5%B6&sort=recent&include_private=true&page=1&page_size=5'
-    ) {
-      sendJson(res, 200, {
-        results: [memoryFixture],
-        items: [memoryFixture],
-        count: 1,
-        total: 1,
-        page: 1,
-        page_size: 5,
-        total_pages: 1,
-      });
-      return;
-    }
-    if (req.method === 'POST' && req.url === '/v1/partitions/ws-demo/memories/search') {
-      sendJson(res, 200, {
-        results: [{ ...memoryFixture, score: 0.8, signals: {}, matched_on: ['semantic'] }],
-        count: 1,
-        total: 1,
-        took_ms: 5,
-        signals: { strategy: 'hybrid' },
-      });
-      return;
-    }
-    if (req.method === 'GET' && req.url === '/v1/partitions/ws-demo/memories/mem_1') {
-      sendJson(res, 200, { ...memoryFixture, history: [], entities: [], relations: [], neighbors: [] });
-      return;
-    }
-    if (req.method === 'PATCH' && req.url === '/v1/partitions/ws-demo/memories/mem_1') {
-      sendJson(res, 200, { ...memoryFixture, content: '更新后的正文' });
-      return;
-    }
-    if (req.method === 'DELETE' && req.url === '/v1/partitions/ws-demo/memories/mem_1') {
-      sendJson(res, 200, { message: 'deleted', ok: true });
-      return;
-    }
-    sendJson(res, 404, { error: { code: 'not_found', message: '未实现' } });
+    return json({ items: [personFixture], next_cursor: null });
   });
-  try {
-    const client = clientFor(server);
+  const client = clientFor(mock, { maxRetries: 2 });
 
-    const added = await client.memories.add({
-      partition: 'ws-demo',
-      text: 'Alice 对牛奶过敏',
-      personId: 'alice',
-      scope: 'person',
-      sessionId: 'sess_1',
-      category: 'constraint',
-      tags: ['过敏'],
-    });
-    assert.equal(server.requests[0]?.url, '/v1/partitions/ws-demo/memories');
-    assert.deepEqual(JSON.parse(server.requests[0]?.body ?? '{}'), {
-      text: 'Alice 对牛奶过敏',
-      person_id: 'alice',
-      scope: 'person',
-      session_id: 'sess_1',
-      category: 'constraint',
-      tags: ['过敏'],
-    });
-    assert.equal(added.took_ms, 4);
-    assert.equal(added.results[0]?.id, 'mem_1');
-
-    const list = await client.memories.list({
-      partition: 'ws-demo',
-      personId: 'alice',
-      scope: 'person',
-      status: 'active',
-      q: '牛奶',
-      sort: 'recent',
-      includePrivate: true,
-      page: 1,
-      pageSize: 5,
-    });
-    assert.equal(list.count, 1);
-    assert.equal(list.total_pages, 1);
-    assert.equal(list.results[0]?.id, 'mem_1');
-
-    const search = await client.memories.search({
-      partition: 'ws-demo',
-      query: '牛奶',
-      personExternalId: 'alice',
-      scope: 'person',
-      category: 'constraint',
-      topK: 5,
-    });
-    assert.deepEqual(JSON.parse(server.requests[2]?.body ?? '{}'), {
-      query: '牛奶',
-      person_id: 'alice',
-      scope: 'person',
-      category: 'constraint',
-      top_k: 5,
-    });
-    assert.equal(search.results[0]?.score, 0.8);
-
-    const detail = await client.memories.get('mem_1', { partition: 'ws-demo' });
-    assert.equal(server.requests[3]?.url, '/v1/partitions/ws-demo/memories/mem_1');
-    assert.equal(detail.id, 'mem_1');
-
-    const updated = await client.memories.update(
-      'mem_1',
-      { text: '更新后的正文', category: 'fact', importance: 0.5 },
-      { partition: 'ws-demo' },
-    );
-    assert.equal(server.requests[4]?.method, 'PATCH');
-    assert.deepEqual(JSON.parse(server.requests[4]?.body ?? '{}'), {
-      text: '更新后的正文',
-      content: '更新后的正文',
-      category: 'fact',
-      importance: 0.5,
-    });
-    assert.equal(updated.memory?.content, '更新后的正文');
-
-    const removed = await client.memories.delete('mem_1', { partition: 'ws-demo' });
-    assert.equal(server.requests[5]?.method, 'DELETE');
-    assert.equal(removed.ok, true);
-  } finally {
-    await server.close();
-  }
+  const page = await client.persons.list('ws-demo');
+  assert.equal(mock.calls.length, 2);
+  assert.equal(page.items[0]?.id, 'per_1');
 });
 
-test('人级字段缺少 partition 时抛 TypeError（避免旧端点静默忽略）', async () => {
-  const server = await startMock((req, res) => {
-    sendJson(res, 200, { results: [], count: 0, page: 1, page_size: 20 });
+test('503：GET 指数退避重试', async () => {
+  const mock = createFetchMock((_call, index) => {
+    if (index === 0) return json({ error: { code: 'SERVICE_UNAVAILABLE', message: '稍后重试' } }, 503);
+    return json({ items: [], next_cursor: null });
   });
-  try {
-    const client = clientFor(server);
-    await assert.rejects(() => client.memories.add({ text: 'x', personId: 'alice' }), /partition/);
-    await assert.rejects(() => client.memories.add({ text: 'x', category: 'fact' }), /partition/);
-    await assert.rejects(() => client.memories.search({ query: 'x', scope: 'person' }), /partition/);
-    await assert.rejects(() => client.memories.list({ scope: 'person' }), /partition/);
-    assert.equal(server.requests.length, 0, '非中立端点参数不应发出请求');
+  const client = clientFor(mock, { maxRetries: 1 });
 
-    // 旧端点仍按原路径工作。
-    const legacy = await client.memories.list({ userId: 'u-1' });
-    assert.equal(legacy.count, 0);
-    assert.equal(server.requests[0]?.url, '/v1/memories?user_id=u-1');
-  } finally {
-    await server.close();
-  }
+  const startedAt = Date.now();
+  const page = await client.persons.list('ws-demo');
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(mock.calls.length, 2);
+  assert.ok(elapsed >= 150, `应至少经历一次指数退避，实际 ${elapsed}ms`);
+  assert.equal(page.items.length, 0);
+});
+
+test('非幂等 POST 不重试（即使带 idempotencyKey）；只读检索 POST 可重试', async () => {
+  // 写记忆：服务端 503 时只尝试一次，避免重复写入。
+  const addMock = createFetchMock(() =>
+    json({ error: { code: 'SERVICE_UNAVAILABLE', message: '稍后重试' } }, 503),
+  );
+  const addClient = clientFor(addMock, { maxRetries: 2 });
+  await assert.rejects(
+    () =>
+      addClient.memories.add(
+        'ws-demo',
+        'user-1',
+        { text: '不会重试' },
+        { idempotencyKey: 'idem-key-12345678' },
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof MnemosApiError);
+      assert.equal(error.status, 503);
+      return true;
+    },
+  );
+  assert.equal(addMock.calls.length, 1);
+  assert.equal(addMock.calls[0]?.headers.get('idempotency-key'), 'idem-key-12345678');
+
+  // 检索是只读 POST，允许指数退避重试。
+  const searchMock = createFetchMock((_call, index) => {
+    if (index === 0) return json({ error: { code: 'SERVICE_UNAVAILABLE', message: '稍后重试' } }, 503);
+    return json({ results: [memoryFixture], took_ms: 2, next_cursor: null });
+  });
+  const searchClient = clientFor(searchMock, { maxRetries: 2 });
+  const response = await searchClient.memories.search('ws-demo', { query: '评审' });
+
+  assert.equal(searchMock.calls.length, 2);
+  assert.equal(searchMock.calls[0]?.headers.get('idempotency-key'), null);
+  assert.equal(response.results[0]?.id, 'mem_1');
+});
+
+test('超时：单次尝试超时映射为 code=timeout', async () => {
+  let calls = 0;
+  // 模拟真实 fetch：AbortSignal 触发时 reject。
+  const timeoutFetch: typeof fetch = (_input, init) =>
+    new Promise<Response>((_resolve, reject) => {
+      calls += 1;
+      init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      });
+    });
+
+  const client = new MnemosClient({
+    apiKey: 'mnemos_live_demo_v6',
+    baseUrl: 'http://mnemos.test',
+    fetchImpl: timeoutFetch,
+    timeoutMs: 20,
+    maxRetries: 0,
+  });
+
+  await assert.rejects(
+    () => client.health(),
+    (error: unknown) => {
+      assert.ok(error instanceof MnemosApiError);
+      assert.equal(error.status, 0);
+      assert.equal(error.code, 'timeout');
+      return true;
+    },
+  );
+  assert.equal(calls, 1);
+});
+
+test('取消：已 abort 的 signal 不发起请求', async () => {
+  const mock = createFetchMock(() => json(personFixture));
+  const client = clientFor(mock);
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    () => client.persons.get('ws-demo', 'per_1', { signal: controller.signal }),
+    (error: unknown) => {
+      assert.ok(error instanceof MnemosApiError);
+      assert.equal(error.code, 'aborted');
+      assert.equal(error.status, 0);
+      return true;
+    },
+  );
+  assert.equal(mock.calls.length, 0);
+});
+
+/* ------------------------------------------------------------------ */
+/* 9. 构造参数校验                                                     */
+/* ------------------------------------------------------------------ */
+
+test('构造参数：apiKey / baseUrl / timeoutMs 校验', () => {
+  assert.throws(() => new MnemosClient({ apiKey: '' }), /apiKey 不能为空/);
+  assert.throws(
+    () => new MnemosClient({ apiKey: 'k', baseUrl: 'not-a-url' }),
+    /baseUrl 不是合法 URL/,
+  );
+  assert.throws(
+    () => new MnemosClient({ apiKey: 'k', timeoutMs: 0 }),
+    /timeoutMs 必须为正数/,
+  );
+  assert.throws(
+    () => new MnemosClient({ apiKey: 'k', maxRetries: -1 }),
+    /maxRetries 必须为非负整数/,
+  );
 });

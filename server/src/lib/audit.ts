@@ -4,7 +4,7 @@ import { newId, nowIso } from './ids.ts';
 
 export interface AuditInput {
   orgId?: string;
-  projectId?: string;
+  partitionId?: string;
   actor: Actor;
   action: string;
   resourceType: string;
@@ -15,7 +15,7 @@ export interface AuditInput {
 export interface AuditRow {
   id: string;
   org_id: string | null;
-  project_id: string | null;
+  partition_id: string | null;
   actor_type: string;
   actor_id: string | null;
   actor_label: string;
@@ -32,13 +32,13 @@ export function writeAudit(db: DatabaseSync, input: AuditInput): string {
   const id = newId('aud');
   db.prepare(
     `INSERT INTO audit_logs
-      (id, org_id, project_id, actor_type, actor_id, actor_label, action,
+      (id, org_id, partition_id, actor_type, actor_id, actor_label, action,
        resource_type, resource_id, detail, ip, user_agent, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     input.orgId ?? null,
-    input.projectId ?? null,
+    input.partitionId ?? null,
     input.actor.type,
     input.actor.id,
     input.actor.label,

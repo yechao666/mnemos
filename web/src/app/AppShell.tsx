@@ -10,13 +10,13 @@ import { routeTitle } from '../components/shell/nav.ts';
 /** 控制台外壳：侧边栏 + 顶栏 + 命令面板 + 内容区。 */
 export function AppShell() {
   const location = useLocation();
-  const { projects } = useAuth();
+  const { partitions } = useAuth();
   const isMobile = useMediaQuery('(max-width: 1024px)');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
-  useDocumentTitle(routeTitle(location.pathname, projects));
+  useDocumentTitle(routeTitle(location.pathname, partitions));
 
   // 路由变化后收起移动端抽屉与命令面板，避免遮挡新页面。
   useEffect(() => {

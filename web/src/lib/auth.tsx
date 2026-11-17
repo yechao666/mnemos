@@ -1,11 +1,12 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import type { Org, Project, User } from '@shared';
+import type { Org, Partition, User } from './types.ts';
 import { api, getToken, setToken, UNAUTHORIZED_EVENT } from './api.ts';
 
 export interface AuthState {
   user: User | null;
   org: Org | null;
-  projects: Project[];
+  /** v6：组织下的分区（取代 v5 的 projects） */
+  partitions: Partition[];
   loading: boolean;
   error: string | null;
 }
@@ -18,29 +19,25 @@ export interface AuthApi extends AuthState {
 
 const AuthContext = createContext<AuthApi | null>(null);
 
+const EMPTY: AuthState = { user: null, org: null, partitions: [], loading: false, error: null };
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AuthState>({
-    user: null,
-    org: null,
-    projects: [],
+    ...EMPTY,
     loading: Boolean(getToken()),
-    error: null,
   });
 
   const refresh = useCallback(async () => {
     if (!getToken()) {
-      setState({ user: null, org: null, projects: [], loading: false, error: null });
+      setState(EMPTY);
       return;
     }
     try {
       const me = await api.auth.me();
-      setState({ user: me.user, org: me.org, projects: me.projects, loading: false, error: null });
+      setState({ user: me.user, org: me.org, partitions: me.partitions, loading: false, error: null });
     } catch (error) {
       setState({
-        user: null,
-        org: null,
-        projects: [],
-        loading: false,
+        ...EMPTY,
         error: error instanceof Error ? error.message : '会话已失效',
       });
     }
@@ -53,7 +50,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const onUnauthorized = () => {
       setToken(null);
-      setState({ user: null, org: null, projects: [], loading: false, error: '登录状态已过期，请重新登录' });
+      setState({ ...EMPTY, error: '登录状态已过期，请重新登录' });
     };
     window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
@@ -64,7 +61,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setToken(result.token);
     setState((prev) => ({ ...prev, user: result.user, org: result.org, loading: true, error: null }));
     const me = await api.auth.me();
-    setState({ user: me.user, org: me.org, projects: me.projects, loading: false, error: null });
+    setState({ user: me.user, org: me.org, partitions: me.partitions, loading: false, error: null });
   }, []);
 
   const logout = useCallback(async () => {
@@ -74,7 +71,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       /* 会话可能已过期 */
     }
     setToken(null);
-    setState({ user: null, org: null, projects: [], loading: false, error: null });
+    setState(EMPTY);
   }, []);
 
   const value = useMemo<AuthApi>(() => ({ ...state, login, logout, refresh }), [state, login, logout, refresh]);

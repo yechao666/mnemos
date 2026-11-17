@@ -1,16 +1,14 @@
-import { createMemoryService } from './engine/index.ts';
-import { assertEnv, ensureDir, loadEnv } from './env.ts';
-import { getSchemaVersion, migrate, openDatabase, tableCount } from './db/index.ts';
-import { createHttpServer, drainConnections } from './http/server.ts';
-import { EventBus } from './lib/bus.ts';
-import { createPlatform } from './platform/index.ts';
-import { createWebhookDispatcher } from './webhooks/index.ts';
-import { startDreamScheduler } from './engine/dream-scheduler.ts';
-import { initObservability } from './observability/otel.ts';
-import type { AppContext } from './contracts.ts';
 import { APP_VERSION } from '../../shared/src/constants.ts';
-import { runSeed } from './seed/seed.ts';
+import type { AppContext } from './contracts.ts';
+import { getSchemaVersion, migrate, openDatabase, tableCount } from './db/index.ts';
+import { createMemoryService } from './engine/index.ts';
+import { startDreamScheduler } from './engine/dream-scheduler.ts';
+import { assertEnv, ensureDir, loadEnv } from './env.ts';
+import { createHttpServer, drainConnections } from './http/server.ts';
+import { initObservability } from './observability/otel.ts';
+import { createPlatform } from './platform/index.ts';
 import { bootstrapAdminIfNeeded } from './bootstrap.ts';
+import { runSeed } from './seed/seed.ts';
 
 const env = loadEnv();
 
@@ -25,21 +23,22 @@ ensureDir(env.dataDir);
 ensureDir(env.backupDir);
 
 const db = openDatabase(env.dbPath);
-migrate(db);
+try {
+  migrate(db);
+} catch (error) {
+  console.error(`[mnemos] 数据库初始化失败：${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}
 
-const bus = new EventBus();
-const engine = createMemoryService(db, { bus, llm: env.llm });
-const platform = createPlatform({ db, env, bus });
+const platform = createPlatform({ db, env });
 const { logger, metrics } = platform;
-
+const engine = createMemoryService(db, { llm: env.llm });
 const observability = await initObservability(env, logger);
-const webhooks = createWebhookDispatcher({ db, env, bus, logger, metrics });
 
 const context: AppContext = {
   db,
   engine,
   env,
-  bus,
   startedAt: Date.now(),
   logger,
   metrics,
@@ -56,17 +55,15 @@ try {
 
   if (env.demoMode && tableCount(db, 'orgs') === 0) {
     logger.info('空数据库，写入演示数据集');
-    const summary = await runSeed({ db, engine, bus, env, log: (line) => logger.info(`seed: ${line}`) });
+    const summary = await runSeed({ db, engine, env, log: (line) => logger.info(`seed: ${line}`) });
     logger.info('演示数据就绪', {
-      projects: summary.projects,
-      agents: summary.agents,
-      tasks: summary.tasks,
+      partitions: summary.partitions,
+      persons: summary.persons,
       memories: summary.memories,
-      usageEvents: summary.usageEvents,
     });
     if (summary.demoApiKey) {
-      logger.warn('已生成演示 API Key，请勿在生产环境保留', {
-        project: summary.demoApiKey.projectSlug,
+      logger.warn('已生成演示分区 API Key，请勿在生产环境保留', {
+        partition: summary.demoApiKey.partitionSlug,
         keyPrefix: summary.demoApiKey.secret.slice(0, 18),
       });
     }
@@ -84,13 +81,11 @@ try {
 }
 
 const server = createHttpServer(context);
-
-/** 做梦调度器的停止函数（listen 成功后赋值，停机时调用）。 */
 let stopDreamScheduler: () => void = () => {};
 
 server.listen(env.port, env.host, () => {
   const base = `http://${env.host}:${env.port}`;
-  logger.info('Mnemos 已启动', {
+  logger.info('Mnemos v6 已启动', {
     url: base,
     api: `${base}/v1`,
     version: APP_VERSION,
@@ -98,12 +93,11 @@ server.listen(env.port, env.host, () => {
     db: env.dbPath,
     logLevel: env.logLevel,
     metrics: env.metricsEnabled,
-    quotaEnforce: env.quotaEnforce,
   });
-  // 启动 60s 后首次维护，之后按间隔重复
-  platform.maintenance.start();
-  webhooks.start();
-  stopDreamScheduler = startDreamScheduler({ db, env, engine, logger, metrics });
+  if (env.dreamSchedulerEnabled) {
+    stopDreamScheduler = startDreamScheduler({ db, engine, logger, tickMs: env.dreamTickMs });
+    logger.info('dream.scheduler_started', { tickMs: env.dreamTickMs });
+  }
 });
 
 let shuttingDown = false;
@@ -120,11 +114,9 @@ async function shutdown(signal: string): Promise<void> {
   forceTimer.unref();
 
   try {
-    // 先结束 keep-alive/SSE，否则 server.close() 会一直等待长连接
     const drain = drainConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await drain;
-    webhooks.stop();
     stopDreamScheduler();
     await observability.shutdown();
     await platform.shutdown();

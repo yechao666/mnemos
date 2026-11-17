@@ -3,30 +3,19 @@ import type { ReactNode } from 'react';
 import { useAuth } from '../lib/auth.tsx';
 import { AppShell } from './AppShell.tsx';
 import { LoginPage } from '../pages/LoginPage.tsx';
-import { DashboardPage } from '../pages/DashboardPage.tsx';
-import { ProjectsPage } from '../pages/ProjectsPage.tsx';
-import { TeamPage } from '../pages/TeamPage.tsx';
+import { PartitionsPage } from '../pages/PartitionsPage.tsx';
+import { PartitionLayout } from '../pages/PartitionLayout.tsx';
+import { PartitionOverviewPage } from '../pages/PartitionOverviewPage.tsx';
+import { PersonsPage } from '../pages/PersonsPage.tsx';
+import { PersonDetailPage } from '../pages/PersonDetailPage.tsx';
+import { MemoriesPage } from '../pages/MemoriesPage.tsx';
+import { KeysPage } from '../pages/KeysPage.tsx';
+import { UsagePage } from '../pages/UsagePage.tsx';
+import { AuditPage } from '../pages/AuditPage.tsx';
+import { SettingsPage } from '../pages/SettingsPage.tsx';
+import { ApiDocsPage } from '../pages/ApiDocsPage.tsx';
 import { OrgSettingsPage } from '../pages/OrgSettingsPage.tsx';
 import { NotFoundPage } from '../pages/NotFoundPage.tsx';
-import { OpsPage } from '../pages/OpsPage.tsx';
-import { ProjectLayout } from '../pages/ProjectLayout.tsx';
-import { ProjectOverviewPage } from '../pages/project/ProjectOverviewPage.tsx';
-import { MemoriesPage } from '../pages/project/MemoriesPage.tsx';
-import { PersonsPage } from '../pages/project/PersonsPage.tsx';
-import { PersonDetailPage } from '../pages/project/PersonDetailPage.tsx';
-import { RecordsPage } from '../pages/project/RecordsPage.tsx';
-import { ProjectMembersPage } from '../pages/project/ProjectMembersPage.tsx';
-import { RetrospectivePage } from '../pages/project/RetrospectivePage.tsx';
-import { GraphPage } from '../pages/project/GraphPage.tsx';
-import { AgentsPage } from '../pages/project/AgentsPage.tsx';
-import { TasksPage } from '../pages/project/TasksPage.tsx';
-import { WebhooksPage } from '../pages/project/WebhooksPage.tsx';
-import { PlaygroundPage } from '../pages/project/PlaygroundPage.tsx';
-import { KeysPage } from '../pages/project/KeysPage.tsx';
-import { UsagePage } from '../pages/project/UsagePage.tsx';
-import { AuditPage } from '../pages/project/AuditPage.tsx';
-import { SettingsPage } from '../pages/project/SettingsPage.tsx';
-import { ApiDocsPage } from '../pages/project/ApiDocsPage.tsx';
 
 function BootScreen() {
   return (
@@ -50,6 +39,7 @@ function RequireAuth({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+/** v6 路由：组织 → 分区 → 人 → 记忆（旧领域路由一律删除）。 */
 export function AppRoutes() {
   return (
     <Routes>
@@ -61,29 +51,19 @@ export function AppRoutes() {
           </RequireAuth>
         }
       >
-        <Route path="/" element={<DashboardPage />} />
-        <Route path="/projects" element={<ProjectsPage />} />
-        <Route path="/projects/:projectId" element={<ProjectLayout />}>
-          <Route index element={<ProjectOverviewPage />} />
-          <Route path="memories" element={<MemoriesPage />} />
+        <Route path="/" element={<Navigate to="/partitions" replace />} />
+        <Route path="/partitions" element={<PartitionsPage />} />
+        <Route path="/partitions/:partitionId" element={<PartitionLayout />}>
+          <Route index element={<PartitionOverviewPage />} />
           <Route path="persons" element={<PersonsPage />} />
           <Route path="persons/:personRef" element={<PersonDetailPage />} />
-          <Route path="records" element={<RecordsPage />} />
-          <Route path="members" element={<ProjectMembersPage />} />
-          <Route path="retrospective" element={<RetrospectivePage />} />
-          <Route path="graph" element={<GraphPage />} />
-          <Route path="agents" element={<AgentsPage />} />
-          <Route path="tasks" element={<TasksPage />} />
-          <Route path="webhooks" element={<WebhooksPage />} />
-          <Route path="playground" element={<PlaygroundPage />} />
+          <Route path="memories" element={<MemoriesPage />} />
           <Route path="keys" element={<KeysPage />} />
           <Route path="usage" element={<UsagePage />} />
           <Route path="audit" element={<AuditPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="docs" element={<ApiDocsPage />} />
         </Route>
-        <Route path="/team" element={<TeamPage />} />
-        <Route path="/ops" element={<OpsPage />} />
         <Route path="/org" element={<OrgSettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>

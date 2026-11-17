@@ -1,195 +1,314 @@
-import type { ReactNode } from 'react';
-import { APP_VERSION, DEFAULT_PROJECT_SETTINGS } from '@shared';
-import { Badge, Button, Callout, Card, EmptyState, PageHead, Skeleton, type Tone } from '@ui';
+import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import type { OrgUser, Role } from '@lib/types.ts';
+import { ROLE_LABEL, ROLE_RANK } from '@lib/constants.ts';
+import { toneForRole } from '@lib/tone.ts';
+import {
+  Avatar,
+  Badge,
+  Button,
+  Callout,
+  Card,
+  ConfirmDialog,
+  EmptyState,
+  ErrorState,
+  Field,
+  IconButton,
+  Input,
+  Modal,
+  PageHead,
+  SectionHead,
+  Select,
+  Table,
+  useToast,
+  type Column,
+} from '@ui';
 import { api } from '@lib/api.ts';
 import { useAsync } from '@lib/hooks.ts';
 import { useAuth } from '@lib/auth.tsx';
-import { fmtDate } from '@lib/format.ts';
-import { ROLE_LABEL } from '@lib/tone.ts';
-import { OrgKeysSection } from '../components/project-ops/keys/OrgKeysSection.tsx';
+import { fmtFullDateTime, fmtRelative } from '@lib/format.ts';
 
-function fmtUptime(ms: number | null | undefined): string {
-  if (ms == null || !Number.isFinite(ms) || ms < 0) return '—';
-  const totalMinutes = Math.floor(ms / 60_000);
-  const days = Math.floor(totalMinutes / 1440);
-  const hours = Math.floor((totalMinutes % 1440) / 60);
-  const minutes = totalMinutes % 60;
-  if (days > 0) return `${days} 天 ${hours} 小时`;
-  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
-  return `${minutes} 分钟`;
-}
+const MANAGED_ROLES: { value: Role; label: string }[] = [
+  { value: 'admin', label: '管理员' },
+  { value: 'developer', label: '开发者' },
+  { value: 'viewer', label: '只读' },
+];
 
-function Metric({ label, value, mono }: { label: ReactNode; value: ReactNode; mono?: boolean }) {
-  return (
-    <div className="metric">
-      <span className="metric-label">{label}</span>
-      <span className={`metric-value${mono ? ' mono' : ''}`}>{value}</span>
-    </div>
-  );
-}
-
+/** 组织设置：组织资料 + 控制台账号（登录用，不是「人」）。 */
 export function OrgSettingsPage() {
-  const { org, user, projects } = useAuth();
-  const health = useAsync(() => api.health(), []);
-  // 组织密钥仅组织所有者可创建/查看/吊销。
-  const isOwner = user?.role === 'owner';
+  const navigate = useNavigate();
+  const { user, org, partitions, refresh } = useAuth();
+  const toast = useToast();
+  const isAdmin = Boolean(user && ROLE_RANK[user.role] >= ROLE_RANK.admin);
 
-  const healthTone: Tone = health.error ? 'red' : health.data ? (health.data.ok ? 'green' : 'amber') : 'slate';
-  const healthLabel = health.loading
-    ? '检测中'
-    : health.error
-      ? '不可用'
-      : health.data
-        ? health.data.ok
-          ? '运行正常'
-          : '状态异常'
-        : '未知';
+  const users = useAsync(() => api.org.users.list(), [], isAdmin);
+
+  const [createOpen, setCreateOpen] = useState(false);
+  const [tempPassword, setTempPassword] = useState<{ email: string; password: string } | null>(null);
+  const [resetTarget, setResetTarget] = useState<OrgUser | null>(null);
+  const [resetting, setResetting] = useState(false);
+
+  const resetPassword = async () => {
+    if (!resetTarget) return;
+    setResetting(true);
+    try {
+      const result = await api.org.users.resetPassword(resetTarget.id);
+      setTempPassword({ email: resetTarget.email, password: result.temporaryPassword });
+      setResetTarget(null);
+      toast.success('已生成临时密码');
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : '重置密码失败');
+    } finally {
+      setResetting(false);
+    }
+  };
+
+  const columns: Column<OrgUser>[] = [
+    {
+      key: 'name',
+      header: '账号',
+      render: (row) => (
+        <div className="hstack gap-10" style={{ minWidth: 0 }}>
+          <Avatar name={row.name} tone={toneForRole(row.role)} size="sm" />
+          <div style={{ minWidth: 0 }}>
+            <div className="strong truncate">{row.name}</div>
+            <div className="tiny dim truncate">{row.email}</div>
+          </div>
+        </div>
+      ),
+    },
+    {
+      key: 'role',
+      header: '角色',
+      width: 110,
+      render: (row) => <Badge tone={toneForRole(row.role)} size="sm">{ROLE_LABEL[row.role]}</Badge>,
+    },
+    {
+      key: 'status',
+      header: '状态',
+      width: 96,
+      render: (row) => (
+        <Badge tone={row.status === 'active' ? 'green' : 'slate'} size="sm" dot>
+          {row.status === 'active' ? '启用' : '禁用'}
+        </Badge>
+      ),
+    },
+    {
+      key: 'lastSeen',
+      header: '最近登录',
+      width: 130,
+      render: (row) => (
+        <span className="tiny dim" title={row.lastSeenAt ? fmtFullDateTime(row.lastSeenAt) : undefined}>
+          {row.lastSeenAt ? fmtRelative(row.lastSeenAt) : '从未'}
+        </span>
+      ),
+    },
+    {
+      key: 'actions',
+      header: '',
+      width: 96,
+      align: 'right',
+      render: (row) => (
+        <div className="hstack gap-2" style={{ justifyContent: 'flex-end' }}>
+          <IconButton icon="refresh" label="重置密码" size="sm" disabled={!isAdmin} onClick={() => setResetTarget(row)} />
+        </div>
+      ),
+    },
+  ];
 
   return (
     <div className="page">
       <PageHead
         eyebrow="组织"
         title="组织设置"
-        desc={
-          org
-            ? `${org.name} 的基础资料、平台诊断与组织级密钥（组织密钥仅所有者可管理）`
-            : '组织资料、平台诊断与组织级密钥'
-        }
+        desc="组织级资料与登录账号。控制台账号只用于登录与权限；记忆的「人」是数据主体，在分区内管理。"
         actions={
-          <Button icon="refresh" loading={health.loading} onClick={() => void health.refresh()}>
-            刷新诊断
-          </Button>
+          isAdmin ? (
+            <Button variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>
+              新建控制台账号
+            </Button>
+          ) : null
         }
       />
 
-      {!org ? (
-        <Card pad>
-          <EmptyState
-            icon="settings"
-            title="组织资料不可用"
-            description="未能读取到当前组织档案，请刷新会话或稍后重试。"
-          />
+      <Card pad>
+        <SectionHead
+          title="组织资料"
+          desc="组织由部署初始化创建；分区、密钥与账号都归属当前组织。"
+          actions={<Badge tone="violet" size="sm">{org?.plan ?? '—'}</Badge>}
+        />
+        <div className="grid grid-4 mt-12">
+          <div>
+            <div className="tiny dim">组织名称</div>
+            <div className="strong mt-4">{org?.name ?? '—'}</div>
+          </div>
+          <div>
+            <div className="tiny dim">slug</div>
+            <div className="mono small mt-4">{org?.slug ?? '—'}</div>
+          </div>
+          <div>
+            <div className="tiny dim">分区</div>
+            <div className="strong mt-4">{partitions.length} 个</div>
+          </div>
+          <div>
+            <div className="tiny dim">当前账号</div>
+            <div className="strong mt-4">{user ? `${user.name} · ${ROLE_LABEL[user.role]}` : '—'}</div>
+          </div>
+        </div>
+        <div className="hstack gap-8 wrap mt-16">
+          <Button size="sm" icon="layers" onClick={() => navigate('/partitions')}>分区列表</Button>
+          <Button
+            size="sm"
+            icon="key"
+            onClick={() => navigate(partitions[0] ? `/partitions/${partitions[0].id}/keys` : '/partitions')}
+          >
+            组织密钥
+          </Button>
+          <span className="tiny dim">组织密钥在任一分区的「密钥」页管理（仅 owner）。</span>
+        </div>
+      </Card>
+
+      {isAdmin ? (
+        <Card>
+          <div style={{ padding: '14px 16px 0' }}>
+            <SectionHead
+              title="控制台账号"
+              desc="登录控制台的组织成员；与记忆数据里的「人」无关。"
+              actions={<IconButton icon="refresh" label="刷新账号" size="sm" disabled={users.loading} onClick={() => void users.refresh()} />}
+            />
+          </div>
+          {users.error && !users.data ? (
+            <div style={{ padding: 16 }}>
+              <ErrorState message={users.error} onRetry={() => void users.refresh()} />
+            </div>
+          ) : (
+            <Table
+              columns={columns}
+              rows={users.data ?? []}
+              rowKey={(row) => row.id}
+              loading={users.loading && !users.data}
+              empty={<EmptyState icon="users" title="暂无控制台账号" description="创建账号后即可登录控制台。" compact />}
+            />
+          )}
         </Card>
       ) : (
-        <>
-          <div className="grid grid-2">
-            <Card>
-              <div className="card-head">
-                <div>
-                  <div className="card-title">组织资料</div>
-                  <div className="card-sub">由服务端组织档案同步，当前为只读</div>
-                </div>
-                <Badge tone="violet" size="sm">{org.plan}</Badge>
-              </div>
-              <div className="card-body">
-                <div className="metric-grid">
-                  <Metric label="组织名称" value={org.name} />
-                  <Metric label="组织 slug" value={org.slug} mono />
-                  <Metric label="计划" value={org.plan} />
-                  <Metric label="创建时间" value={fmtDate(org.createdAt)} />
-                  <Metric label="组织 ID" value={org.id} mono />
-                  <Metric
-                    label="当前账号"
-                    value={user ? `${user.name} · ${ROLE_LABEL[user.role]}` : '—'}
-                  />
-                </div>
-              </div>
-            </Card>
-
-            <Card>
-              <div className="card-head">
-                <div>
-                  <div className="card-title">平台诊断</div>
-                  <div className="card-sub">实时读取 /api/health</div>
-                </div>
-                <Badge tone={healthTone} size="sm" dot>{healthLabel}</Badge>
-              </div>
-              <div className="card-body">
-                {health.loading && !health.data ? (
-                  <div className="vstack gap-10">
-                    <Skeleton w="55%" h={12} />
-                    <Skeleton w="42%" h={12} />
-                    <Skeleton w="66%" h={12} />
-                  </div>
-                ) : health.error ? (
-                  <Callout tone="red" icon="alert">{health.error}</Callout>
-                ) : (
-                  <div className="metric-grid">
-                    <Metric label="服务版本" value={health.data?.version ?? '—'} mono />
-                    <Metric label="运行时长" value={fmtUptime(health.data?.uptimeMs)} />
-                    <Metric label="健康检查" value={health.data?.ok ? '通过' : '异常'} />
-                    <Metric label="接口地址" value="/api/health" mono />
-                  </div>
-                )}
-                <div className="divider mt-16" />
-                <div className="tiny dim mt-12">
-                  诊断结果用于排查控制台与记忆引擎的连通性；不可用时页面其余数据仍可只读浏览。
-                </div>
-              </div>
-            </Card>
-          </div>
-
-          {isOwner ? <OrgKeysSection projects={projects} /> : null}
-
-          <div className="grid grid-2">
-            <Card>
-              <div className="card-head">
-                <div>
-                  <div className="card-title">安全与合规</div>
-                  <div className="card-sub">平台内置策略，随项目设置生效</div>
-                </div>
-                <Badge tone="green" size="sm" dot>已启用</Badge>
-              </div>
-              <div className="card-body">
-                <div className="metric-grid">
-                  <Metric label="多项目隔离" value="记忆、密钥与用量按项目强制隔离" />
-                  <Metric label="审计日志" value="写操作全量留痕，可按项目检索与回放" />
-                  <Metric label="密钥作用域" value="读 / 写 / 图谱 / 管理四级作用域；组织密钥仅所有者可创建" />
-                  <Metric
-                    label="数据保留策略"
-                    value={`默认 ${DEFAULT_PROJECT_SETTINGS.retentionDays} 天，可按项目覆写`}
-                  />
-                </div>
-                <div className="mt-16">
-                  <Callout tone="slate" icon="lock">
-                    组织资料与平台诊断为只读；组织密钥仅所有者可在上方「组织密钥」区块管理。
-                    进入具体项目的「设置」可调整抽取模式、检索权重、保留天数与配额。
-                  </Callout>
-                </div>
-              </div>
-            </Card>
-
-            <Card>
-              <div className="card-head">
-                <div>
-                  <div className="card-title">环境</div>
-                  <div className="card-sub">当前控制台的运行环境信息</div>
-                </div>
-                <Badge tone="cyan" size="sm">同源部署</Badge>
-              </div>
-              <div className="card-body">
-                <div className="metric-grid">
-                  <Metric label="API 地址" value={window.location.origin} mono />
-                  <Metric label="控制台版本" value={APP_VERSION} mono />
-                  <Metric
-                    label="默认嵌入模型"
-                    value={DEFAULT_PROJECT_SETTINGS.embeddingModel}
-                    mono
-                  />
-                  <Metric
-                    label="检索默认值"
-                    value={`TopK ${DEFAULT_PROJECT_SETTINGS.topK} · 阈值 ${DEFAULT_PROJECT_SETTINGS.threshold}`}
-                  />
-                </div>
-                <div className="divider mt-16" />
-                <div className="tiny dim mt-12">
-                  嵌入模型可在项目级覆盖；不同区域的记忆不共享索引，跨项目检索需显式授权。
-                </div>
-              </div>
-            </Card>
-          </div>
-        </>
+        <Callout tone="slate" icon="info">
+          控制台账号管理需要管理员及以上权限。当前账号为「{user ? ROLE_LABEL[user.role] : '—'}」。
+        </Callout>
       )}
+
+      <CreateOrgUserModal
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        onCreated={async (email, temporaryPassword) => {
+          await users.refresh();
+          setTempPassword({ email, password: temporaryPassword });
+          await refresh();
+        }}
+      />
+
+      <Modal
+        open={tempPassword !== null}
+        onClose={() => setTempPassword(null)}
+        title="临时密码"
+        description="请把临时密码交给该账号本人，并提示登录后修改。密码只显示这一次。"
+        footer={<Button variant="ghost" onClick={() => setTempPassword(null)}>关闭</Button>}
+      >
+        <div className="vstack gap-12">
+          <Field label="账号"><Input readOnly value={tempPassword?.email ?? ''} /></Field>
+          <Field label="临时密码"><Input readOnly className="mono" value={tempPassword?.password ?? ''} /></Field>
+        </div>
+      </Modal>
+
+      <ConfirmDialog
+        open={resetTarget !== null}
+        onClose={() => setResetTarget(null)}
+        onConfirm={() => void resetPassword()}
+        title="重置账号密码"
+        description={resetTarget ? `将为 ${resetTarget.email} 生成新的临时密码，旧密码立即失效。` : undefined}
+        confirmLabel="重置密码"
+        loading={resetting}
+      />
     </div>
+  );
+}
+
+function CreateOrgUserModal({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: (email: string, temporaryPassword: string) => Promise<void>;
+}) {
+  const toast = useToast();
+  const [email, setEmail] = useState('');
+  const [name, setName] = useState('');
+  const [role, setRole] = useState<Role>('developer');
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setEmail('');
+    setName('');
+    setRole('developer');
+    setError(null);
+  }, [open]);
+
+  const submit = async () => {
+    if (submitting) return;
+    if (!email.trim() || !name.trim()) {
+      setError('请填写姓名与邮箱。');
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      const result = await api.org.users.create({ email: email.trim(), name: name.trim(), role });
+      toast.success('控制台账号已创建');
+      onClose();
+      await onCreated(result.user.email, result.temporaryPassword);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '创建失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="新建控制台账号"
+      description="账号用于登录控制台；记忆数据请通过「人（Person）」管理。"
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button variant="primary" icon="plus" loading={submitting} onClick={() => void submit()}>
+            创建账号
+          </Button>
+        </>
+      }
+    >
+      <div className="vstack gap-12">
+        <Field label="姓名" required htmlFor="org-user-name">
+          <Input id="org-user-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：周宁" autoFocus />
+        </Field>
+        <Field label="邮箱" required htmlFor="org-user-email">
+          <Input id="org-user-email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="ning.zhou@company.com" />
+        </Field>
+        <Field label="角色" htmlFor="org-user-role" hint="管理员可管理密钥、账号与设置；开发者可读写记忆；只读仅查看。">
+          <Select
+            id="org-user-role"
+            options={MANAGED_ROLES}
+            value={role}
+            onChange={(event) => setRole(event.target.value as Role)}
+          />
+        </Field>
+        {error ? <div className="field-error" role="alert">{error}</div> : null}
+      </div>
+    </Modal>
   );
 }

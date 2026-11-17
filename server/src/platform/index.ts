@@ -12,7 +12,6 @@ export interface CreatePlatformOptions {
 
 /**
  * 组装生产平台能力：日志、指标、维护调度、备份。
- * 维护调度在这里启动（main.ts 只负责构造上下文），shutdown() 停调度并 flush 日志。
  */
 export function createPlatform(deps: PlatformDeps, options: CreatePlatformOptions = {}): Platform {
   const startedAt = Date.now();
@@ -55,7 +54,7 @@ export { createMaintenanceController } from './maintenance.ts';
 export { createMetrics, HISTOGRAM_BUCKETS_MS } from './metrics.ts';
 export {
   assertQuota,
-  evaluateProjectQuota,
+  evaluatePartitionQuota,
   monthlyMemoryTokens,
   startOfNextUtcMonth,
   startOfUtcMonth,

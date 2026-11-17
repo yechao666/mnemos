@@ -1,8 +1,9 @@
 /**
- * dsh-mnemos-personal：把新版 Mnemos（中立记忆服务 v5）接入 dsh 的宿主侧 cordis 插件。
+ * dsh-mnemos-personal：把 Mnemos v6（中立记忆服务）接入 dsh 的宿主侧 cordis 插件。
  *
  * 做四件事：
- * 1. 注册 8 个 `mnemos_*` Agent 工具（分区 = 工作区、记忆按人组织，写 `/v1/partitions/:p/...`）；
+ * 1. 注册 8 个 `mnemos_*` Agent 工具（分区 = 工作区、记忆按人组织，写 `/v1/partitions/:p/...`，
+ *    人 / 记忆列表用 v6 游标分页）；
  * 2. 在系统提示里插一段说明，告诉 Agent「本工作区已绑定分区 <slug>，记忆按人组织；默认人 <personId>」；
  * 3. 把配置页挂进 dsh 设置（导出 `Config` + `.volatile()` 字段，dsh 自动生成表单）；
  * 4. 每次调用现读活配置 / 现算工作区，设置与会话变化即时生效。
@@ -72,7 +73,7 @@ export function buildSystemPromptText(config, workspacePath) {
     return (`Mnemos 记忆系统（dsh-mnemos-personal）：本工作区已绑定分区 ${slug}，记忆按人组织；默认人 ${config.personId}（type=${config.personType}）。\n` +
         '使用时机：\n' +
         '- 开始任务前先调 mnemos_context 取默认人的上下文（资料 + 简报 + 高相关记忆 + 分区共享知识），返回的 prompt 可直接阅读 / 注入，比逐条检索省 token。\n' +
-        '- 想快速了解「关于这个人已知什么」用 mnemos_brief；需要具体旧事 / 约定 / 踩坑记录用 mnemos_search；读一条详情或分页列表用 mnemos_get。\n' +
+        '- 想快速了解「关于这个人已知什么」用 mnemos_brief；需要具体旧事 / 约定 / 踩坑记录用 mnemos_search；读一条详情或用游标翻页列表用 mnemos_get（把响应里的 next_cursor 传给 cursor）。\n' +
         '- 得出了值得沉淀的结论、决策、约束、踩坑经验时用 mnemos_add（scope=partition 表示分区共享，同分区其他人也能检索；缺省沿用分区设置）。\n' +
         '- 换人读写时显式传 person_id（缺省 / self = 默认人）；人不是登录账号，human 是 App 用户 / 员工，agent 是智能体。\n' +
         '- 管理用 mnemos_person（list / get / upsert）；不确定分区或连接状态时用 mnemos_workspace / mnemos_status。\n' +

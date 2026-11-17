@@ -69,6 +69,13 @@ describe('workspaceSlug', () => {
     assert.match(workspaceSlug('/'), /^ws-workspace-[0-9a-f]{8}$/)
   })
 
+  it('basename 截断保证 slug 不超过 v6 的 48 字符上限', () => {
+    const slug = workspaceSlug('/work/' + 'a'.repeat(60))
+    assert.equal(slug.length, 48)
+    assert.match(slug, /^ws-a{36}-[0-9a-f]{8}$/)
+    assert.equal(slug, workspaceSlug('/work/' + 'a'.repeat(60)))
+  })
+
   it('name 是路径最后一段', () => {
     assert.equal(workspaceName('/work/My Project'), 'My Project')
   })

@@ -3,7 +3,7 @@ import { newId, nowIso } from './ids.ts';
 
 export interface UsageInput {
   orgId?: string;
-  projectId: string;
+  partitionId: string;
   apiKeyId?: string;
   channel: 'console' | 'api' | 'playground' | 'system';
   operation: string;
@@ -19,13 +19,13 @@ export interface UsageInput {
 export function recordUsage(db: DatabaseSync, input: UsageInput): void {
   db.prepare(
     `INSERT INTO usage_events
-      (id, org_id, project_id, api_key_id, channel, operation, method, path,
+      (id, org_id, partition_id, api_key_id, channel, operation, method, path,
        status, latency_ms, result_count, memory_tokens, actor, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     newId('use'),
     input.orgId ?? null,
-    input.projectId,
+    input.partitionId,
     input.apiKeyId ?? null,
     input.channel,
     input.operation,

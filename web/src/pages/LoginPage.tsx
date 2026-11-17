@@ -1,190 +1,53 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Navigate, useLocation, useNavigate } from 'react-router-dom';
-import { APP_NAME, APP_TAGLINE, APP_VERSION, DEMO_ACCOUNTS } from '@shared';
+import { APP_NAME, APP_TAGLINE, APP_VERSION } from '@lib/constants.ts';
 import { ROLE_LABEL, toneForRole } from '@lib/tone.ts';
 import { api, ApiError } from '@lib/api.ts';
 import { useAuth } from '@lib/auth.tsx';
 import { useAsync, useDocumentTitle, useInterval } from '@lib/hooks.ts';
-import {
-  Avatar,
-  Badge,
-  Button,
-  Callout,
-  Card,
-  Field,
-  Icon,
-  IconButton,
-  Input,
-  useToast,
-  type Tone,
-} from '@ui';
+import { Avatar, Badge, Button, Callout, Card, Field, Icon, IconButton, Input, useToast, type Tone } from '@ui';
 
 const VALUE_POINTS = [
   {
     tone: 'violet',
     icon: 'layers',
-    title: '多项目隔离',
-    desc: '记忆、密钥与用量按项目强制隔离，互不串味。',
+    title: '分区隔离',
+    desc: '一个 App / 项目 / 租户一个分区，记忆、密钥与用量互不串味。',
   },
   {
     tone: 'cyan',
-    icon: 'brain',
-    title: '混合检索可解释',
-    desc: '语义、关键词、实体与时效加权融合，命中信号逐条可查。',
+    icon: 'users',
+    title: '以人为中心',
+    desc: '用户、员工、智能体都是「人」；记忆永远归属于一个人。',
   },
   {
     tone: 'amber',
-    icon: 'shield',
-    title: '企业级治理与审计',
-    desc: '权限按项目授予，写操作全量留痕，审计可回放。',
+    icon: 'sparkles',
+    title: '百万级人列表',
+    desc: '游标分页 + 窗口化渲染，百万级人也只渲染可视行。',
   },
 ] as const;
 
-type LoginIssueKind = 'generic' | 'locked' | 'rate' | 'disabled';
-
 interface LoginIssue {
-  kind: LoginIssueKind;
   tone: Tone;
   message: string;
-  /** 锁定或限流的截止时间；存在时提交按钮禁用 */
   blockedUntil?: number;
 }
 
-const LOCK_FALLBACK_MS = 15 * 60 * 1000;
-
-function readDetailNumber(details: unknown, keys: string[]): number | null {
-  if (!details || typeof details !== 'object') return null;
-  const record = details as Record<string, unknown>;
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-    if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) {
-      return Number(value);
-    }
-  }
-  return null;
-}
-
-function readDetailBoolean(details: unknown, key: string): boolean {
-  if (!details || typeof details !== 'object') return false;
-  return (details as Record<string, unknown>)[key] === true;
-}
-
-function readDetailString(details: unknown, keys: string[]): string | null {
-  if (!details || typeof details !== 'object') return null;
-  const record = details as Record<string, unknown>;
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === 'string' && value.trim() !== '') return value;
-  }
-  return null;
-}
-
-/** 解析登录错误：把状态码与 details 归一为可直接展示的中文提示。 */
 function describeLoginError(error: unknown): LoginIssue {
-  if (!(error instanceof ApiError)) {
-    return {
-      kind: 'generic',
-      tone: 'red',
-      message: error instanceof Error ? error.message : '登录失败，请稍后重试。',
-    };
-  }
-
-  const code = error.code.toLowerCase();
-  const details = error.details;
-
-  if (code.includes('disabled') || code === 'account_disabled') {
-    return {
-      kind: 'disabled',
-      tone: 'red',
-      message: '账号已被管理员禁用，请联系组织管理员恢复访问。',
-    };
-  }
-
-  if (error.status === 423 || code.includes('locked')) {
-    const lockedUntil = readDetailString(details, ['lockedUntil', 'locked_until']);
-    const parsed = lockedUntil ? Date.parse(lockedUntil) : Number.NaN;
-    const retrySeconds = readDetailNumber(details, ['retryAfterSeconds', 'retry_after_seconds', 'retryAfter']);
-    const remainingMinutes = readDetailNumber(details, ['remainingMinutes', 'remaining_minutes']);
-    let until = Number.isFinite(parsed) ? parsed : Number.NaN;
-    if (!Number.isFinite(until) && retrySeconds !== null && retrySeconds > 0) {
-      until = Date.now() + retrySeconds * 1000;
+  if (error instanceof ApiError) {
+    if (error.status === 429) {
+      return { tone: 'amber', message: '尝试过于频繁，请稍后重试。' };
     }
-    if (!Number.isFinite(until) && remainingMinutes !== null && remainingMinutes > 0) {
-      until = Date.now() + remainingMinutes * 60 * 1000;
+    if (error.status === 423) {
+      return { tone: 'amber', message: '账号已锁定，请稍后重试。' };
     }
-    if (!Number.isFinite(until)) until = Date.now() + LOCK_FALLBACK_MS;
-    const active = until > Date.now();
-    return {
-      kind: 'locked',
-      tone: 'amber',
-      message: '账号已锁定，请稍后重试。',
-      blockedUntil: active ? until : undefined,
-    };
+    return { tone: 'red', message: error.message || '登录失败，请稍后重试。' };
   }
-
-  if (error.status === 429 || code.includes('rate_limited') || code.includes('too_many')) {
-    const retrySeconds = readDetailNumber(details, ['retryAfterSeconds', 'retry_after_seconds', 'retryAfter']);
-    return {
-      kind: 'rate',
-      tone: 'amber',
-      message: '尝试过于频繁，请稍后重试。',
-      blockedUntil: retrySeconds !== null && retrySeconds > 0 ? Date.now() + retrySeconds * 1000 : undefined,
-    };
-  }
-
-  if (error.status === 401) {
-    const remaining = readDetailNumber(details, [
-      'remainingAttempts',
-      'remaining_attempts',
-      'attemptsRemaining',
-      'attempts_remaining',
-    ]);
-    const locked = readDetailBoolean(details, 'locked');
-    const lockedUntilRaw = readDetailString(details, ['lockedUntil', 'locked_until']);
-    const lockedUntil = lockedUntilRaw ? Date.parse(lockedUntilRaw) : Number.NaN;
-    if (locked && Number.isFinite(lockedUntil) && lockedUntil > Date.now()) {
-      return {
-        kind: 'locked',
-        tone: 'amber',
-        message: '账号已锁定，请稍后重试。',
-        blockedUntil: lockedUntil,
-      };
-    }
-    const suffix =
-      remaining === null
-        ? ''
-        : remaining <= 0
-          ? '尝试次数已用尽，请联系管理员解锁。'
-          : `还可尝试 ${remaining} 次。`;
-    return {
-      kind: 'generic',
-      tone: remaining !== null && remaining <= 2 ? 'amber' : 'red',
-      message: `${error.message || '邮箱或密码不正确。'}${suffix ? ` ${suffix}` : ''}`,
-    };
-  }
-
   return {
-    kind: 'generic',
     tone: 'red',
-    message: error.message || '登录失败，请稍后重试。',
+    message: error instanceof Error ? error.message : '登录失败，请稍后重试。',
   };
-}
-
-function loginIssueMessage(issue: LoginIssue, now: number): string {
-  if (issue.blockedUntil) {
-    const remaining = Math.max(0, issue.blockedUntil - now);
-    if (issue.kind === 'locked') {
-      return `账号已锁定，请 ${Math.max(1, Math.ceil(remaining / 60_000))} 分钟后重试。`;
-    }
-    if (issue.kind === 'rate') {
-      const seconds = Math.max(1, Math.ceil(remaining / 1000));
-      return seconds >= 60
-        ? `尝试过于频繁，请 ${Math.ceil(seconds / 60)} 分钟后重试。`
-        : `尝试过于频繁，请 ${seconds} 秒后重试。`;
-    }
-  }
-  return issue.message;
 }
 
 export function LoginPage() {
@@ -202,20 +65,18 @@ export function LoginPage() {
   const [issue, setIssue] = useState<LoginIssue | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
-  const blockedUntil = issue?.blockedUntil ?? null;
-  const blocked = blockedUntil !== null && blockedUntil > now;
-
-  useInterval(() => setNow(Date.now()), blockedUntil !== null ? 1000 : null);
-
+  useInterval(() => setNow(Date.now()), issue?.blockedUntil ? 1000 : null);
   useEffect(() => {
-    if (blockedUntil !== null && blockedUntil <= now) setIssue(null);
-  }, [blockedUntil, now]);
+    if (issue?.blockedUntil && issue.blockedUntil <= now) setIssue(null);
+  }, [issue, now]);
 
+  // 演示账号来自 /api/auth/demo-accounts；v6 若未启用该端点则不展示（不伪造账号）。
   const demo = useAsync(() => api.auth.demoAccounts(), []);
-  const demoAccounts = demo.data && demo.data.length > 0 ? demo.data : DEMO_ACCOUNTS;
+  const demoAccounts = demo.data ?? [];
+  const blocked = Boolean(issue?.blockedUntil && issue.blockedUntil > now);
 
   const locationState = location.state as { from?: unknown } | null;
-  const from = locationState && typeof locationState.from === 'string' ? locationState.from : '/';
+  const from = locationState && typeof locationState.from === 'string' ? locationState.from : '/partitions';
 
   if (user) return <Navigate to={from} replace />;
 
@@ -224,7 +85,7 @@ export function LoginPage() {
     if (submitting || blocked) return;
     const trimmedEmail = email.trim();
     if (!trimmedEmail || !password) {
-      setIssue({ kind: 'generic', tone: 'red', message: '请输入工作邮箱与密码。' });
+      setIssue({ tone: 'red', message: '请输入工作邮箱与密码。' });
       return;
     }
     setSubmitting(true);
@@ -285,11 +146,11 @@ export function LoginPage() {
           </div>
 
           <h1 className="auth-title">
-            让 AI <span className="text-gradient">记住该记住的</span>
+            记住每个人 <span className="text-gradient">该记住的</span>
           </h1>
           <p className="auth-sub">
-            为你的 AI 应用提供可隔离、可解释、可审计的长期记忆层。写入一次，跨会话稳定召回，
-            把上下文成本留给真正重要的事实。
+            面向百万人的中立记忆服务：分区隔离、以人为中心、共享与私有由 scope 决定。
+            写入一次，跨会话稳定召回，把上下文成本留给真正重要的事实。
           </p>
 
           <div className="auth-points">
@@ -320,7 +181,7 @@ export function LoginPage() {
             </div>
             <div>
               <div className="brand-name">登录 {APP_NAME}</div>
-              <div className="brand-sub">企业记忆基础设施</div>
+              <div className="brand-sub">分区 · 人 · 记忆</div>
             </div>
           </div>
 
@@ -360,26 +221,19 @@ export function LoginPage() {
               </Field>
 
               {issue ? (
-                <Callout
-                  tone={issue.tone}
-                  icon={issue.kind === 'locked' || issue.kind === 'disabled' ? 'lock' : 'alert'}
-                >
-                  {loginIssueMessage(issue, now)}
+                <Callout tone={issue.tone} icon={issue.tone === 'red' ? 'alert' : 'lock'}>
+                  {issue.blockedUntil
+                    ? `请 ${Math.max(1, Math.ceil((issue.blockedUntil - now) / 60_000))} 分钟后重试。`
+                    : issue.message}
                 </Callout>
               ) : null}
 
-              <Button
-                type="submit"
-                variant="primary"
-                block
-                loading={submitting}
-                disabled={blocked}
-                iconRight="arrowRight"
-              >
+              <Button type="submit" variant="primary" block loading={submitting} disabled={blocked} iconRight="arrowRight">
                 {submitting ? '正在登录…' : blocked ? '暂时无法登录' : '登录控制台'}
               </Button>
             </form>
 
+            {demoAccounts.length > 0 ? (
             <div className="auth-demo mt-16">
               <div className="between mb-8">
                 <span className="tiny dim">演示账号 · 点击一键填充</span>
@@ -407,10 +261,11 @@ export function LoginPage() {
                 ))}
               </div>
             </div>
+            ) : null}
 
             <div className="between tiny dim mt-16">
               <span>版本 {APP_VERSION}</span>
-              <span>演示密码 mnemos-demo</span>
+              <span>分区 → 人 → 记忆</span>
             </div>
           </Card>
         </div>

@@ -1,6 +1,9 @@
 /**
- * Mnemos 共享领域契约 —— 服务端与控制台共用的唯一事实来源。
- * 所有 HTTP JSON 载荷均为 camelCase（公开 v1 API 额外接受/返回 snake_case，由 http 层适配）。
+ * Mnemos v6 共享领域契约 —— 服务端与控制台共用的唯一事实来源。
+ *
+ * 核心只有三个：Partition（分区）+ Person（人）+ Memory（记忆）。
+ * 控制台 /api 一律 camelCase；公开 v1 API 为 snake_case（由 http 层序列化）。
+ * 列表协议统一为游标分页 CursorPage（不返回 total、不做 COUNT(*)）。
  */
 
 /* ------------------------------------------------------------------ */
@@ -8,14 +11,20 @@
 /* ------------------------------------------------------------------ */
 
 export type Role = 'owner' | 'admin' | 'developer' | 'viewer';
-export type ApiScope = 'memories:read' | 'memories:write' | 'graph:read' | 'admin';
-export type ProjectStatus = 'active' | 'paused' | 'archived';
-export type MemoryStatus = 'active' | 'archived' | 'deleted';
-export type MemorySource = 'conversation' | 'api' | 'agent' | 'import' | 'playground' | 'dream';
-export type ExtractionMode = 'additive' | 'consolidate';
+export type ApiScope = 'memories:read' | 'memories:write' | 'admin';
 export type ActorType = 'user' | 'api_key' | 'system';
 
-export type MemoryEventType = 'ADD' | 'UPDATE' | 'DELETE' | 'MERGE' | 'NOOP';
+export type PartitionStatus = 'active' | 'paused' | 'archived';
+
+export type PersonType = 'human' | 'agent' | 'service' | 'other';
+export type PersonStatus = 'active' | 'archived' | 'deleted';
+/** 人列表排序：recent=最近活跃，new=最近新建，name=显示名。 */
+export type PersonSort = 'recent' | 'new' | 'name';
+
+/** 记忆可见范围：person=仅本人；partition=分区共享；session=仅当前会话。 */
+export type MemoryScope = 'person' | 'partition' | 'session';
+export type MemoryStatus = 'active' | 'archived' | 'deleted';
+export type MemorySource = 'api' | 'conversation' | 'agent' | 'import' | 'playground' | 'dream';
 
 export type MemoryCategory =
   | 'preference'
@@ -37,6 +46,8 @@ export type MemoryCategory =
   | 'assumption'
   | 'dependency';
 
+export type ApiKeyKind = 'partition' | 'org';
+
 export interface Actor {
   type: ActorType;
   id: string;
@@ -46,7 +57,7 @@ export interface Actor {
 }
 
 /* ------------------------------------------------------------------ */
-/* 组织 / 用户 / 项目                                                  */
+/* 组织 / 控制台账号                                                   */
 /* ------------------------------------------------------------------ */
 
 export interface Org {
@@ -72,103 +83,370 @@ export interface User {
   passwordChangedAt?: string;
 }
 
-export interface RetrievalWeights {
-  semantic: number;
-  keyword: number;
-  entity: number;
-  recency: number;
+export interface OrgUser extends User {
+  activeSessions: number;
 }
 
-export interface ProjectSettings {
-  extractionMode: ExtractionMode;
-  embeddingModel: string;
-  topK: number;
-  threshold: number;
-  retentionDays: number;
-  graphEnabled: boolean;
-  dedupeThreshold: number;
-  weights: RetrievalWeights;
-  monthlyQuota: number;
-  webhookUrl?: string;
-  locale: string;
-  /** 新记忆缺省可见范围：消费类 App 用 person，协作项目用 partition */
+export interface CreateUserInput {
+  email: string;
+  name: string;
+  role: Role;
+  title?: string;
+  password?: string;
+}
+
+export interface UpdateUserInput {
+  role?: Role;
+  status?: 'active' | 'disabled';
+  title?: string;
+  name?: string;
+}
+
+export interface ResetPasswordResult {
+  userId: string;
+  temporaryPassword: string;
+}
+
+export interface PasswordChangeInput {
+  currentPassword: string;
+  newPassword: string;
+}
+
+export interface AuthResponse {
+  token: string;
+  user: User;
+  org: Org;
+}
+
+/* ------------------------------------------------------------------ */
+/* 分区（Partition）                                                   */
+/* ------------------------------------------------------------------ */
+
+export interface PartitionSettings {
+  /** 新记忆缺省可见范围（消费类 App 用 person，协作分区用 partition） */
   defaultScope: MemoryScope;
-  /** 写入不存在的 person 时是否自动建档 */
-  personAutoCreate: boolean;
-  /* --- 记忆简报（最近记忆压缩，可直接注入 Agent 上下文） --- */
-  /** 简报字符上限（100–5000） */
+  /** 人级/分区级简报字符上限（100–5000） */
   briefMaxChars: number;
-  /** 是否把记忆简报注入任务简报 prompt */
   briefEnabled: boolean;
-  /* --- 记忆做梦（增量记忆巩固） --- */
   dreamEnabled: boolean;
-  /** 复盘总结周期（分钟，1–43200） */
+  /** 做梦周期（分钟，1–43200） */
   dreamIntervalMinutes: number;
-  /* --- 周报/月报 --- */
-  reportsEnabled: boolean;
-  /** 1=周一 … 7=周日 */
-  weeklyReportDay: number;
-  weeklyReportTime: string;
-  /** 1–28 */
-  monthlyReportDay: number;
-  monthlyReportTime: string;
+  /** 记忆保留天数（0=不限） */
+  retentionDays: number;
+  /** 月度写入 token 配额（0=不限） */
+  monthlyQuota: number;
+  /** 写入未知人时是否自动建档 */
+  personAutoCreate: boolean;
+  locale: string;
 }
 
-export interface Project {
+/** 分区：App / 项目 / 租户。取代 v5 的 projects，表名 partitions。 */
+export interface Partition {
   id: string;
   orgId: string;
   slug: string;
   name: string;
   description: string;
-  status: ProjectStatus;
-  region: string;
-  env: string;
+  status: PartitionStatus;
+  settings: PartitionSettings;
   createdAt: string;
   updatedAt: string;
   archivedAt?: string;
-  settings: ProjectSettings;
+  /** 列表/详情附带的分区统计（来自 partition_stats，O(1)） */
+  stats?: PartitionStats;
 }
 
-export interface ProjectStats {
-  memories: number;
-  users: number;
-  agents: number;
-  entities: number;
-  relations: number;
-  searches7d: number;
-  adds7d: number;
-  tokensSaved: number;
-  storageBytes: number;
-  quotaUsedPct: number;
-  recallP50Ms: number;
-  recallP95Ms: number;
-  hitRate: number;
-  growthPct: number;
-  lastActivityAt?: string;
+/** 分区头部聚合：列表页直接读这张表，绝不 COUNT(*)。 */
+export interface PartitionStats {
+  partitionId: string;
+  personsTotal: number;
+  personsHuman: number;
+  personsAgent: number;
+  personsService: number;
+  memoriesTotal: number;
+  sharedTotal: number;
+  sessionsTotal: number;
+  updatedAt: string;
 }
 
-export interface ProjectSummary extends Project {
-  stats: ProjectStats;
-  members: number;
-  keys: number;
+export interface PartitionInput {
+  slug: string;
+  name?: string;
+  description?: string;
+  status?: PartitionStatus;
+  settings?: Partial<PartitionSettings>;
 }
 
-export interface ProjectMember {
-  userId: string;
-  name: string;
-  email: string;
-  role: Role;
-  avatarColor: string;
-  joinedAt: string;
+/* ------------------------------------------------------------------ */
+/* 人（Person）                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 记忆的主体「人」：真人（App 用户 / 员工）或智能体。
+ * 与登录账号（User）无关；externalId 由调用方定义（App 的 user_id、Agent 的 id/name）。
+ * memoryCount / sharedMemoryCount / sessionCount 为反规范化计数，列表页直接用。
+ */
+export interface Person {
+  id: string;
+  partitionId: string;
+  externalId: string;
+  type: PersonType;
+  displayName: string;
+  attributes: Record<string, unknown>;
+  status: PersonStatus;
+  memoryCount: number;
+  sharedMemoryCount: number;
+  sessionCount: number;
+  lastMemoryAt?: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  createdAt: string;
+  updatedAt: string;
 }
+
+export interface PersonInput {
+  externalId: string;
+  type?: PersonType;
+  displayName?: string;
+  attributes?: Record<string, unknown>;
+  status?: PersonStatus;
+}
+
+export interface PersonListQuery {
+  type?: PersonType;
+  status?: PersonStatus;
+  q?: string;
+  sort?: PersonSort;
+  cursor?: string;
+  limit?: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* 会话（可选分组）                                                     */
+/* ------------------------------------------------------------------ */
+
+export interface Session {
+  id: string;
+  partitionId: string;
+  personId: string;
+  title: string;
+  status: 'active' | 'ended';
+  startedAt: string;
+  endedAt?: string;
+  metadata: Record<string, unknown>;
+}
+
+/* ------------------------------------------------------------------ */
+/* 记忆                                                                */
+/* ------------------------------------------------------------------ */
+
+export interface Memory {
+  id: string;
+  partitionId: string;
+  /** 记忆主体（归属人，内部 id）——NOT NULL */
+  personId: string;
+  /** 写入者（可与人不同） */
+  actorPersonId?: string;
+  /** 人的外部 ID（App user_id / Agent id），便于调用方直接比对 */
+  personExternalId?: string;
+  scope: MemoryScope;
+  sessionId?: string;
+  category: MemoryCategory;
+  content: string;
+  importance: number;
+  confidence: number;
+  source: MemorySource;
+  status: MemoryStatus;
+  tags: string[];
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt?: string;
+  dreamedAt?: string;
+}
+
+export interface MemoryDetail {
+  memory: Memory;
+  person: Person | null;
+}
+
+/** 写入记忆：person 必填（内部 id 或 external id + type）。 */
+export interface AddMemoryInput {
+  partitionId: string;
+  /** 内部 id */
+  personId?: string;
+  /** 外部 id（与 personId 二选一；缺省按 type 解析/建档） */
+  personExternalId?: string;
+  personType?: PersonType;
+  actorPersonId?: string;
+  scope?: MemoryScope;
+  sessionId?: string;
+  sessionTitle?: string;
+  category?: MemoryCategory;
+  content: string;
+  importance?: number;
+  confidence?: number;
+  source?: MemorySource;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+  expiresAt?: string | null;
+  actor: Actor;
+}
+
+export interface MemoryListQuery {
+  partitionId: string;
+  personId?: string;
+  personExternalId?: string;
+  scope?: MemoryScope;
+  category?: MemoryCategory;
+  status?: MemoryStatus;
+  /** FTS5 前缀检索；空则按索引排序 */
+  q?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface UpdateMemoryInput {
+  content?: string;
+  category?: MemoryCategory;
+  importance?: number;
+  confidence?: number;
+  status?: MemoryStatus;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+  expiresAt?: string | null;
+}
+
+/* ------------------------------------------------------------------ */
+/* 游标分页                                                            */
+/* ------------------------------------------------------------------ */
+
+/** 统一列表协议：不返回 total；头部统计读 partition_stats。 */
+export interface CursorPage<T> {
+  items: T[];
+  nextCursor: string | null;
+  partitionStats?: PartitionStats;
+}
+
+/* ------------------------------------------------------------------ */
+/* 记忆简报（brief）/ 上下文（context）/ 做梦（dream）                  */
+/* ------------------------------------------------------------------ */
+
+export interface MemoryBriefItem {
+  id: string;
+  content: string;
+  category: MemoryCategory;
+  importance: number;
+  scope: MemoryScope;
+  updatedAt: string;
+  personId: string;
+  personExternalId?: string;
+}
+
+/** 记忆简报：取最近的活跃记忆压缩成有字符上限、可直接注入提示词的文本。 */
+export interface MemoryBrief {
+  partitionId: string;
+  /** 人级简报时带上该人（内部 id） */
+  personId?: string;
+  scopeKey: string;
+  text: string;
+  maxChars: number;
+  count: number;
+  /** mnemos-condense（确定性压缩）或实际 LLM 模型名 */
+  model: string;
+  /** 是否命中缓存 */
+  cached: boolean;
+  sourceHash: string;
+  generatedAt: string;
+  recent: MemoryBriefItem[];
+}
+
+export interface BriefInput {
+  partitionId: string;
+  personId?: string;
+  maxChars?: number;
+  force?: boolean;
+  /** 是否允许调用 LLM 润色（默认 false） */
+  allowLlm?: boolean;
+}
+
+/** 人的上下文：资料 + 人的简报 + 相关记忆 + 分区共享知识，可直接注入提示词。 */
+export interface PersonContext {
+  person: Person;
+  brief: MemoryBrief;
+  memories: Memory[];
+  shared: Memory[];
+  prompt: string;
+  tokenEstimate: number;
+  citations: string[];
+  builtAt: string;
+}
+
+export interface ContextInput {
+  partitionId: string;
+  personId: string;
+  query?: string;
+  budgetTokens?: number;
+  includePartition?: boolean;
+}
+
+export type MemoryDreamRunStatus = 'running' | 'completed' | 'skipped' | 'failed';
+export type MemoryDreamTrigger = 'manual' | 'schedule';
+
+/** 一次做梦（增量记忆巩固）的运行记录。 */
+export interface MemoryDreamRun {
+  id: string;
+  partitionId: string;
+  /** 人级做梦时的归属人（内部 id）；分区级为空 */
+  personId?: string;
+  trigger: MemoryDreamTrigger;
+  status: MemoryDreamRunStatus;
+  inputCount: number;
+  insightCount: number;
+  summary?: string;
+  error?: string;
+  startedAt: string;
+  finishedAt?: string;
+}
+
+export interface MemoryDreamSettings {
+  enabled: boolean;
+  intervalMinutes: number;
+  lastAt?: string;
+}
+
+export interface MemoryDreamStatus {
+  settings: MemoryDreamSettings;
+  personId?: string;
+  pendingCount: number;
+  lastRun?: MemoryDreamRun;
+  runs: MemoryDreamRun[];
+}
+
+export interface MemoryDreamInput {
+  partitionId: string;
+  personId?: string;
+  trigger?: MemoryDreamTrigger;
+  /** 单批最多处理的记忆条数（1–200，默认 50） */
+  batchSize?: number;
+}
+
+export interface MemoryDreamResult {
+  run: MemoryDreamRun | null;
+  status: MemoryDreamStatus;
+}
+
+/* ------------------------------------------------------------------ */
+/* API Key                                                             */
+/* ------------------------------------------------------------------ */
 
 export interface ApiKey {
   id: string;
-  projectId: string;
-  /** project=只属于该分区；org=组织级，可访问/创建本组织任意分区（DSH 插件按工作区建分区用） */
-  kind?: ApiKeyKind;
+  /** 分区 key 绑定的分区；org key 为空 */
+  partitionId?: string;
   /** org key 所属组织 */
   orgId?: string;
+  kind: ApiKeyKind;
   name: string;
   prefix: string;
   scopes: ApiScope[];
@@ -188,659 +466,13 @@ export interface ApiKeyWithSecret extends ApiKey {
 }
 
 /* ------------------------------------------------------------------ */
-/* 记忆                                                                */
-/* ------------------------------------------------------------------ */
-
-export interface ChatMessage {
-  role: 'user' | 'assistant' | 'system' | 'tool';
-  content: string;
-  name?: string;
-}
-
-export type MemoryVisibility = 'project' | 'agent' | 'task';
-
-/** 中立服务的可见范围：person=仅该人；partition=分区共享；session=仅当前会话。 */
-export type MemoryScope = 'person' | 'partition' | 'session';
-
-export type ApiKeyKind = 'project' | 'org';
-
-/* ------------------------------------------------------------------ */
-/* 人（Person）与分区（Partition）                                     */
-/* ------------------------------------------------------------------ */
-
-export type PersonType = 'human' | 'agent' | 'service' | 'other';
-export type PersonStatus = 'active' | 'archived' | 'deleted';
-
-/**
- * 记忆的主体「人」：真人（App 用户 / 员工）或智能体。
- * 与登录账号（User）无关；externalId 由调用方定义（App 的 user_id、Agent 的 id/name）。
- */
-export interface Person {
-  id: string;
-  partitionId: string;
-  externalId: string;
-  type: PersonType;
-  displayName: string;
-  attributes: Record<string, unknown>;
-  status: PersonStatus;
-  firstSeenAt: string;
-  lastSeenAt: string;
-  createdAt: string;
-  updatedAt: string;
-  stats?: PersonStats;
-}
-
-export interface PersonStats {
-  memories: number;
-  sharedMemories: number;
-  sessions: number;
-  lastMemoryAt?: string;
-}
-
-export interface PersonInput {
-  externalId: string;
-  type?: PersonType;
-  displayName?: string;
-  attributes?: Record<string, unknown>;
-  status?: PersonStatus;
-}
-
-export interface PersonListInput {
-  projectId: string;
-  type?: PersonType;
-  status?: PersonStatus;
-  q?: string;
-  page?: number;
-  pageSize?: number;
-  sort?: 'recent' | 'name' | 'memories';
-}
-
-export interface PersonContextInput {
-  projectId: string;
-  /** 内部 id 或 external_id */
-  personRef: string;
-  query?: string;
-  budgetTokens?: number;
-  /** 是否带上分区共享知识（默认 true） */
-  includePartition?: boolean;
-}
-
-/** 人的上下文：资料 + 人的简报 + 相关记忆 + 分区共享知识，可直接注入提示词。 */
-export interface PersonContext {
-  person: Person;
-  brief: MemoryBrief;
-  /** 与 query 最相关、且属于该人的记忆 */
-  memories: Memory[];
-  /** 分区共享知识（scope=partition，person_id 可有可无） */
-  shared: Memory[];
-  prompt: string;
-  tokenEstimate: number;
-  citations: string[];
-  builtAt: string;
-}
-
-/** 分区（项目/应用/租户）：对外叫 Partition，存储上仍用 projects。 */
-export type Partition = Project;
-
-export interface PartitionInput {
-  slug: string;
-  name?: string;
-  description?: string;
-  region?: string;
-  env?: string;
-}
-
-
-export interface Memory {
-  id: string;
-  projectId: string;
-  /** 记忆主体（归属人，内部 id）；为空表示分区共享知识 */
-  personId?: string;
-  /** 写入者（可与人不同）；系统/做梦写入时为一个系统人 */
-  actorPersonId?: string;
-  /** 人的外部 ID（App user_id / Agent id），便于调用方直接比对 */
-  personExternalId?: string;
-  /** 会话（task_id / run_id 的泛化） */
-  sessionId?: string;
-  /** 可见范围：person | partition | session */
-  scope: MemoryScope;
-  userId?: string;
-  agentId?: string;
-  runId?: string;
-  appId?: string;
-  /** 产生该记忆的任务会话（跨时间段归因） */
-  taskId?: string;
-  /** project=项目共享；agent=仅该 Agent 私有；task=仅当前任务可见 */
-  visibility: MemoryVisibility;
-  content: string;
-  category: MemoryCategory;
-  importance: number;
-  confidence: number;
-  source: MemorySource;
-  status: MemoryStatus;
-  tags: string[];
-  metadata: Record<string, unknown>;
-  createdAt: string;
-  updatedAt: string;
-  lastAccessedAt?: string;
-  accessCount: number;
-  expiresAt?: string;
-}
-
-export interface SignalScores {
-  semantic: number;
-  keyword: number;
-  entity: number;
-  recency: number;
-  importance: number;
-}
-
-export interface SearchHit extends Memory {
-  score: number;
-  signals: SignalScores;
-  matchedOn: string[];
-  entities: string[];
-}
-
-export interface SearchResponse {
-  results: SearchHit[];
-  total: number;
-  tookMs: number;
-  queryTerms: string[];
-  strategy: string;
-  weights: RetrievalWeights;
-}
-
-export interface MemoryHistoryEntry {
-  id: string;
-  memoryId: string;
-  event: MemoryEventType;
-  oldContent?: string;
-  newContent?: string;
-  actor: string;
-  reason?: string;
-  createdAt: string;
-  meta: Record<string, unknown>;
-}
-
-export interface EntityRef {
-  id: string;
-  name: string;
-  type: string;
-  mentionCount: number;
-}
-
-export interface Relation {
-  id: string;
-  sourceEntityId: string;
-  targetEntityId: string;
-  relation: string;
-  memoryId?: string;
-  weight: number;
-  createdAt: string;
-}
-
-/* ------------------------------------------------------------------ */
-/* Agent 与任务会话（Agent 原生模型）                                   */
-/* ------------------------------------------------------------------ */
-
-export type AgentStatus = 'active' | 'idle' | 'retired';
-
-export interface Agent {
-  id: string;
-  projectId: string;
-  name: string;
-  role: string;
-  model: string;
-  description: string;
-  /** 能力标签，例如 code-review / sql / oncall / frontend */
-  capabilities: string[];
-  status: AgentStatus;
-  metadata: Record<string, unknown>;
-  createdAt: string;
-  lastActiveAt?: string;
-  stats: {
-    memories: number;
-    privateMemories: number;
-    tasks: number;
-    lastTaskAt?: string;
-  };
-}
-
-export interface AgentInput {
-  name: string;
-  role?: string;
-  model?: string;
-  description?: string;
-  capabilities?: string[];
-  status?: AgentStatus;
-  metadata?: Record<string, unknown>;
-}
-
-export type TaskStatus = 'open' | 'active' | 'done' | 'abandoned';
-
-export interface Task {
-  id: string;
-  projectId: string;
-  title: string;
-  goal: string;
-  status: TaskStatus;
-  ownerAgentId?: string;
-  ownerAgentName?: string;
-  branch?: string;
-  summary?: string;
-  metadata: Record<string, unknown>;
-  createdAt: string;
-  startedAt: string;
-  endedAt?: string;
-  memoryCount: number;
-  agentCount: number;
-}
-
-export interface TaskInput {
-  title: string;
-  goal?: string;
-  ownerAgentId?: string;
-  branch?: string;
-  status?: TaskStatus;
-  metadata?: Record<string, unknown>;
-}
-
-export interface FinishTaskInput {
-  status?: 'done' | 'abandoned';
-  summary?: string;
-  /** 本次任务产生的决策，写入项目共享记忆 */
-  decisions?: string[];
-  /** 本次任务踩过的坑 / 可复用经验，写入项目共享记忆 */
-  lessons?: string[];
-  /** 本次任务的关键进展，写入项目共享记录 */
-  progress?: string[];
-  /** 风险、阻塞及其状态变化 */
-  risks?: string[];
-  /** 范围、排期、验收标准等变更 */
-  changes?: string[];
-  /** 验收与质量证据 */
-  acceptance?: string[];
-  /** 未验证假设与待确认问题 */
-  assumptions?: string[];
-  /** 跨团队依赖与承诺 */
-  dependencies?: string[];
-  /** 额外记录（默认项目共享） */
-  notes?: string[];
-  agentId?: string;
-}
-
-export interface BriefingInput {
-  projectId: string;
-  agentId?: string;
-  taskId?: string;
-  query?: string;
-  budgetTokens?: number;
-  includePrivate?: boolean;
-}
-
-export type BriefingSectionKey =
-  | 'project'
-  | 'conventions'
-  | 'decisions'
-  | 'experience'
-  | 'incidents'
-  | 'agent_notes'
-  | 'open_tasks';
-
-export interface BriefingSection {
-  key: BriefingSectionKey;
-  title: string;
-  description: string;
-  hits: SearchHit[];
-}
-
-export interface Briefing {
-  project: { id: string; name: string; description: string };
-  agent?: Agent;
-  task?: Task;
-  sections: BriefingSection[];
-  /** 可直接注入 Agent 系统提示词的 Markdown 文本 */
-  prompt: string;
-  tokenEstimate: number;
-  citations: string[];
-  builtAt: string;
-  tookMs: number;
-  /** 记忆简报（最近记忆压缩）；项目开启 briefEnabled 时同时注入 prompt 首段 */
-  brief?: BriefingBrief;
-}
-
-/** 任务简报里携带的“记忆简报”快照：控制台预览与 Agent 实际拿到的一致。 */
-export interface BriefingBrief {
-  text: string;
-  maxChars: number;
-  count: number;
-}
-
-/* ------------------------------------------------------------------ */
-/* 记忆简报（brief）与做梦（dream）                                     */
-/* ------------------------------------------------------------------ */
-
-/** 简报中引用的记忆摘要，便于控制台展示“这条简报由什么组成”。 */
-export interface MemoryBriefItem {
-  id: string;
-  content: string;
-  category: MemoryCategory;
-  importance: number;
-  updatedAt: string;
-  taskId?: string;
-  agentId?: string;
-  personId?: string;
-  personExternalId?: string;
-  scope?: MemoryScope;
-}
-
-/** 记忆简报：取最近的活跃记忆/洞见压缩成有字符上限、可直接注入提示词的文本。 */
-export interface MemoryBrief {
-  projectId: string;
-  /** 人级简报时带上该人（内部 id） */
-  personId?: string;
-  /** 简报正文；暂无可用记忆时为空串 */
-  text: string;
-  maxChars: number;
-  /** 纳入简报的记忆条数 */
-  count: number;
-  /** mnemos-condense（确定性压缩）或实际调用的 LLM 模型名 */
-  model: string;
-  /** 是否命中缓存 */
-  cached: boolean;
-  generatedAt: string;
-  recent: MemoryBriefItem[];
-}
-
-export interface MemoryBriefInput {
-  projectId: string;
-  /** 人级简报：只取该人的 person 记忆 + 与其相关的分区共享记忆 */
-  personId?: string;
-  /** 覆盖项目设置里的 briefMaxChars（不落库） */
-  maxChars?: number;
-  /** 按该 Agent 的可见性生成；不传时只使用项目共享记忆 */
-  agentId?: string;
-  /** 控制台/审计视角：包含所有 Agent 私有记忆（默认 false） */
-  includePrivate?: boolean;
-  /** 忽略缓存，重新生成 */
-  force?: boolean;
-  /** 是否允许调用 LLM 润色（默认 false，热路径只用确定性压缩） */
-  allowLlm?: boolean;
-}
-
-export type MemoryDreamRunStatus = 'running' | 'completed' | 'skipped' | 'failed';
-export type MemoryDreamTrigger = 'schedule' | 'manual';
-
-/** 一次做梦（增量记忆巩固）的运行记录。 */
-export interface MemoryDreamRun {
-  id: string;
-  projectId: string;
-  /** 人级做梦时的归属人（内部 id）；分区级为空 */
-  personId?: string;
-  trigger: MemoryDreamTrigger;
-  status: MemoryDreamRunStatus;
-  inputCount: number;
-  insightCount: number;
-  summary?: string;
-  error?: string;
-  startedAt: string;
-  finishedAt?: string;
-}
-
-export interface MemoryDreamSettings {
-  enabled: boolean;
-  intervalMinutes: number;
-  /** 上次做梦时间（取最近一次运行） */
-  lastAt?: string;
-}
-
-
-export type MemoryReportPeriod = 'week' | 'month';
-
-export interface MemoryReportItem {
-  id: string;
-  content: string;
-  category: MemoryCategory;
-  createdAt: string;
-  agentId?: string;
-  taskId?: string;
-  status?: string;
-  severity?: string;
-}
-
-export interface MemoryReportSection {
-  key: 'progress' | 'decisions' | 'lessons' | 'risks' | 'changes' | 'acceptance' | 'assumptions' | 'dependencies' | 'insights';
-  title: string;
-  count: number;
-  items: MemoryReportItem[];
-}
-
-export interface MemoryReport {
-  projectId: string;
-  period: MemoryReportPeriod;
-  title: string;
-  start: string;
-  end: string;
-  sections: MemoryReportSection[];
-  counts: Record<'progress' | 'decisions' | 'lessons' | 'risks' | 'changes' | 'acceptance' | 'assumptions' | 'dependencies' | 'insights', number>;
-  markdown: string;
-}
-
-export interface MemoryDreamStatus {
-  settings: MemoryDreamSettings;
-  /** 人级状态时带上该人（内部 id）；分区级为空 */
-  personId?: string;
-  /** 尚未做梦的活跃记忆数 */
-  pendingCount: number;
-  lastRun?: MemoryDreamRun;
-  /** 最近 10 次运行记录（新 → 旧） */
-  runs: MemoryDreamRun[];
-}
-
-export interface MemoryDreamSettingsInput {
-  enabled?: boolean;
-  intervalMinutes?: number;
-}
-
-export interface MemoryDreamInput {
-  projectId: string;
-  /** 指定人：只巩固该人 scope=person 的新记忆；缺省为分区级（scope=partition） */
-  personId?: string;
-  trigger?: MemoryDreamTrigger;
-  /** 单批最多处理的记忆条数（1–200，默认 50） */
-  batchSize?: number;
-}
-
-export interface MemoryDreamResult {
-  /** 该项目正在做梦时返回 null（路由层转 409） */
-  run: MemoryDreamRun | null;
-  status: MemoryDreamStatus;
-}
-
-
-export interface TaskWithMemories {
-  task: Task;
-  memories: Memory[];
-}
-
-export interface MemoryDetail {
-  memory: Memory;
-  history: MemoryHistoryEntry[];
-  entities: EntityRef[];
-  relations: Relation[];
-  neighbors: EntityRef[];
-}
-
-export interface GraphNode {
-  id: string;
-  label: string;
-  type: string;
-  weight: number;
-  memories: number;
-}
-
-export interface GraphEdge {
-  id: string;
-  source: string;
-  target: string;
-  relation: string;
-  weight: number;
-}
-
-export interface GraphData {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  stats: {
-    nodes: number;
-    edges: number;
-    entities: number;
-    density: number;
-    topTypes: { type: string; count: number }[];
-  };
-}
-
-/* ------------------------------------------------------------------ */
-/* 记忆引擎 I/O                                                        */
-/* ------------------------------------------------------------------ */
-
-export interface AddMemoryInput {
-  projectId: string;
-  messages?: ChatMessage[];
-  text?: string;
-  /** 记忆主体：内部 id 或 external id（与 personExternalId 二选一） */
-  personId?: string;
-  personExternalId?: string;
-  /** 写入者（默认同 person） */
-  actorPersonId?: string;
-  /** 可见范围；缺省取分区设置 defaultScope */
-  scope?: MemoryScope;
-  sessionId?: string;
-  userId?: string;
-  agentId?: string;
-  runId?: string;
-  appId?: string;
-  taskId?: string;
-  visibility?: MemoryVisibility;
-  metadata?: Record<string, unknown>;
-  tags?: string[];
-  infer?: boolean;
-  mode?: ExtractionMode;
-  source?: MemorySource;
-  actor: Actor;
-}
-
-export interface MemoryEvent {
-  type: MemoryEventType;
-  memoryId?: string;
-  content: string;
-  reason?: string;
-  at: string;
-}
-
-export interface AddMemoryResult {
-  results: Memory[];
-  events: MemoryEvent[];
-  tookMs: number;
-  extracted: number;
-  merged: number;
-  skipped: number;
-}
-
-export interface SearchFilters {
-  status?: MemoryStatus;
-  category?: MemoryCategory;
-  tags?: string[];
-  createdAfter?: string;
-  createdBefore?: string;
-  minImportance?: number;
-  metadata?: Record<string, unknown>;
-}
-
-export interface SearchMemoryInput {
-  projectId: string;
-  query: string;
-  /** 按人过滤（内部 id 或 external id） */
-  personId?: string;
-  /** 按可见范围过滤 */
-  scope?: MemoryScope;
-  userId?: string;
-  /** 调用方 Agent 身份：用于可见性判定（project 共享 + 自己的 private + 当前任务） */
-  agentId?: string;
-  /** 归属过滤：只看该 Agent 写入的记忆（控制台筛选用） */
-  writtenByAgentId?: string;
-  runId?: string;
-  appId?: string;
-  /** 仅返回该任务写入的记忆 */
-  taskId?: string;
-  /** 仅返回指定可见性 */
-  visibility?: MemoryVisibility;
-  /** 控制台/审计视角：包含所有 Agent 的私有记忆（默认 false） */
-  includePrivate?: boolean;
-  filters?: SearchFilters;
-  topK?: number;
-  threshold?: number;
-}
-
-export interface ListMemoriesInput {
-  projectId: string;
-  q?: string;
-  /** 按人过滤（内部 id 或 external id） */
-  personId?: string;
-  /** 按可见范围过滤 */
-  scope?: MemoryScope;
-  userId?: string;
-  /** 调用方 Agent 身份（可见性） */
-  agentId?: string;
-  /** 归属过滤：只看该 Agent 写入的记忆 */
-  writtenByAgentId?: string;
-  runId?: string;
-  taskId?: string;
-  visibility?: MemoryVisibility;
-  includePrivate?: boolean;
-  category?: MemoryCategory;
-  status?: MemoryStatus;
-  sort?: 'recent' | 'importance' | 'accessed';
-  page?: number;
-  pageSize?: number;
-}
-
-export interface UpdateMemoryInput {
-  content?: string;
-  category?: MemoryCategory;
-  importance?: number;
-  status?: MemoryStatus;
-  tags?: string[];
-  metadata?: Record<string, unknown>;
-  expiresAt?: string | null;
-}
-
-export interface FeedbackInput {
-  helpful: boolean;
-  query?: string;
-}
-
-export interface BulkMemoryInput {
-  action: 'delete' | 'archive' | 'restore';
-  ids: string[];
-}
-
-export interface Paginated<T> {
-  items: T[];
-  page: number;
-  pageSize: number;
-  total: number;
-  totalPages: number;
-}
-
-/* ------------------------------------------------------------------ */
-/* 控制台 / 观测                                                       */
+/* 用量 / 审计 / 运维                                                   */
 /* ------------------------------------------------------------------ */
 
 export interface AuditLog {
   id: string;
   orgId?: string;
-  projectId?: string;
+  partitionId?: string;
   actorType: ActorType;
   actorId?: string;
   actorLabel: string;
@@ -885,172 +517,6 @@ export interface UsageAnalytics {
   };
 }
 
-export interface CategoryCount {
-  name: string;
-  count: number;
-}
-
-export interface ProjectOverview {
-  stats: ProjectStats;
-  usage: UsagePoint[];
-  categories: CategoryCount[];
-  topEntities: EntityRef[];
-  recentActivity: AuditLog[];
-  recentMemories: Memory[];
-  keys: ApiKey[];
-  health: { status: 'healthy' | 'degraded'; checks: { name: string; ok: boolean; detail: string }[] };
-}
-
-export interface DashboardSummary {
-  org: Org;
-  totals: {
-    projects: number;
-    memories: number;
-    users: number;
-    agents: number;
-    searches7d: number;
-    adds7d: number;
-    tokensSaved: number;
-    p50: number;
-    errorRate: number;
-  };
-  usage: UsagePoint[];
-  projects: ProjectSummary[];
-  recentActivity: AuditLog[];
-  topProjects: { id: string; name: string; memories: number; slug: string }[];
-  categoryMix: CategoryCount[];
-}
-
-/* ------------------------------------------------------------------ */
-/* Webhook 事件订阅                                                    */
-/* ------------------------------------------------------------------ */
-
-export type WebhookEventType =
-  | 'memory.created'
-  | 'memory.updated'
-  | 'memory.deleted'
-  | 'task.finished'
-  | 'agent.registered'
-  | 'key.created'
-  | 'key.revoked'
-  | 'quota.exceeded';
-
-export interface Webhook {
-  id: string;
-  projectId: string;
-  name: string;
-  url: string;
-  eventTypes: WebhookEventType[];
-  enabled: boolean;
-  description: string;
-  createdBy?: string;
-  createdAt: string;
-  updatedAt: string;
-  lastDeliveryAt?: string;
-  lastStatus?: number;
-  failureCount: number;
-  disabledAt?: string;
-}
-
-export interface WebhookWithSecret extends Webhook {
-  /** 仅在创建/轮换时返回一次 */
-  secret: string;
-}
-
-export interface WebhookInput {
-  name: string;
-  url: string;
-  eventTypes: WebhookEventType[];
-  description?: string;
-  enabled?: boolean;
-}
-
-export type WebhookDeliveryStatus = 'pending' | 'delivering' | 'success' | 'failed' | 'dead';
-
-export interface WebhookDelivery {
-  id: string;
-  webhookId: string;
-  projectId: string;
-  eventType: WebhookEventType | 'webhook.test';
-  eventId?: string;
-  /** 请求载荷（JSON 字符串，供控制台预览；可能被截断） */
-  payload?: string;
-  status: WebhookDeliveryStatus;
-  attempts: number;
-  maxAttempts: number;
-  nextAttemptAt?: string;
-  responseStatus?: number;
-  responseBody?: string;
-  latencyMs?: number;
-  error?: string;
-  createdAt: string;
-  deliveredAt?: string;
-}
-
-export interface WebhookTestResult {
-  deliveryId: string;
-  status: WebhookDeliveryStatus;
-  responseStatus?: number;
-  latencyMs?: number;
-  error?: string;
-}
-
-export interface WebhookStats {
-  total: number;
-  success: number;
-  failed: number;
-  dead: number;
-  pending: number;
-  avgLatencyMs: number;
-  last24h: number;
-}
-
-/** 事件载荷：发送到订阅方的最小、稳定结构。 */
-export interface WebhookEventPayload {
-  id: string;
-  type: WebhookEventType;
-  at: string;
-  projectId: string;
-  projectSlug?: string;
-  actor: string;
-  data: Record<string, unknown>;
-}
-
-/* ------------------------------------------------------------------ */
-/* 生产运维 / 组织管理                                                 */
-/* ------------------------------------------------------------------ */
-
-export interface OrgUser extends User {
-  projectCount: number;
-  activeSessions: number;
-}
-
-export interface CreateUserInput {
-  email: string;
-  name: string;
-  role: Role;
-  title?: string;
-  password?: string;
-}
-
-export interface UpdateUserInput {
-  role?: Role;
-  status?: 'active' | 'disabled';
-  title?: string;
-  name?: string;
-}
-
-export interface ResetPasswordResult {
-  userId: string;
-  /** 仅在重置时返回一次 */
-  temporaryPassword: string;
-}
-
-export interface PasswordChangeInput {
-  currentPassword: string;
-  newPassword: string;
-}
-
 export interface BackupInfo {
   id: string;
   file: string;
@@ -1086,16 +552,15 @@ export interface OpsStatus {
   counts: {
     orgs: number;
     users: number;
-    projects: number;
+    partitions: number;
+    persons: number;
     memories: number;
-    agents: number;
-    tasks: number;
     apiKeys: number;
     auditEvents: number;
     usageEvents: number;
   };
   quotas: {
-    projectId: string;
+    partitionId: string;
     name: string;
     usedTokens: number;
     monthlyQuota: number;
@@ -1103,7 +568,7 @@ export interface OpsStatus {
     memories: number;
   }[];
   retention: {
-    projectId: string;
+    partitionId: string;
     name: string;
     retentionDays: number;
     expiredMemories: number;
@@ -1131,98 +596,54 @@ export interface OpsMaintenanceResult {
   dryRun: boolean;
   expiredArchived: number;
   deletedPurged: number;
-  idempotencyPurged: number;
   sessionsPurged: number;
   walCheckpointed: boolean;
   vacuumed: boolean;
   durationMs: number;
 }
 
-export interface ProjectExport {
-  format: 'mnemos-export/v1';
-  exportedAt: string;
-  project: { id: string; slug: string; name: string };
-  agents: Agent[];
-  tasks: Task[];
-  memories: Memory[];
-}
-
-export interface AuthResponse {
-  token: string;
-  user: User;
-  org: Org;
-}
-
-export interface DemoAccount {
-  email: string;
-  name: string;
-  role: Role;
-  password: string;
-  title: string;
-}
-
-export interface LiveEvent {
-  id: string;
-  type:
-    | 'memory.added'
-    | 'memory.updated'
-    | 'memory.deleted'
-    | 'search.performed'
-    | 'key.created'
-    | 'key.revoked'
-    | 'task.finished'
-    | 'agent.registered'
-    | 'quota.exceeded'
-    | 'project.created';
-  projectId?: string;
-  projectName?: string;
-  actor: string;
-  summary: string;
-  at: string;
-  meta?: Record<string, unknown>;
+export interface ReconcileResult {
+  partitionId: string;
+  personsTotal: number;
+  memoriesTotal: number;
+  sharedTotal: number;
+  sessionsTotal: number;
+  updatedPersons: number;
 }
 
 /* ------------------------------------------------------------------ */
 /* 服务端内部接口                                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * v6 记忆服务（引擎公开面）。
+ * 同步方法直接访问 SQLite；brief/context/dream 可能调用 LLM，返回 Promise。
+ */
 export interface MemoryService {
-  add(input: AddMemoryInput): Promise<AddMemoryResult>;
-  search(input: SearchMemoryInput): Promise<SearchResponse>;
-  list(input: ListMemoriesInput): Promise<Paginated<Memory>>;
-  get(projectId: string, id: string): Promise<MemoryDetail | null>;
-  update(projectId: string, id: string, input: UpdateMemoryInput, actor: Actor): Promise<Memory>;
-  remove(projectId: string, id: string, actor: Actor): Promise<void>;
-  bulk(projectId: string, input: BulkMemoryInput, actor: Actor): Promise<{ affected: number }>;
-  history(projectId: string, id: string): Promise<MemoryHistoryEntry[]>;
-  feedback(projectId: string, id: string, input: FeedbackInput, actor: Actor): Promise<Memory>;
-  graph(projectId: string, limit: number): Promise<GraphData>;
-  stats(projectId: string): Promise<ProjectStats>;
-  /* --- Agent 原生：注册表 / 任务会话 / 任务简报 --- */
-  agents(projectId: string): Promise<Agent[]>;
-  agent(projectId: string, agentId: string): Promise<Agent | null>;
-  createAgent(projectId: string, input: AgentInput, actor: Actor): Promise<Agent>;
-  updateAgent(projectId: string, agentId: string, input: Partial<AgentInput>, actor: Actor): Promise<Agent>;
-  tasks(projectId: string, params?: { status?: TaskStatus; agentId?: string; limit?: number }): Promise<Task[]>;
-  task(projectId: string, taskId: string): Promise<Task | null>;
-  createTask(projectId: string, input: TaskInput, actor: Actor): Promise<Task>;
-  updateTask(projectId: string, taskId: string, input: Partial<TaskInput> & { summary?: string }, actor: Actor): Promise<Task>;
-  finishTask(projectId: string, taskId: string, input: FinishTaskInput, actor: Actor): Promise<{ task: Task; memories: Memory[] }>;
-  briefing(input: BriefingInput): Promise<Briefing>;
-  /* --- 记忆简报 / 做梦 --- */
-  brief(input: MemoryBriefInput): Promise<MemoryBrief>;
-  updateBriefSettings(projectId: string, maxChars: number, actor: Actor): Promise<MemoryBrief>;
-  dreamStatus(projectId: string): Promise<MemoryDreamStatus>;
-  /** 人级做梦状态（pending/runs 只含该人） */
-  personDreamStatus(projectId: string, personRef: string): Promise<MemoryDreamStatus>;
-  updateDreamSettings(projectId: string, input: MemoryDreamSettingsInput, actor: Actor): Promise<MemoryDreamStatus>;
+  /* --- 分区 --- */
+  upsertPartition(orgId: string, input: PartitionInput, actor: Actor): Partition;
+  listPartitions(orgId: string): Partition[];
+  getPartition(orgId: string, ref: string): Partition | null;
+  updatePartition(orgId: string, ref: string, input: Partial<PartitionInput>, actor: Actor): Partition;
+  partitionStats(partitionId: string): PartitionStats;
+
+  /* --- 人 --- */
+  upsertPerson(partitionId: string, input: PersonInput, actor: Actor): Person;
+  listPersons(partitionId: string, query: PersonListQuery): CursorPage<Person>;
+  getPerson(partitionId: string, ref: string): Person | null;
+  updatePerson(partitionId: string, ref: string, input: Partial<PersonInput>, actor: Actor): Person;
+  reconcileCounts(partitionId: string): ReconcileResult;
+
+  /* --- 记忆 --- */
+  addMemory(input: AddMemoryInput): Memory;
+  listMemories(query: MemoryListQuery): CursorPage<Memory>;
+  getMemory(partitionId: string, id: string): MemoryDetail | null;
+  updateMemory(partitionId: string, id: string, input: UpdateMemoryInput, actor: Actor): Memory;
+  removeMemory(partitionId: string, id: string, actor: Actor): void;
+
+  /* --- 简报 / 上下文 / 做梦 --- */
+  brief(input: BriefInput): Promise<MemoryBrief>;
+  context(input: ContextInput): Promise<PersonContext>;
+  dreamStatus(input: { partitionId: string; personId?: string }): MemoryDreamStatus;
   dream(input: MemoryDreamInput, actor: Actor): Promise<MemoryDreamResult>;
-  /* --- 中立服务：人（Person） --- */
-  persons(input: PersonListInput): Promise<Paginated<Person>>;
-  /** personRef 支持内部 id 或 external_id */
-  person(projectId: string, personRef: string): Promise<Person | null>;
-  upsertPerson(projectId: string, input: PersonInput, actor: Actor): Promise<Person>;
-  updatePerson(projectId: string, personRef: string, input: Partial<PersonInput>, actor: Actor): Promise<Person>;
-  /** 人的上下文：资料 + 人的简报 + 相关记忆 + 分区共享知识 */
-  personContext(input: PersonContextInput): Promise<PersonContext>;
 }

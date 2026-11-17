@@ -1,8 +1,9 @@
 /**
- * dsh-mnemos-personal：把新版 Mnemos（中立记忆服务 v5）接入 dsh 的宿主侧 cordis 插件。
+ * dsh-mnemos-personal：把 Mnemos v6（中立记忆服务）接入 dsh 的宿主侧 cordis 插件。
  *
  * 做四件事：
- * 1. 注册 8 个 `mnemos_*` Agent 工具（分区 = 工作区、记忆按人组织，写 `/v1/partitions/:p/...`）；
+ * 1. 注册 8 个 `mnemos_*` Agent 工具（分区 = 工作区、记忆按人组织，写 `/v1/partitions/:p/...`，
+ *    人 / 记忆列表用 v6 游标分页）；
  * 2. 在系统提示里插一段说明，告诉 Agent「本工作区已绑定分区 <slug>，记忆按人组织；默认人 <personId>」；
  * 3. 把配置页挂进 dsh 设置（导出 `Config` + `.volatile()` 字段，dsh 自动生成表单）；
  * 4. 每次调用现读活配置 / 现算工作区，设置与会话变化即时生效。

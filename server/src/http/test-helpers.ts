@@ -2,7 +2,7 @@
  * HTTP 路由级测试夹具：内存 SQLite + 真实 HTTP server（端口 0）+ 会话/API Key 预置。
  *
  * 只构造 HTTP 层真正会消费的 AppContext 字段（logger / metrics / platform 用轻量 fake），
- * 记忆/人/简报/做梦全部走真实引擎，保证路由行为与生产一致。
+ * 引擎与数据库全部走真实实现，保证路由行为与生产一致。
  */
 
 import { DatabaseSync } from 'node:sqlite';
@@ -13,7 +13,6 @@ import type { AppContext, Logger, Metrics, Platform } from '../contracts.ts';
 import { migrate } from '../db/index.ts';
 import { createMemoryService } from '../engine/index.ts';
 import { loadEnv } from '../env.ts';
-import { EventBus } from '../lib/bus.ts';
 import { newApiKeySecret, nowIso, sha256 } from '../lib/ids.ts';
 import { createHttpServer } from './server.ts';
 
@@ -75,17 +74,17 @@ export interface HttpFixture {
   baseUrl: string;
   orgId: string;
   otherOrgId: string;
-  projectId: string;
-  /** alpha 分区 slug */
-  projectSlug: string;
+  /** alpha 分区 id / slug */
+  partitionId: string;
+  partitionSlug: string;
   betaId: string;
-  /** 控制台会话令牌：owner / admin（组织级）/ developer / viewer（project 成员） */
+  /** 控制台会话令牌 */
   sessions: Record<'owner' | 'admin' | 'developer' | 'viewer', string>;
-  /** 项目 key（alpha，scopes: read+write+admin） */
-  projectKey: string;
-  /** alpha 只读项目 key */
-  projectReadKey: string;
-  /** 组织级 key（org_test，scopes: read+write+admin） */
+  /** alpha 分区 key（read+write+admin） */
+  partitionKey: string;
+  /** alpha 只读分区 key */
+  partitionReadKey: string;
+  /** 组织级 key（read+write+admin） */
   orgKey: string;
   /** 其他组织的 org key */
   foreignOrgKey: string;
@@ -95,7 +94,7 @@ export interface HttpFixture {
 function addSession(db: DatabaseSync, userId: string): string {
   const token = `session-${userId}`;
   db.prepare(
-    `INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_seen_at)
+    `INSERT INTO user_sessions (token_hash, user_id, created_at, expires_at, last_seen_at)
      VALUES (?, ?, ?, ?, ?)`,
   ).run(sha256(token), userId, AT, FAR_FUTURE, AT);
   return token;
@@ -104,29 +103,29 @@ function addSession(db: DatabaseSync, userId: string): string {
 function addKey(
   db: DatabaseSync,
   input: {
-    projectId: string;
+    partitionId?: string;
+    orgId?: string;
     name: string;
     scopes: ApiScope[];
-    kind?: 'project' | 'org';
-    orgId?: string;
+    kind?: 'partition' | 'org';
   },
 ): string {
   const { secret, prefix, hash } = newApiKeySecret();
   db.prepare(
     `INSERT INTO api_keys
-       (id, project_id, name, prefix, key_hash, scopes, created_by, created_at,
-        rate_limit_per_min, kind, org_id)
-     VALUES (?, ?, ?, ?, ?, ?, 'usr_owner', ?, 100000, ?, ?)`,
+       (id, partition_id, org_id, kind, name, prefix, key_hash, scopes, created_by, created_at,
+        rate_limit_per_min)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'usr_owner', ?, 100000)`,
   ).run(
     `key_${prefix}`,
-    input.projectId,
+    input.partitionId ?? null,
+    input.orgId ?? null,
+    input.kind ?? 'partition',
     input.name,
     prefix,
     hash,
     JSON.stringify(input.scopes),
     AT,
-    input.kind ?? 'project',
-    input.orgId ?? null,
   );
   return secret;
 }
@@ -140,12 +139,28 @@ function addUser(db: DatabaseSync, id: string, orgId: string, role: Role, email:
   ).run(id, orgId, email, email, role, AT, AT);
 }
 
-function addProject(db: DatabaseSync, id: string, orgId: string, slug: string, name: string): void {
+function addPartition(db: DatabaseSync, id: string, orgId: string, slug: string, name: string): void {
   db.prepare(
-    `INSERT INTO projects
-       (id, org_id, slug, name, description, status, region, env, settings, created_at, updated_at)
-     VALUES (?, ?, ?, ?, '', 'active', 'cn-shanghai', 'production', '{}', ?, ?)`,
+    `INSERT INTO partitions
+       (id, org_id, slug, name, description, status, settings, created_at, updated_at)
+     VALUES (?, ?, ?, ?, '', 'active', '{}', ?, ?)`,
   ).run(id, orgId, slug, name, AT, AT);
+}
+
+function fakeEnv() {
+  return loadEnv({
+    host: '127.0.0.1',
+    port: 0,
+    authDisabled: false,
+    quotaEnforce: false,
+    demoMode: false,
+    metricsEnabled: false,
+    logLevel: 'error',
+    requestTimeoutMs: 15_000,
+    shutdownTimeoutMs: 1_000,
+    dreamSchedulerEnabled: false,
+    dreamTickMs: 60_000,
+  });
 }
 
 export async function startServer(app: AppContext): Promise<{ server: Server; baseUrl: string }> {
@@ -175,21 +190,9 @@ export async function setupHttpFixture(): Promise<HttpFixture> {
   addUser(db, 'usr_developer', 'org_test', 'developer', 'developer@test.dev');
   addUser(db, 'usr_viewer', 'org_test', 'viewer', 'viewer@test.dev');
 
-  addProject(db, 'prj_alpha', 'org_test', 'alpha', 'Alpha 分区');
-  addProject(db, 'prj_beta', 'org_test', 'beta', 'Beta 分区');
-  addProject(db, 'prj_foreign', 'org_other', 'foreign', '外部组织分区');
-
-  for (const [userId, role] of [
-    ['usr_developer', 'developer'],
-    ['usr_viewer', 'viewer'],
-  ] as const) {
-    db.prepare('INSERT INTO project_members (project_id, user_id, role, created_at) VALUES (?, ?, ?, ?)').run(
-      'prj_alpha',
-      userId,
-      role,
-      AT,
-    );
-  }
+  addPartition(db, 'ptn_alpha', 'org_test', 'alpha', 'Alpha 分区');
+  addPartition(db, 'ptn_beta', 'org_test', 'beta', 'Beta 分区');
+  addPartition(db, 'ptn_foreign', 'org_other', 'foreign', '外部组织分区');
 
   const sessions = {
     owner: addSession(db, 'usr_owner'),
@@ -198,49 +201,35 @@ export async function setupHttpFixture(): Promise<HttpFixture> {
     viewer: addSession(db, 'usr_viewer'),
   };
 
-  const projectKey = addKey(db, {
-    projectId: 'prj_alpha',
-    name: 'alpha 项目 key',
+  const partitionKey = addKey(db, {
+    partitionId: 'ptn_alpha',
+    name: 'alpha 分区 key',
     scopes: ['memories:read', 'memories:write', 'admin'],
   });
-  const projectReadKey = addKey(db, {
-    projectId: 'prj_alpha',
+  const partitionReadKey = addKey(db, {
+    partitionId: 'ptn_alpha',
     name: 'alpha 只读 key',
     scopes: ['memories:read'],
   });
   const orgKey = addKey(db, {
-    projectId: 'prj_alpha',
+    orgId: 'org_test',
     name: '组织级 key',
     scopes: ['memories:read', 'memories:write', 'admin'],
     kind: 'org',
-    orgId: 'org_test',
   });
   const foreignOrgKey = addKey(db, {
-    projectId: 'prj_foreign',
+    orgId: 'org_other',
     name: '外部组织 key',
     scopes: ['memories:read', 'memories:write', 'admin'],
     kind: 'org',
-    orgId: 'org_other',
   });
 
-  const bus = new EventBus();
-  const engine = createMemoryService(db, { bus });
+  const engine = createMemoryService(db);
   const logger = fakeLogger();
   const metrics = fakeMetrics();
-  const env = loadEnv({
-    host: '127.0.0.1',
-    port: 0,
-    authDisabled: false,
-    quotaEnforce: false,
-    demoMode: false,
-    metricsEnabled: false,
-    logLevel: 'error',
-    requestTimeoutMs: 15_000,
-    shutdownTimeoutMs: 1_000,
-    dreamSchedulerEnabled: false,
-  });
+  const env = fakeEnv();
   const platform = fakePlatform(logger, metrics);
-  const app: AppContext = { db, engine, env, bus, startedAt: Date.now(), logger, metrics, platform };
+  const app: AppContext = { db, engine, env, startedAt: Date.now(), logger, metrics, platform };
 
   const { server, baseUrl } = await startServer(app);
   return {
@@ -249,12 +238,12 @@ export async function setupHttpFixture(): Promise<HttpFixture> {
     baseUrl,
     orgId: 'org_test',
     otherOrgId: 'org_other',
-    projectId: 'prj_alpha',
-    projectSlug: 'alpha',
-    betaId: 'prj_beta',
+    partitionId: 'ptn_alpha',
+    partitionSlug: 'alpha',
+    betaId: 'ptn_beta',
     sessions,
-    projectKey,
-    projectReadKey,
+    partitionKey,
+    partitionReadKey,
     orgKey,
     foreignOrgKey,
     async close() {

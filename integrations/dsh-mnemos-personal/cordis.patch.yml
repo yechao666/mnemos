@@ -10,7 +10,7 @@
 # 本插件只有主机半边（无 `dsh.client` 声明）：工具与系统提示段都在宿主进程里，
 # 设置页由 dsh 的自动表单（导出的 Config schema + .volatile() 字段）生成。
 #
-# 新版 Mnemos（中立记忆服务 v5）：分区 = DSH 会话工作区，记忆按人（Person）组织。
+# Mnemos v6（中立记忆服务）：分区 = DSH 会话工作区，记忆按人（Person）组织，人/记忆列表用游标分页。
 # 旧插件 integrations/dsh-mnemos（行 id `dsh-mnemos`）保持不动，两者可同时安装。
 - insert:
     - id: dsh-mnemos-personal

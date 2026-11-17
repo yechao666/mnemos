@@ -1,23 +1,32 @@
 /**
- * Mnemos 新版中立 REST 客户端（`/v1/partitions/:partition/...`，org key 鉴权，snake_case 入参）。
+ * Mnemos v6 中立 REST 客户端（`/v1/partitions/:partition/...`，org key 鉴权，snake_case 入参）。
  *
- * 契约来源：本仓库 `docs/neutral-memory-model.md` 第 5 节「API（v1 中立面）」：
+ * 契约来源：本仓库 `docs/v6-architecture.md` 第 3 节「API（v6，干净面）」：
  * - 鉴权：`Authorization: Bearer mnemos_live_*`；org key 可访问/创建本组织任意分区。
  * - 端点默认挂在 `/v1/partitions/:partition/...`，`:partition` 支持分区 id 或 slug。
  * - JSON 一律 snake_case。
+ * - 人 / 记忆列表统一**游标分页**：响应 `{ items, next_cursor, partition_stats }`，
+ *   不返回 total（百万级不 COUNT(*)）；`limit` 默认 50、上限 200。
  * - 错误体沿用旧约定：`{ error: { code, message, details?, requestId } }`，
  *   `x-request-id` 响应头里也有同一个 id。
  *
- * 本插件只负责「分区 + 人 + 记忆 + 简报 / 上下文」这几条链路；所有失败都归一成
+ * 本插件只负责「分区 + 人 + 记忆 + 简报 / 上下文 / 做梦」这几条链路；所有失败都归一成
  * {@link MnemosApiError}（带 `status` / `code` / `action`），工具层再转成
  * `{ ok:false, error, action }`，`execute()` 永远不抛异常。
+ *
+ * 响应解析刻意宽容：服务端可能用 `{ items }` 或 `{ results }` / 裸数组，单条写入可能返回
+ * `{ items:[...] }` / `{ memory }` / 裸记忆对象；这里统一归一，避免一次后端小改动就让读路径全挂。
  */
 /** 单次 HTTP 请求缺省超时（毫秒）。 */
 export const DEFAULT_TIMEOUT_MS = 15_000;
 /** 检索缺省条数（服务端上限 50）。 */
 export const DEFAULT_TOP_K = 8;
-/** 记忆条数上限（服务端 top_k 上限）。 */
+/** 检索条数上限（服务端 top_k 上限）。 */
 export const MAX_TOP_K = 50;
+/** 列表缺省条数（v6 游标分页：默认 50）。 */
+export const DEFAULT_LIST_LIMIT = 50;
+/** 列表条数上限（v6 游标分页：最大 200）。 */
+export const MAX_LIST_LIMIT = 200;
 /** 请求失败（非 2xx、网络错误、配置缺失）。 */
 export class MnemosApiError extends Error {
     status;
@@ -73,7 +82,7 @@ function actionFor(status, code) {
         return '触发限流或配额：稍后重试，或换一个 org key。';
     }
     if (status === 400 || normalized === 'VALIDATION_ERROR' || normalized === 'BAD_REQUEST') {
-        return '参数被服务端拒绝：检查 scope（session scope 必须带 session_id）、top_k（≤ 50）、person_id 与分区 slug 的格式。';
+        return '参数被服务端拒绝：检查 scope（session scope 必须带 session_id）、top_k（≤ 50）、limit（≤ 200）、person_id 与分区 slug 的格式。';
     }
     if (status === 503 || status === 504) {
         return 'Mnemos 服务暂时不可用：确认服务已启动后重试。';
@@ -87,6 +96,9 @@ function isTimeoutError(error) {
 function asRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value) ? value : undefined;
 }
+function isRecord(value) {
+    return asRecord(value) !== undefined;
+}
 function stringField(record, ...keys) {
     if (record === undefined)
         return undefined;
@@ -97,11 +109,18 @@ function stringField(record, ...keys) {
     }
     return undefined;
 }
+/**
+ * 看起来像分区的内部 id（v6 `ptn_*`；旧 `prj_*`）。
+ * 这种引用必须直接 GET，不能拿去 `POST /v1/partitions {slug}` 当成新 slug upsert。
+ */
+export function looksLikePartitionId(value) {
+    return /^(ptn|prj)_[A-Za-z0-9]+$/.test(value);
+}
 /** 从 `{ partition }` / 裸分区对象提取分区视图。 */
 export function extractPartition(payload, fallbackSlug, fallbackName) {
     const root = asRecord(payload);
-    const partition = asRecord(root?.partition) ?? asRecord(root?.project) ?? root;
-    const id = stringField(partition, 'id', 'partition_id', 'project_id');
+    const partition = asRecord(root?.partition) ?? root;
+    const id = stringField(partition, 'id', 'partition_id');
     const slug = stringField(partition, 'slug') ?? fallbackSlug;
     const name = stringField(partition, 'name') ?? fallbackName ?? slug;
     const info = { slug, name };
@@ -114,8 +133,7 @@ export function extractPartition(payload, fallbackSlug, fallbackName) {
 export function extractPerson(payload, fallbackExternalId) {
     const root = asRecord(payload);
     const person = asRecord(root?.person) ?? root;
-    const externalId = stringField(person, 'external_id', 'externalId') ??
-        fallbackExternalId;
+    const externalId = stringField(person, 'external_id', 'externalId') ?? fallbackExternalId;
     const info = { externalId };
     const id = stringField(person, 'id');
     if (id !== undefined)
@@ -125,6 +143,91 @@ export function extractPerson(payload, fallbackExternalId) {
         info.type = type;
     info.raw = payload;
     return info;
+}
+/**
+ * 从列表响应里取数组：容忍 `items`（v6）/ `results` / 裸数组。
+ * 单条响应（`{ memory }` / 裸记忆对象）也会被归一成单元素数组。
+ */
+export function extractMemories(payload) {
+    const record = asRecord(payload);
+    if (record !== undefined) {
+        for (const key of ['items', 'results', 'memories']) {
+            const value = record[key];
+            if (Array.isArray(value))
+                return value.filter(isRecord);
+        }
+        const single = asRecord(record.memory) ?? asRecord(record.result);
+        if (single !== undefined)
+            return [single];
+        if (typeof record.id === 'string' || typeof record.content === 'string')
+            return [record];
+    }
+    if (Array.isArray(payload))
+        return payload.filter(isRecord);
+    return [];
+}
+/** 从响应里取人数组：容忍 `items` / `results` / `persons` / `people` / 裸数组。 */
+export function extractPeople(payload) {
+    const record = asRecord(payload);
+    if (record !== undefined) {
+        for (const key of ['items', 'results', 'persons', 'people']) {
+            const value = record[key];
+            if (Array.isArray(value))
+                return value.filter(isRecord);
+        }
+    }
+    if (Array.isArray(payload))
+        return payload.filter(isRecord);
+    return [];
+}
+/** 把 v6 列表响应归一成 `{ items, next_cursor, partition_stats }`。 */
+export function extractCursorPage(payload, ...itemKeys) {
+    const record = asRecord(payload);
+    let items = [];
+    if (Array.isArray(payload)) {
+        items = payload;
+    }
+    else if (record !== undefined) {
+        for (const key of itemKeys) {
+            const value = record[key];
+            if (Array.isArray(value)) {
+                items = value;
+                break;
+            }
+        }
+    }
+    const page = { items, raw: payload };
+    if (record !== undefined) {
+        const nextCursor = stringField(record, 'next_cursor', 'nextCursor');
+        if (nextCursor !== undefined)
+            page.next_cursor = nextCursor;
+        const stats = asRecord(record.partition_stats) ?? asRecord(record.partitionStats);
+        if (stats !== undefined)
+            page.partition_stats = stats;
+    }
+    return page;
+}
+/** 分区统计响应：容忍 `{ stats }` / `{ partition_stats }` / 裸对象。 */
+export function extractStats(payload) {
+    const record = asRecord(payload);
+    if (record === undefined)
+        return {};
+    return (asRecord(record.stats) ??
+        asRecord(record.partition_stats) ??
+        asRecord(record.partitionStats) ??
+        record);
+}
+/** 检索响应归一：`results` / `items` / 裸数组；带 took_ms / next_cursor。 */
+function normalizeSearch(payload) {
+    const record = asRecord(payload);
+    const result = { results: extractMemories(payload), raw: payload };
+    const tookMs = typeof record?.took_ms === 'number' ? record.took_ms : typeof record?.tookMs === 'number' ? record.tookMs : undefined;
+    if (tookMs !== undefined)
+        result.took_ms = tookMs;
+    const nextCursor = stringField(record, 'next_cursor', 'nextCursor');
+    if (nextCursor !== undefined)
+        result.next_cursor = nextCursor;
+    return result;
 }
 /**
  * 读取活配置的 Mnemos 客户端：每次请求都重新解析配置，
@@ -137,7 +240,7 @@ export class MnemosClient {
     partitionCache = new Map();
     /** slug → 进行中的 ensure（并发工具调用只发一次 POST）。 */
     partitionInflight = new Map();
-    /** `${分区 slug}\0${externalId}` → 人视图（首次 PUT 成功后缓存）。 */
+    /** `${分区引用}\0${externalId}` → 人视图（首次 PUT 成功后缓存）。 */
     personCache = new Map();
     constructor(config, options = {}) {
         this.config = config;
@@ -155,7 +258,7 @@ export class MnemosClient {
     getTimeoutMs() {
         return this.timeoutMs;
     }
-    /** 分区路径前缀：`/v1/partitions/:partition`。 */
+    /** 分区路径前缀：`/v1/partitions/:partition`（:partition 支持 id 或 slug）。 */
     partitionPath(partitionRef, suffix = '') {
         return `/v1/partitions/${encodeURIComponent(partitionRef)}${suffix}`;
     }
@@ -282,6 +385,12 @@ export class MnemosClient {
         return promise;
     }
     async doEnsurePartition(slug, name) {
+        // fixed 模式允许直接填分区 id：按 id 读，不要用 id 当 slug 去 upsert（会建出错误分区）。
+        if (looksLikePartitionId(slug)) {
+            const info = extractPartition(await this.request('GET', this.partitionPath(slug)), slug, name);
+            this.partitionCache.set(slug, info);
+            return info;
+        }
         let payload;
         try {
             payload = await this.request('POST', '/v1/partitions', { body: { slug, name: name ?? slug } });
@@ -307,9 +416,13 @@ export class MnemosClient {
         this.partitionCache.set(slug, info);
         return info;
     }
-    /** `GET /v1/partitions/:partition` —— 分区信息。 */
+    /** `GET /v1/partitions/:partition` —— 分区信息（含 settings）。 */
     getPartition(partitionRef) {
         return this.request('GET', this.partitionPath(partitionRef));
+    }
+    /** `GET /v1/partitions/:partition/stats` —— 分区统计（直接读 partition_stats）。 */
+    async getPartitionStats(partitionRef) {
+        return extractStats(await this.request('GET', this.partitionPath(partitionRef, '/stats')));
     }
     /** 清空缓存（测试 / 配置切换后强制重新 ensure）。 */
     clearCache() {
@@ -347,21 +460,29 @@ export class MnemosClient {
             return info;
         });
     }
-    /** `GET /v1/partitions/:p/persons/:person` —— 人详情 + 统计。 */
+    /** `GET /v1/partitions/:p/persons/:person` —— 人详情（计数在 persons 行上）。 */
     getPerson(partitionRef, personRef) {
         return this.request('GET', this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}`));
     }
-    /** `GET /v1/partitions/:p/persons` —— 人列表（type / status / q / 分页）。 */
-    listPersons(partitionRef, query = {}) {
-        return this.request('GET', this.partitionPath(partitionRef, '/persons'), {
+    /** `PATCH /v1/partitions/:p/persons/:person` —— 更新展示名 / 类型 / 属性 / 状态。 */
+    updatePerson(partitionRef, personRef, body) {
+        return this.request('PATCH', this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}`), {
+            body,
+        });
+    }
+    /** `GET /v1/partitions/:p/persons` —— 人列表（游标分页 + q / type / status / sort）。 */
+    async listPersons(partitionRef, query = {}) {
+        const payload = await this.request('GET', this.partitionPath(partitionRef, '/persons'), {
             query: {
+                cursor: query.cursor,
+                limit: query.limit,
+                q: query.q,
                 type: query.type,
                 status: query.status,
-                q: query.q,
-                page: query.page,
-                page_size: query.page_size,
+                sort: query.sort,
             },
         });
+        return extractCursorPage(payload, 'items', 'results', 'persons', 'people');
     }
     /** `GET /v1/partitions/:p/persons/:person/brief` —— 人的简报。 */
     getPersonBrief(partitionRef, personRef) {
@@ -373,28 +494,113 @@ export class MnemosClient {
             body,
         });
     }
+    /** `GET /v1/partitions/:p/persons/:person/dream` —— 人级做梦状态。 */
+    getPersonDream(partitionRef, personRef) {
+        return this.request('GET', this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}/dream`));
+    }
+    /** `POST /v1/partitions/:p/persons/:person/dream/run` —— 触发人级做梦。 */
+    runPersonDream(partitionRef, personRef, body = {}) {
+        return this.request('POST', this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}/dream/run`), {
+            body,
+        });
+    }
     /* ------------------------------------------------------------------ */
     /* 记忆                                                                */
     /* ------------------------------------------------------------------ */
-    /** `POST /v1/partitions/:p/memories` —— 写记忆。 */
-    addMemory(partitionRef, body) {
-        return this.request('POST', this.partitionPath(partitionRef, '/memories'), { body });
+    /** `POST /v1/partitions/:p/persons/:person/memories` —— 给该人写记忆（person 在路径里）。 */
+    async addMemory(partitionRef, personRef, body) {
+        const payload = await this.request('POST', this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}/memories`), { body });
+        const record = asRecord(payload);
+        const events = Array.isArray(record?.events) ? record.events : [];
+        return { memories: extractMemories(payload), events, raw: payload };
     }
-    /** `POST /v1/partitions/:p/memories/search` —— 检索。 */
-    searchMemories(partitionRef, body) {
-        return this.request('POST', this.partitionPath(partitionRef, '/memories/search'), { body });
-    }
-    /** `GET /v1/partitions/:p/memories` —— 列表（person / scope / category / 分页）。 */
-    listMemories(partitionRef, query = {}) {
-        return this.request('GET', this.partitionPath(partitionRef, '/memories'), {
+    /** `GET /v1/partitions/:p/persons/:person/memories` —— 该人记忆：游标分页 + scope/category。 */
+    async listPersonMemories(partitionRef, personRef, query = {}) {
+        const payload = await this.request('GET', this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}/memories`), {
             query: {
+                cursor: query.cursor,
+                limit: query.limit,
+                scope: query.scope,
+                category: query.category,
+                q: query.q,
+            },
+        });
+        return extractCursorPage(payload, 'items', 'results', 'memories');
+    }
+    /** `GET /v1/partitions/:p/memories` —— 记忆全局列表（person_id / scope / category / q，游标分页）。 */
+    async listMemories(partitionRef, query = {}) {
+        const payload = await this.request('GET', this.partitionPath(partitionRef, '/memories'), {
+            query: {
+                cursor: query.cursor,
+                limit: query.limit,
                 person_id: query.person_id,
                 scope: query.scope,
                 category: query.category,
-                page: query.page,
-                page_size: query.page_size,
+                q: query.q,
             },
         });
+        return extractCursorPage(payload, 'items', 'results', 'memories');
+    }
+    /**
+     * 检索记忆。
+     *
+     * v6 的检索就是「记忆列表 + `q`」（FTS 前缀），`POST .../memories/search` 是官方兼容端点
+     * （v6 后端返回 `{ results, took_ms, next_cursor, partition_stats }`）。注意它的 `person_id`
+     * 是**作者过滤**而不是「该人可见」：默认检索（未指定 scope）要取两次 —— 本人记忆 + 分区共享 ——
+     * 再按 id 去重，才与工具承诺的「该人可见 + 分区共享知识」一致。
+     */
+    async searchMemories(partitionRef, body) {
+        // scope 明确：单查该范围；没给 person_id：分区级检索。
+        if (body.scope !== undefined || body.person_id === undefined) {
+            return this.searchOnce(partitionRef, body);
+        }
+        const [own, shared] = await Promise.all([
+            this.searchOnce(partitionRef, body),
+            this.searchOnce(partitionRef, {
+                query: body.query,
+                scope: 'partition',
+                category: body.category,
+                top_k: body.top_k,
+            }),
+        ]);
+        const limit = body.top_k ?? DEFAULT_TOP_K;
+        const seen = new Set();
+        const results = [];
+        for (const memory of [...own.results, ...shared.results]) {
+            const key = memory.id ?? `${memory.content ?? ''}|${memory.created_at ?? ''}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            results.push(memory);
+            if (results.length >= limit)
+                break;
+        }
+        const merged = { results, raw: { own: own.raw, shared: shared.raw } };
+        if (own.took_ms !== undefined || shared.took_ms !== undefined) {
+            merged.took_ms = (own.took_ms ?? 0) + (shared.took_ms ?? 0);
+        }
+        return merged;
+    }
+    /** 单次检索：优先 `POST .../memories/search`，端点不存在时退化为 `GET .../memories?q=`。 */
+    async searchOnce(partitionRef, body) {
+        try {
+            const payload = await this.request('POST', this.partitionPath(partitionRef, '/memories/search'), { body });
+            return normalizeSearch(payload);
+        }
+        catch (error) {
+            if (!(error instanceof MnemosApiError) || (error.status !== 404 && error.status !== 405))
+                throw error;
+            const payload = await this.request('GET', this.partitionPath(partitionRef, '/memories'), {
+                query: {
+                    q: body.query,
+                    person_id: body.person_id,
+                    scope: body.scope,
+                    category: body.category,
+                    limit: body.top_k,
+                },
+            });
+            return normalizeSearch(payload);
+        }
     }
     /** `GET /v1/partitions/:p/memories/:id` —— 记忆详情。 */
     getMemory(partitionRef, id) {

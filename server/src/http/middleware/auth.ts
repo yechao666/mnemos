@@ -1,7 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { ROLE_RANK } from '../../../../shared/src/constants.ts';
-import type { ApiScope, Org, Project, Role, User } from '../../../../shared/src/types.ts';
+import type { ApiScope, Org, Partition, Role, User } from '../../../../shared/src/types.ts';
 import type { AppContext } from '../../contracts.ts';
+import { findPartitionRow, loadStatsRow } from '../../engine/partition.ts';
 import { sha256, nowIso } from '../../lib/ids.ts';
 import type { ApiKeyAuth, ConsoleAuth, RequestContext } from '../context.ts';
 import { headerOf } from '../context.ts';
@@ -9,23 +10,22 @@ import {
   parseJsonArray,
   toApiKey,
   toOrg,
-  toProject,
+  toPartition,
   toUser,
   type ApiKeyRow,
   type OrgRow,
-  type ProjectRow,
   type UserRow,
 } from '../mappers.ts';
 import { HttpError, errors } from '../respond.ts';
 
-/** T1 的 ops 路由直接从这里取会话认证类型；保持再导出避免跨层导入。 */
 export type { ApiKeyAuth, ConsoleAuth } from '../context.ts';
 
 /**
- * 认证与授权：
- *  - 控制台：sessions.token_hash = sha256(Bearer token)
- *  - 公开 v1：api_keys.key_hash = sha256(mnemos_live_…)，按 scopes 授权
- *  - MNEMOS_AUTH_DISABLED=1 时控制台放行（回退到首个 owner 用户）
+ * 认证与授权（v6）：
+ *  - 控制台：user_sessions.token_hash = sha256(Bearer token)
+ *  - 公开 v1：api_keys.key_hash = sha256(mnemos_live_…)；partition key 只能访问自身分区，
+ *    org key（kind=org）可访问 / 创建本组织任意分区
+ *  - 分区访问：读 viewer+，写 developer+，密钥/设置 admin+（控制台按组织角色）
  */
 
 const SESSION_LAST_SEEN_THROTTLE_MS = 60_000;
@@ -39,7 +39,6 @@ interface RateWindow {
 
 const rateWindows = new Map<string, RateWindow>();
 
-/** 指标按命名约定前缀 `mnemos_`，T1 的 /metrics 直接输出同名序列。 */
 function bumpMetric(app: AppContext, name: string, labels?: Record<string, string>, value = 1): void {
   const metrics = app.metrics;
   if (!metrics || typeof metrics.counter !== 'function') return;
@@ -72,7 +71,6 @@ export function parseIpv4Rule(value: string): Ipv4Rule | null {
   return { address: octets.join('.'), prefix };
 }
 
-/** allowedIps 中每一项都必须是合法 IPv4 或 CIDR。 */
 export function isValidIpRule(value: string): boolean {
   return parseIpv4Rule(value) !== null;
 }
@@ -155,7 +153,6 @@ function consumeRateLimit(rc: RequestContext, keyId: string, limitPerMin: number
   setRateLimitHeaders(rc, limitPerMin, limitPerMin - count, resetMs);
   if (count > limitPerMin) {
     rc.res.setHeader('Retry-After', String(Math.max(1, Math.ceil((resetMs - now) / 1000))));
-    // 429 的 rate_limited 计数由 observability 中间件统一完成，这里不重复累加。
     throw errors.rateLimited(`超出该 API Key 的速率限制（${limitPerMin} 次/分钟）`);
   }
 }
@@ -223,21 +220,22 @@ function authenticateConsoleInner(rc: RequestContext, allowQueryToken: boolean):
   if (!token) throw errors.unauthorized('缺少 Authorization: Bearer 会话令牌');
 
   const row = app.db
-    .prepare('SELECT s.expires_at AS expires_at, u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?')
+    .prepare(
+      'SELECT s.expires_at AS expires_at, u.* FROM user_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?',
+    )
     .get(sha256(token)) as unknown as (UserRow & { expires_at: string }) | undefined;
 
   if (!row) throw errors.unauthorized('会话令牌无效，请重新登录');
 
   const expiresAt = Date.parse(row.expires_at);
   if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-    app.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+    app.db.prepare('DELETE FROM user_sessions WHERE token_hash = ?').run(sha256(token));
     throw errors.unauthorized('会话已过期，请重新登录');
   }
 
-  // 兜底：T1 的登录拦截之外，禁用账号的历史会话也不得继续使用。
   if (row.status === 'disabled') {
-    app.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
-    throw new HttpError(401, 'account_disabled', '账号已被禁用，请联系组织管理员');
+    app.db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(row.id);
+    throw new HttpError(401, 'ACCOUNT_DISABLED', '账号已被禁用，请联系组织管理员');
   }
 
   const org = loadOrg(app.db, row.org_id);
@@ -283,7 +281,7 @@ function authenticateApiKeyInner(rc: RequestContext): ApiKeyAuth {
   if (row.expires_at) {
     const expiresAt = Date.parse(row.expires_at);
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-      throw new HttpError(401, 'key_expired', '该 API Key 已过期，请在控制台轮换或创建新密钥');
+      throw new HttpError(401, 'KEY_EXPIRED', '该 API Key 已过期，请在控制台轮换或创建新密钥');
     }
   }
 
@@ -291,28 +289,31 @@ function authenticateApiKeyInner(rc: RequestContext): ApiKeyAuth {
   if (allowedIps.length > 0) {
     const ip = requestIp(app, rc);
     if (!isIpAllowed(ip, allowedIps)) {
-      throw new HttpError(403, 'ip_not_allowed', `当前来源 IP（${normalizeClientIp(ip) || '未知'}）不在该 API Key 的白名单内`);
+      throw new HttpError(403, 'IP_NOT_ALLOWED', `当前来源 IP（${normalizeClientIp(ip) || '未知'}）不在该 API Key 的白名单内`);
     }
   }
 
   const isOrgKey = row.kind === 'org';
-  let org: Org | undefined;
+  let org: Org | null = null;
+  let partition: Partition | undefined;
+
   if (isOrgKey) {
     const orgId = (row.org_id ?? '').trim();
     if (!orgId) throw errors.invalidApiKey('组织级 API Key 缺少组织绑定，请重新创建');
-    const loaded = loadOrg(app.db, orgId);
-    if (!loaded) throw errors.invalidApiKey('API Key 绑定的组织不存在');
-    org = loaded;
+    org = loadOrg(app.db, orgId);
+    if (!org) throw errors.invalidApiKey('API Key 绑定的组织不存在');
+  } else {
+    const partitionId = (row.partition_id ?? '').trim();
+    if (!partitionId) throw errors.invalidApiKey('分区级 API Key 缺少分区绑定，请重新创建');
+    const partitionRow = app.db.prepare('SELECT * FROM partitions WHERE id = ?').get(partitionId) as unknown as
+      | Parameters<typeof toPartition>[0]
+      | undefined;
+    if (!partitionRow) throw errors.invalidApiKey('API Key 绑定的分区不存在');
+    partition = toPartition(partitionRow);
+    org = loadOrg(app.db, partition.orgId);
+    if (!org) throw errors.invalidApiKey('API Key 绑定的组织不存在');
+    if (partition.status === 'archived') throw errors.forbidden('分区已归档，无法继续调用');
   }
-
-  const projectRow = app.db.prepare('SELECT * FROM projects WHERE id = ?').get(row.project_id) as unknown as
-    | ProjectRow
-    | undefined;
-  if (!projectRow) throw errors.invalidApiKey('API Key 绑定的项目不存在');
-
-  const project = toProject(projectRow);
-  // project key 绑定单一分区，归档后整体拒绝；org key 的锚点分区只用于审计，不随其归档失效。
-  if (!isOrgKey && project.status === 'archived') throw errors.forbidden('项目已归档，无法继续调用');
 
   const lastUsedMs = row.last_used_at ? Date.parse(row.last_used_at) : 0;
   let lastUsedAt = row.last_used_at;
@@ -324,7 +325,7 @@ function authenticateApiKeyInner(rc: RequestContext): ApiKeyAuth {
   const key = toApiKey({ ...row, last_used_at: lastUsedAt });
   consumeRateLimit(rc, key.id, Math.max(1, key.rateLimitPerMin));
 
-  return org ? { kind: 'api_key', key, project, org } : { kind: 'api_key', key, project };
+  return { kind: 'api_key', key, org, partition };
 }
 
 export function hasScope(scopes: ApiScope[], required: ApiScope): boolean {
@@ -354,106 +355,58 @@ export function requireKeyAuth(rc: RequestContext): ApiKeyAuth {
   return rc.auth;
 }
 
-/** 用户在项目中的有效角色：org owner/admin 天然拥有全部项目。 */
-export function effectiveProjectRole(app: AppContext, user: User, projectId: string): Role | null {
-  if (ROLE_RANK[user.role] >= ROLE_RANK.admin) return user.role;
-  const row = app.db
-    .prepare('SELECT role FROM project_members WHERE project_id = ? AND user_id = ?')
-    .get(projectId, user.id) as unknown as { role: string } | undefined;
-  return row ? (row.role as Role) : null;
-}
-
-export function findProjectRow(app: AppContext, projectId: string): ProjectRow | null {
-  const row = app.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) as unknown as
-    | ProjectRow
-    | undefined;
-  return row ?? null;
-}
-
-export function findProject(app: AppContext, projectId: string): Project | null {
-  const row = findProjectRow(app, projectId);
-  return row ? toProject(row) : null;
-}
-
-/** 校验并返回项目；api_key 认证时项目由 key 决定。 */
-export function requireProjectAccess(rc: RequestContext, projectId: string, minRole: Role): Project {
-  if (!rc.auth) throw errors.unauthorized();
-
-  if (rc.auth.kind === 'api_key') {
-    if (rc.auth.project.id !== projectId) throw errors.notFound('项目不存在');
-    return rc.auth.project;
-  }
-
-  const row = findProjectRow(rc.app, projectId);
-  if (!row || row.org_id !== rc.auth.user.orgId) throw errors.notFound('项目不存在');
-  const project = toProject(row);
-  const role = effectiveProjectRole(rc.app, rc.auth.user, project.id);
-  if (!role) throw errors.forbidden('你不是该项目的成员');
-  if (ROLE_RANK[role] < ROLE_RANK[minRole]) {
+export function requireConsoleRole(rc: RequestContext, minRole: Role): ConsoleAuth {
+  const auth = requireConsoleAuth(rc);
+  if (ROLE_RANK[auth.user.role] < ROLE_RANK[minRole]) {
     throw errors.forbidden(`该操作需要 ${minRole} 及以上角色`);
   }
-  return project;
+  return auth;
 }
 
-/** 当前用户可见项目（org owner/admin 可见全部；其余仅作为成员的项目）。 */
-export function visibleProjects(app: AppContext, user: User): Project[] {
-  const rows =
-    ROLE_RANK[user.role] >= ROLE_RANK.admin
-      ? (app.db
-          .prepare('SELECT * FROM projects WHERE org_id = ? ORDER BY created_at ASC')
-          .all(user.orgId) as unknown as ProjectRow[])
-      : (app.db
-          .prepare(
-            `SELECT p.* FROM projects p
-               JOIN project_members pm ON pm.project_id = p.id
-              WHERE p.org_id = ? AND pm.user_id = ?
-              ORDER BY p.created_at ASC`,
-          )
-          .all(user.orgId, user.id) as unknown as ProjectRow[]);
-  return rows.map(toProject);
+/** 要求 org 级 API Key（如创建分区、组织级统计）。 */
+export function requireOrgKey(rc: RequestContext): ApiKeyAuth {
+  const auth = requireKeyAuth(rc);
+  if (auth.key.kind !== 'org') {
+    throw errors.forbidden('该操作需要组织级 API Key（kind=org）；分区 key 只能操作自身分区');
+  }
+  return auth;
 }
 
-/* ------------------------------------------------------------------ */
-/* 中立 API：分区解析（/v1/partitions/:partition）                      */
-/* ------------------------------------------------------------------ */
-
-/** 按内部 id 或组织内 slug 查找分区行。 */
-export function findPartitionRow(app: AppContext, orgId: string, ref: string): ProjectRow | null {
-  const value = typeof ref === 'string' ? ref.trim() : '';
-  if (!value) return null;
-  const byId = app.db.prepare('SELECT * FROM projects WHERE id = ?').get(value) as unknown as ProjectRow | undefined;
-  if (byId) return byId;
-  const bySlug = app.db
-    .prepare('SELECT * FROM projects WHERE org_id = ? AND slug = ?')
-    .get(orgId, value) as unknown as ProjectRow | undefined;
-  return bySlug ?? null;
+/** 组织内可见分区（控制台：组织角色即分区权限）。 */
+export function visiblePartitions(app: AppContext, user: User): Partition[] {
+  const rows = app.db
+    .prepare('SELECT * FROM partitions WHERE org_id = ? ORDER BY created_at ASC, id ASC')
+    .all(user.orgId) as unknown as Parameters<typeof toPartition>[0][];
+  return rows.map((row) => toPartition(row, loadStatsRow(app.db, row.id)));
 }
 
 /**
  * API Key 视角解析分区：`:partition` 支持内部 id 或 slug。
- *  - project key：只能命中自身分区（id 或 slug 均可，slug 命中后仍校验 id 一致）；
+ *  - partition key：只能命中自身分区；
  *  - org key：可命中本组织任意分区。
  * 越权与不存在统一 404，避免探测其他组织的分区。
  */
-export function requireApiKeyPartition(rc: RequestContext, ref: string): Project {
+export function requireApiKeyPartition(rc: RequestContext, ref: string): Partition {
   const auth = requireKeyAuth(rc);
-  if (auth.key.kind === 'org') {
-    const org = auth.org;
-    if (!org) throw errors.forbidden('组织级 API Key 缺少组织上下文，请重新创建');
-    const row = findPartitionRow(rc.app, org.id, ref);
-    if (!row || row.org_id !== org.id) throw errors.notFound('分区不存在');
-    return toProject(row);
+  const row = findPartitionRow(rc.app.db, auth.org.id, ref);
+  if (!row) throw errors.notFound('分区不存在');
+  if (auth.key.kind !== 'org') {
+    if (!auth.partition || row.id !== auth.partition.id) throw errors.notFound('分区不存在');
   }
-  const row = findPartitionRow(rc.app, auth.project.orgId, ref);
-  if (!row || row.id !== auth.project.id) throw errors.notFound('分区不存在');
-  return toProject(row);
+  return toPartition(row);
 }
 
-/** 要求 org 级 API Key（如创建分区）；project key 会得到 403。 */
-export function requireOrgKey(rc: RequestContext): ApiKeyAuth {
-  const auth = requireKeyAuth(rc);
-  if (auth.key.kind !== 'org') {
-    throw errors.forbidden('该操作需要组织级 API Key（kind=org），project key 只能操作自身分区');
-  }
-  return auth;
+/** 控制台视角解析分区：组织角色即分区角色。 */
+export function requireConsolePartition(rc: RequestContext, ref: string, minRole: Role = 'viewer'): Partition {
+  const auth = requireConsoleRole(rc, minRole);
+  const row = findPartitionRow(rc.app.db, auth.org.id, ref);
+  if (!row) throw errors.notFound('分区不存在');
+  return toPartition(row);
+}
+
+/** 按当前认证类型解析分区。 */
+export function resolvePartition(rc: RequestContext, ref: string, minRole: Role = 'viewer'): Partition {
+  if (!rc.auth) throw errors.unauthorized();
+  if (rc.auth.kind === 'api_key') return requireApiKeyPartition(rc, ref);
+  return requireConsolePartition(rc, ref, minRole);
 }

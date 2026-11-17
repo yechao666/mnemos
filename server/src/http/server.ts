@@ -2,14 +2,12 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { AppContext } from '../contracts.ts';
 import { recordUsage } from '../lib/usage.ts';
-import { assertQuota, evaluateProjectQuota } from '../platform/quota.ts';
 import { createRequestContext, type RequestContext } from './context.ts';
-import { assertScopes, authenticateApiKey, authenticateConsole, requireProjectAccess } from './middleware/auth.ts';
+import { assertScopes, authenticateApiKey, authenticateConsole } from './middleware/auth.ts';
 import { applyCors, handlePreflight } from './middleware/cors.ts';
 import { createObservability, resolveRequestId, type Observability } from './middleware/observability.ts';
 import { applySecurityHeaders } from './middleware/security.ts';
 import { createRequestTimeout } from './middleware/timeout.ts';
-import { buildOpenApiDocument } from './openapi.ts';
 import { errors, normalizeError, sendError } from './respond.ts';
 import { normalizePath, Router, type RouteMatch } from './router.ts';
 import { registerRoutes } from './routes/index.ts';
@@ -20,8 +18,7 @@ import { currentTraceId, withSpan } from '../observability/otel.ts';
  * HTTP 传输层入口：由 main.ts 调用，只返回 Server 实例，不监听端口。
  *
  * 处理顺序：安全响应头 → 请求可观测性（请求 ID / 访问日志 / 指标）
- * → CORS → 超时守护 → 路由匹配 → 认证/授权 → 配额 → handler
- * → 错误映射 → 用量记录。
+ * → CORS → 超时守护 → 路由匹配 → 认证 → handler → 错误映射 → 用量记录。
  */
 
 let activeObservability: Observability | null = null;
@@ -30,24 +27,6 @@ let activeServer: Server | null = null;
 export function createHttpServer(ctx: AppContext): Server {
   const router = new Router();
   registerRoutes(router);
-
-  // OpenAPI 文档：两处路径都返回，便于网关/前端按不同前缀访问。
-  router.add({
-    method: 'GET',
-    path: '/openapi.json',
-    auth: 'none',
-    handler: (rc: RequestContext) => {
-      rc.json(buildOpenApiDocument(rc.app));
-    },
-  });
-  router.add({
-    method: 'GET',
-    path: '/api/openapi.json',
-    auth: 'none',
-    handler: (rc: RequestContext) => {
-      rc.json(buildOpenApiDocument(rc.app));
-    },
-  });
 
   const observability = createObservability(ctx);
   activeObservability = observability;
@@ -68,10 +47,7 @@ export function createHttpServer(ctx: AppContext): Server {
   return server;
 }
 
-/**
- * 优雅停机辅助：关闭空闲 keep-alive、结束 SSE、等待 in-flight 请求
- * （最多 env.shutdownTimeoutMs）。由 main 在收到信号后调用。
- */
+/** 优雅停机辅助：关闭空闲 keep-alive、结束 SSE、等待 in-flight 请求。 */
 export async function drainConnections(): Promise<void> {
   const observability = activeObservability;
   if (!observability) return;
@@ -91,9 +67,9 @@ export function connectionStats(): { inFlight: number; sseClients: number } {
   };
 }
 
-function lookupProjectOrg(app: AppContext, projectId: string): string | undefined {
+function lookupPartitionOrg(app: AppContext, partitionId: string): string | undefined {
   try {
-    const row = app.db.prepare('SELECT org_id FROM projects WHERE id = ?').get(projectId) as unknown as
+    const row = app.db.prepare('SELECT org_id FROM partitions WHERE id = ?').get(partitionId) as unknown as
       | { org_id: string }
       | undefined;
     return row?.org_id;
@@ -112,11 +88,11 @@ function recordRequestUsage(app: AppContext, rc: RequestContext, status: number,
       : auth?.kind === 'api_key'
         ? `API Key · ${auth.key.name}`
         : 'system';
-  const orgId = usage.orgId ?? lookupProjectOrg(app, usage.projectId);
+  const orgId = usage.orgId ?? lookupPartitionOrg(app, usage.partitionId);
   try {
     recordUsage(app.db, {
       orgId,
-      projectId: usage.projectId,
+      partitionId: usage.partitionId,
       apiKeyId: auth?.kind === 'api_key' ? auth.key.id : usage.apiKeyId,
       channel: usage.channel,
       operation: usage.operation,
@@ -131,17 +107,6 @@ function recordRequestUsage(app: AppContext, rc: RequestContext, status: number,
   } catch (error) {
     app.logger.error('http.usage_record_failed', { requestId: rc.requestId, error });
   }
-}
-
-/** 月度写入配额：仅对 operation=add 的写请求在鉴权后、handler 前检查。 */
-function enforceQuota(app: AppContext, rc: RequestContext, operation: string | undefined): void {
-  if (!app.env.quotaEnforce) return;
-  if (operation !== 'add' || !rc.project) return;
-  const state = evaluateProjectQuota(app.db, rc.project);
-  if (!state.exceeded) return;
-  rc.res.setHeader('retry-after', String(state.retryAfter));
-  app.metrics.counter('mnemos_quota_rejected_total');
-  assertQuota(state);
 }
 
 function logRequestFailure(
@@ -202,7 +167,6 @@ async function dispatch(
   try {
     const matched = router.match(method, pathname);
     if (matched === 'METHOD_MISMATCH') {
-      // 避免把含 ID 的真实路径写进指标标签（高基数）。
       tracker.setRoute('method_mismatch');
       throw errors.methodNotAllowed(method, pathname);
     }
@@ -239,40 +203,10 @@ async function dispatch(
     } else if (meta.auth === 'apikey') {
       const auth = authenticateApiKey(rc);
       rc.auth = auth;
-      rc.project = auth.project;
       tracker.setActor(`API Key · ${auth.key.name}`);
-      // org key 只能走自身声明了 allowOrgKey 的端点（/v1/partitions/*），
-      // 否则会隐式落到创建时的锚点分区，语义不清。
-      if (auth.key.kind === 'org' && meta.allowOrgKey !== true) {
-        throw errors.forbidden(
-          '组织级 API Key（kind=org）不能调用分区级旧端点，请使用 /v1/partitions/:partition/... 形式指定分区',
-        );
-      }
       if (meta.scopes && meta.scopes.length > 0) assertScopes(auth, meta.scopes);
     }
 
-    if (meta.project) {
-      const param = meta.project.param ?? 'id';
-      const projectId = routeMatch.params[param];
-      if (!projectId) throw errors.badRequest(`缺少路径参数 ${param}`);
-      rc.project = requireProjectAccess(rc, projectId, meta.project.minRole ?? 'viewer');
-    }
-
-    if (meta.operation && rc.project) {
-      rc.usage = {
-        projectId: rc.project.id,
-        operation: meta.operation,
-        channel: meta.channel ?? 'console',
-        resultCount: 0,
-        memoryTokens: 0,
-        orgId: rc.project.orgId,
-      };
-    }
-
-    enforceQuota(app, rc, meta.operation);
-
-    // 手动 server span：OTel 的 HttpInstrumentation 在 Node ESM 下无法自动挂钩
-    // 已加载的 node:http，因此这里显式包裹 handler，保证开启 OTEL 时一定有链路。
     const context = rc;
     await withSpan(
       `${method} ${meta.path}`,
@@ -281,7 +215,6 @@ async function dispatch(
         'http.route': meta.path,
         'http.target': pathname,
         'mnemos.request_id': requestId,
-        ...(context.project ? { 'mnemos.project_id': context.project.id } : {}),
         ...(meta.operation ? { 'mnemos.operation': meta.operation } : {}),
       },
       async () => {
@@ -292,9 +225,6 @@ async function dispatch(
     );
     if (!res.headersSent && !res.writableEnded) {
       throw errors.internal('路由处理器未返回响应');
-    }
-    if (pathname === '/api/events' && res.headersSent && !res.writableEnded) {
-      tracker.markSse();
     }
   } catch (error) {
     logRequestFailure(app, requestId, method, pathname, error);

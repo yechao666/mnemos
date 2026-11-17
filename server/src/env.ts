@@ -48,13 +48,7 @@ export interface Env {
   bootstrapName?: string;
   bootstrapOrgName?: string;
   bootstrapOrgSlug?: string;
-  /* --- Webhook 投递 --- */
-  webhooksEnabled: boolean;
-  webhookTimeoutMs: number;
-  webhookMaxAttempts: number;
-  webhookWorkerIntervalMs: number;
-  webhookAllowPrivate: boolean;
-  /* --- 记忆做梦调度 --- */
+  /* --- 做梦调度 --- */
   /** MNEMOS_DREAM_SCHEDULER≠0/'' 时开启（默认 true） */
   dreamSchedulerEnabled: boolean;
   /** 调度 tick 间隔（毫秒，默认 60000，最小 5000） */
@@ -64,7 +58,7 @@ export interface Env {
   otelEndpoint: string;
   otelSampleRate: number;
   otelServiceName: string;
-  /** 存储驱动：当前仅 sqlite；postgres 见 docs/scaling.md，尚未实现 */
+  /** 存储驱动：当前仅 sqlite */
   storageDriver: 'sqlite' | 'postgres';
 }
 
@@ -95,7 +89,8 @@ function format(value: string | undefined): LogFormat {
 }
 
 export function loadEnv(overrides: Partial<Env> = {}): Env {
-  const dataDir = process.env.MNEMOS_DATA_DIR ?? join(APP_ROOT, 'data');
+  // v6 与 v5 数据目录分离：v5 的 data/ 保留不迁移，v6 默认使用 data-v6/。
+  const dataDir = process.env.MNEMOS_DATA_DIR ?? join(APP_ROOT, 'data-v6');
   const llmKey = process.env.MNEMOS_LLM_API_KEY ?? process.env.OPENAI_API_KEY ?? '';
   const llmBase = process.env.MNEMOS_LLM_BASE_URL ?? process.env.OPENAI_BASE_URL ?? '';
 
@@ -136,11 +131,6 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     bootstrapName: process.env.MNEMOS_BOOTSTRAP_NAME,
     bootstrapOrgName: process.env.MNEMOS_BOOTSTRAP_ORG_NAME,
     bootstrapOrgSlug: process.env.MNEMOS_BOOTSTRAP_ORG_SLUG,
-    webhooksEnabled: flag(process.env.MNEMOS_WEBHOOKS_ENABLED, true),
-    webhookTimeoutMs: num(process.env.MNEMOS_WEBHOOK_TIMEOUT_MS, 5_000),
-    webhookMaxAttempts: Math.min(12, num(process.env.MNEMOS_WEBHOOK_MAX_ATTEMPTS, 6)),
-    webhookWorkerIntervalMs: num(process.env.MNEMOS_WEBHOOK_WORKER_INTERVAL_MS, 2_000),
-    webhookAllowPrivate: flag(process.env.MNEMOS_WEBHOOK_ALLOW_PRIVATE, false),
     dreamSchedulerEnabled: flagDefaultOn(process.env.MNEMOS_DREAM_SCHEDULER),
     dreamTickMs: Math.max(5_000, num(process.env.MNEMOS_DREAM_TICK_MS, 60_000)),
     otelEnabled: flag(process.env.MNEMOS_OTEL_ENABLED, false),
@@ -171,7 +161,7 @@ export function validateEnv(env: Env): string[] {
   if (env.requestTimeoutMs < 1_000) problems.push('MNEMOS_REQUEST_TIMEOUT_MS 至少 1000');
   if (env.maintenanceIntervalMs < 60_000) problems.push('维护间隔至少 1 分钟');
   if (env.storageDriver !== 'sqlite') {
-    problems.push('MNEMOS_STORAGE=postgres 尚未实现（见 docs/scaling.md Phase 1），当前版本仅支持 sqlite');
+    problems.push('MNEMOS_STORAGE=postgres 尚未实现，当前版本仅支持 sqlite');
   }
   if (env.logLevel && !['debug', 'info', 'warn', 'error'].includes(env.logLevel)) {
     problems.push(`MNEMOS_LOG_LEVEL 非法：${env.logLevel}`);
@@ -196,7 +186,6 @@ export function validateEnv(env: Env): string[] {
   const production = env.nodeEnv === 'production';
   if (production && env.authDisabled) problems.push('生产环境禁止 MNEMOS_AUTH_DISABLED=1');
   if (production && env.demoMode) {
-    // 演示数据本身不致命，但生产应显式关闭自动 seed
     problems.push('生产环境建议设置 MNEMOS_DEMO=0，避免空库自动写入演示数据');
   }
   return problems;

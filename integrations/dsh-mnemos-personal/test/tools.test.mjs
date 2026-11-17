@@ -1,8 +1,9 @@
 /**
- * 工具层测试：node:test + 假 Mnemos v5 服务（test/helpers.mjs），不依赖真实后端。
+ * 工具层测试：node:test + 假 Mnemos **v6** 服务（test/helpers.mjs），不依赖真实后端。
  *
- * 覆盖：分区绑定与隔离、默认人、按人隔离、scope=session 缺省 session_id、readOnly 拦截、
- * 简报 / 上下文 prompt、人管理、连接自检、错误归一（{ok:false,error,action}）、ensure 降级。
+ * 覆盖：分区绑定与隔离、默认人、按人隔离、游标分页（persons / memories）、scope=session 缺省
+ * session_id、readOnly 拦截、简报 / 上下文 prompt、人管理、连接自检、错误归一
+ * （{ok:false,error,action}）、ensure 降级、v6 partition_stats。
  */
 
 import assert from 'node:assert/strict'
@@ -49,6 +50,13 @@ function renderOf(tool, args, result) {
   return blocks[0].text
 }
 
+/** v6 人级写记忆请求（POST .../persons/:person/memories）。 */
+function addRequestOf(fake) {
+  return fake.requests.find(
+    (request) => request.method === 'POST' && /\/persons\/[^/]+\/memories$/.test(request.pathname),
+  )
+}
+
 describe('工具清单', () => {
   it('注册 8 个 mnemos_* 工具，名称与文档一致', async () => {
     const fake = await createMnemosFake()
@@ -81,7 +89,7 @@ describe('工具清单', () => {
 })
 
 describe('mnemos_workspace：工作区 → 分区 + 默认人', () => {
-  it('首次调用建分区与默认人，返回分区 / 人 / 统计；二次调用复用缓存', async () => {
+  it('首次调用建分区与默认人，返回分区 / 人 / partition_stats；二次调用复用缓存', async () => {
     const fake = await createMnemosFake()
     try {
       const { byName, exec } = makeHarness(fake)
@@ -91,7 +99,20 @@ describe('mnemos_workspace：工作区 → 分区 + 默认人', () => {
       assert.equal(result.partition.slug, expectedSlug)
       assert.equal(result.person.external_id, 'dsh-agent')
       assert.equal(result.person.type, 'agent')
-      assert.deepEqual(result.stats, { memories: 0, shared_memories: 0, sessions: 0 })
+      assert.equal(result.person.memory_count, 0)
+      // v6：统计直接来自 partition_stats（人的计数在 persons 行上）。
+      assert.deepEqual(result.stats, {
+        partition_id: result.partition.id,
+        persons_total: 1,
+        persons_human: 0,
+        persons_agent: 1,
+        persons_service: 0,
+        memories_total: 0,
+        shared_total: 0,
+        sessions_total: 0,
+        updated_at: '2026-11-17T00:00:00.000Z',
+      })
+      assert.match(renderOf(byName.get('mnemos_workspace'), {}, result), /分区已就绪/)
 
       // 假服务端真的存了分区 / 人
       assert.ok(fake.state.partitions.has(expectedSlug))
@@ -147,10 +168,25 @@ describe('mnemos_workspace：工作区 → 分区 + 默认人', () => {
       await fake.close()
     }
   })
+
+  it('fixed 模式可填分区内部 id：直接 GET，不按 id 新建分区', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const seeded = fake.seedPartition('mnemos-prod', 'mnemos-prod')
+      const { byName, exec } = makeHarness(fake, { partitionMode: 'fixed', fixedPartition: seeded.id })
+      const result = await byName.get('mnemos_workspace').execute({}, exec('/work/whatever'))
+      assert.equal(result.ok, true, result.error)
+      assert.equal(result.partition.slug, 'mnemos-prod')
+      assert.equal(result.partition.id, seeded.id)
+      assert.equal(fake.countRequests('POST', '/v1/partitions'), 0)
+    } finally {
+      await fake.close()
+    }
+  })
 })
 
-describe('mnemos_add：默认人与写路径', () => {
-  it('默认 scope 由服务端决定（缺省不传），person_id 落到默认人的内部 id', async () => {
+describe('mnemos_add：默认人与写路径（v6 人级端点）', () => {
+  it('缺省 scope 不传；写路径用默认人的内部 id（POST persons/:person/memories）', async () => {
     const fake = await createMnemosFake()
     try {
       const { byName, exec } = makeHarness(fake)
@@ -158,11 +194,14 @@ describe('mnemos_add：默认人与写路径', () => {
       assert.equal(result.ok, true, result.error)
       assert.equal(result.added, 1)
 
-      const addRequest = fake.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/memories'))
-      assert.ok(addRequest)
+      const addRequest = addRequestOf(fake)
+      assert.ok(addRequest, '应走 POST /persons/:person/memories')
+      const expectedSlug = workspaceSlug('/work/demo')
+      const person = fake.state.persons.get(`${expectedSlug}/dsh-agent`)
+      assert.equal(addRequest.pathname, `/v1/partitions/${expectedSlug}/persons/${person.id}/memories`)
       assert.equal(addRequest.body.text, '订单查询要拆分')
       assert.equal(addRequest.body.scope, undefined)
-      assert.match(addRequest.body.person_id, /^prs_/, '应写默认人的内部 id')
+      assert.equal(addRequest.body.person_id, undefined, 'person 在路径里，body 不再重复')
       assert.equal(fake.state.memories[0].person_external_id, 'dsh-agent')
     } finally {
       await fake.close()
@@ -184,10 +223,11 @@ describe('mnemos_add：默认人与写路径', () => {
         exec(),
       )
       assert.equal(result.ok, true, result.error)
-      const person = fake.state.persons.get(`${workspaceSlug('/work/demo')}/alice`)
+      const slug = workspaceSlug('/work/demo')
+      const person = fake.state.persons.get(`${slug}/alice`)
       assert.ok(person, '写前应 PUT 建档')
-      const addRequest = fake.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/memories'))
-      assert.equal(addRequest.body.person_id, person.id)
+      const addRequest = addRequestOf(fake)
+      assert.equal(addRequest.pathname, `/v1/partitions/${slug}/persons/${person.id}/memories`)
       assert.equal(addRequest.body.scope, 'person')
       assert.equal(addRequest.body.category, 'preference')
       assert.deepEqual(addRequest.body.tags, ['ui'])
@@ -202,8 +242,7 @@ describe('mnemos_add：默认人与写路径', () => {
       const { byName, exec } = makeHarness(fake)
       const ok = await byName.get('mnemos_add').execute({ text: '本次会话的临时上下文', scope: 'session' }, exec('/work/demo', 'sess_42'))
       assert.equal(ok.ok, true, ok.error)
-      const addRequest = fake.requests.find((request) => request.method === 'POST' && request.pathname.endsWith('/memories'))
-      assert.equal(addRequest.body.session_id, 'sess_42')
+      assert.equal(addRequestOf(fake).body.session_id, 'sess_42')
 
       const withoutSession = await byName.get('mnemos_add').execute(
         { text: 'x', scope: 'session' },
@@ -269,7 +308,24 @@ describe('按人组织：检索 / 列表隔离', () => {
     }
   })
 
-  it('mnemos_get：按 id 取详情 / 默认人分页列表', async () => {
+  it('v6 没有 search 端点时退化为列表 q 搜索，仍包含他人写的分区共享', async () => {
+    const fake = await createMnemosFake({ searchEndpoint: false })
+    try {
+      const { byName, exec } = makeHarness(fake)
+      await byName.get('mnemos_add').execute({ text: 'agent 私有经验', scope: 'person' }, exec())
+      await byName.get('mnemos_add').execute({ text: '共享经验约定', person_id: 'alice', scope: 'partition' }, exec())
+      const result = await byName.get('mnemos_search').execute({ query: '经验' }, exec())
+      assert.equal(result.ok, true, result.error)
+      assert.equal(result.count, 2)
+      const texts = result.results.map((memory) => memory.content).join('|')
+      assert.match(texts, /agent 私有经验/)
+      assert.match(texts, /共享经验约定/)
+    } finally {
+      await fake.close()
+    }
+  })
+
+  it('mnemos_get：按 id 取详情 / 默认人游标列表', async () => {
     const fake = await createMnemosFake()
     try {
       const { byName, exec } = makeHarness(fake)
@@ -284,7 +340,35 @@ describe('按人组织：检索 / 列表隔离', () => {
       const list = await byName.get('mnemos_get').execute({}, exec())
       assert.equal(list.ok, true, list.error)
       assert.equal(list.count, 1)
-      assert.equal(list.page, 1)
+      assert.equal(list.next_cursor, undefined)
+    } finally {
+      await fake.close()
+    }
+  })
+
+  it('mnemos_get 列表用 cursor/limit 翻页，scope=partition 只列共享', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const { byName, exec } = makeHarness(fake)
+      for (const content of ['一', '二', '三']) {
+        await byName.get('mnemos_add').execute({ text: content, scope: 'person' }, exec())
+      }
+      await byName.get('mnemos_add').execute({ text: '共享', scope: 'partition' }, exec())
+
+      const first = await byName.get('mnemos_get').execute({ limit: 2 }, exec())
+      assert.equal(first.ok, true, first.error)
+      assert.equal(first.count, 2)
+      assert.ok(first.next_cursor, '还有下一页时返回 next_cursor')
+
+      const second = await byName.get('mnemos_get').execute({ limit: 2, cursor: first.next_cursor }, exec())
+      assert.equal(second.ok, true)
+      assert.equal(second.count, 2)
+      assert.equal(second.next_cursor, undefined)
+
+      const shared = await byName.get('mnemos_get').execute({ scope: 'partition' }, exec())
+      assert.equal(shared.ok, true)
+      assert.equal(shared.count, 1)
+      assert.equal(shared.results[0].content, '共享')
     } finally {
       await fake.close()
     }
@@ -359,6 +443,39 @@ describe('mnemos_person：list / get / upsert', () => {
       await fake.close()
     }
   })
+
+  it('list 用 v6 游标分页（cursor/limit），返回 next_cursor 与 partition_stats', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const { byName, exec } = makeHarness(fake)
+      for (const [externalId, type] of [
+        ['alice', 'human'],
+        ['bob', 'human'],
+        ['dsh-agent', 'agent'],
+      ]) {
+        await byName.get('mnemos_person').execute(
+          { action: 'upsert', person_id: externalId, type, display_name: externalId },
+          exec(),
+        )
+      }
+
+      const first = await byName.get('mnemos_person').execute({ action: 'list', limit: 2 }, exec())
+      assert.equal(first.ok, true, first.error)
+      assert.equal(first.count, 2)
+      assert.ok(first.next_cursor, '还有下一页时返回 next_cursor')
+      assert.equal(first.partition_stats.persons_total, 3)
+
+      const second = await byName.get('mnemos_person').execute(
+        { action: 'list', limit: 2, cursor: first.next_cursor },
+        exec(),
+      )
+      assert.equal(second.ok, true)
+      assert.equal(second.count, 1)
+      assert.equal(second.next_cursor, undefined)
+    } finally {
+      await fake.close()
+    }
+  })
 })
 
 describe('readOnly 模式', () => {
@@ -378,7 +495,10 @@ describe('readOnly 模式', () => {
       assert.equal(upsert.ok, false)
       assert.match(upsert.error, /readOnly/)
 
-      assert.equal(fake.countRequests('POST', `/v1/partitions/${workspaceSlug('/work/demo')}/memories`), 0)
+      const writes = fake.requests.filter(
+        (request) => request.method === 'POST' && request.pathname.includes('/memories'),
+      )
+      assert.equal(writes.length, 0)
       assert.equal(
         fake.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/persons/')).length,
         0,

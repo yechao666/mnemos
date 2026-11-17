@@ -1,11 +1,10 @@
 import { NavLink } from 'react-router-dom';
-import { APP_NAME, APP_TAGLINE } from '@shared';
+import { APP_NAME, APP_TAGLINE, APP_VERSION } from '@lib/constants.ts';
 import { useAuth } from '@lib/auth.tsx';
 import { api } from '@lib/api.ts';
 import { useAsync, useMediaQuery } from '@lib/hooks.ts';
-import { fmtCompact, fmtPct } from '@lib/format.ts';
-import { Icon, IconButton, Progress } from '@ui';
-import { toneForStatus } from '@lib/tone.ts';
+import { Icon, IconButton } from '@ui';
+import { partitionStatusTone, partitionTone, partitionInitial } from './util.ts';
 import { NAV_ENTRIES } from './nav.ts';
 
 export interface SidebarProps {
@@ -16,25 +15,17 @@ export interface SidebarProps {
 }
 
 export function Sidebar({ open, collapsed, onClose, onToggleCollapse }: SidebarProps) {
-  const { org, projects } = useAuth();
+  const { org, partitions } = useAuth();
   const isMobile = useMediaQuery('(max-width: 1024px)');
   const compact = collapsed && !isMobile;
 
-  // 侧栏配额与健康状态：失败时静默降级为占位符，不影响导航。
-  const dashboard = useAsync(() => api.dashboard(), []);
+  // 健康状态失败时静默降级，不影响导航。
   const health = useAsync(() => api.health(), []);
-
-  // 配额按「本月记忆注入 Token」计量，与项目 settings.monthlyQuota 同口径
-  const used = dashboard.data?.totals.tokensSaved ?? 0;
-  const quota = projects.reduce((sum, project) => sum + (project.settings?.monthlyQuota ?? 0), 0);
-  const pct = quota > 0 ? Math.min(100, (used / quota) * 100) : 0;
-  const usageReady = Boolean(dashboard.data) && quota > 0;
 
   const healthTone = health.error ? 'red' : health.data?.ok ? 'green' : 'slate';
   const healthLabel = health.loading ? '检测中' : health.error ? '服务不可用' : health.data?.ok ? '服务正常' : '状态未知';
-  const healthVersion = health.data?.version ? `v${health.data.version}` : undefined;
 
-  const quickProjects = projects.slice(0, 4);
+  const quickPartitions = partitions.slice(0, 6);
   const navLinkClass = ({ isActive }: { isActive: boolean }) => `nav-item${isActive ? ' active' : ''}`;
   const compactStyle = compact ? { justifyContent: 'center', padding: 0 } : undefined;
 
@@ -55,13 +46,7 @@ export function Sidebar({ open, collapsed, onClose, onToggleCollapse }: SidebarP
         {isMobile ? (
           <IconButton icon="x" label="关闭导航" size="sm" onClick={onClose} />
         ) : compact ? null : (
-          <IconButton
-            icon="panelLeft"
-            label="收起侧边栏"
-            size="sm"
-            onClick={onToggleCollapse}
-            aria-expanded
-          />
+          <IconButton icon="panelLeft" label="收起侧边栏" size="sm" onClick={onToggleCollapse} aria-expanded />
         )}
       </div>
 
@@ -77,8 +62,8 @@ export function Sidebar({ open, collapsed, onClose, onToggleCollapse }: SidebarP
           >
             <Icon name={item.icon} size={16} />
             {compact ? null : <span className="truncate">{item.label}</span>}
-            {!compact && item.to === '/projects' && projects.length > 0 ? (
-              <span className="nav-badge">{projects.length}</span>
+            {!compact && item.to === '/partitions' && partitions.length > 0 ? (
+              <span className="nav-badge">{partitions.length}</span>
             ) : null}
           </NavLink>
         ))}
@@ -86,20 +71,27 @@ export function Sidebar({ open, collapsed, onClose, onToggleCollapse }: SidebarP
         {compact ? null : (
           <>
             <div className="nav-section">快速访问</div>
-            {quickProjects.length === 0 ? (
+            {quickPartitions.length === 0 ? (
               <div className="tiny dim" style={{ padding: '4px 10px' }}>
-                暂无项目
+                暂无分区
               </div>
             ) : (
-              quickProjects.map((project) => (
+              quickPartitions.map((partition) => (
                 <NavLink
-                  key={project.id}
-                  to={`/projects/${project.id}`}
+                  key={partition.id}
+                  to={`/partitions/${partition.id}`}
                   className={navLinkClass}
-                  title={project.name}
+                  title={`${partition.name} · ${partition.slug}`}
                 >
-                  <span className={`dot tone-${toneForStatus(project.status)}`} aria-hidden="true" />
-                  <span className="truncate">{project.name}</span>
+                  <span
+                    className={`project-mark tone-${partitionTone(partition.id)}`}
+                    style={{ width: 18, height: 18, borderRadius: 6, fontSize: 9, flexShrink: 0 }}
+                    aria-hidden="true"
+                  >
+                    {partitionInitial(partition.name)}
+                  </span>
+                  <span className="truncate grow">{partition.name}</span>
+                  <span className={`dot tone-${partitionStatusTone(partition.status)}`} aria-hidden="true" />
                 </NavLink>
               ))
             )}
@@ -109,30 +101,26 @@ export function Sidebar({ open, collapsed, onClose, onToggleCollapse }: SidebarP
 
       <div className="sidebar-foot">
         {compact ? (
-          <div className="center" title={`${healthLabel}${healthVersion ? ` · ${healthVersion}` : ''}`}>
+          <div className="center" title={healthLabel}>
             <span className={`dot tone-${healthTone}${healthTone === 'green' ? ' dot-pulse' : ''}`} />
           </div>
         ) : (
           <>
-            <div className="usage-meter">
-              <div className="usage-meter-head">
-                <span>月度配额</span>
-                <span className="mono">{usageReady ? fmtPct(pct, 1) : '—'}</span>
-              </div>
-              <Progress value={usageReady ? pct : 0} thin tone={pct > 85 ? 'amber' : 'violet'} />
-              <div className="between tiny dim mt-8">
-                <span className="truncate">{usageReady ? `已用 ${fmtCompact(used)}` : '等待用量数据'}</span>
-                <span className="nowrap">{usageReady ? `上限 ${fmtCompact(quota)}` : '—'}</span>
-              </div>
-            </div>
             <div className="hstack" style={{ padding: '0 2px' }}>
-              <span className="status-dot" title={healthVersion}>
+              <span className="status-dot" title={health.data?.version}>
                 <span className={`dot tone-${healthTone}${healthTone === 'green' ? ' dot-pulse' : ''}`} />
                 {healthLabel}
               </span>
-              {healthVersion ? <span className="tiny dim mono ml-auto">{healthVersion}</span> : null}
+              <span className="tiny dim mono ml-auto">v{health.data?.version ?? APP_VERSION}</span>
             </div>
-            {org ? <div className="tiny dim truncate" style={{ padding: '0 2px' }} title={org.name}>{org.name}</div> : null}
+            {org ? (
+              <div className="tiny dim truncate" style={{ padding: '0 2px' }} title={org.name}>
+                {org.name} · {org.plan}
+              </div>
+            ) : null}
+            <div className="tiny dim truncate" style={{ padding: '0 2px' }}>
+              分区 → 人 → 记忆
+            </div>
           </>
         )}
       </div>
