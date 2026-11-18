@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import { useAuth } from '@lib/auth.tsx';
 import { useDocumentTitle, useMediaQuery } from '@lib/hooks.ts';
@@ -15,6 +15,7 @@ export function AppShell() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const scrollRef = useRef<HTMLElement | null>(null);
 
   useDocumentTitle(routeTitle(location.pathname, partitions));
 
@@ -22,6 +23,8 @@ export function AppShell() {
   useEffect(() => {
     setDrawerOpen(false);
     setPaletteOpen(false);
+    // 路由切换回到内容容器顶部（不滚动浏览器页面）。
+    scrollRef.current?.scrollTo({ top: 0 });
   }, [location.pathname]);
 
   useEffect(() => {
@@ -53,8 +56,10 @@ export function AppShell() {
           onToggleSidebar={() => setCollapsed((value) => !value)}
           onOpenPalette={() => setPaletteOpen(true)}
         />
-        <main className="app-main">
-          <Outlet />
+        <main ref={scrollRef} className="app-scroll">
+          <div className="app-main">
+            <Outlet />
+          </div>
         </main>
       </div>
 

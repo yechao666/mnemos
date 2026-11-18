@@ -122,3 +122,11 @@ export function XxxPage() {
 - 不修改别人负责的文件；先读再写；不要提交 git。
 - 完成后运行 `pnpm --filter @mnemos/web run build` 与
   `pnpm exec tsc -p web/tsconfig.json --noEmit`，确保零报错。
+
+
+## 外壳滚动（桌面 App 式）
+
+- `html/body/#root` 固定为 `height:100%; overflow:hidden`，浏览器页面本身不滚动。
+- `.app-shell` 占满 `100dvh`；`.sidebar` 与 `.topbar` 固定；唯一滚动容器是 `.app-scroll`（`overflow-y:auto; overscroll-behavior:contain`）。
+- 内容区 `.app-main` 在滚动容器内居中（max-width + padding），路由切换自动回到容器顶部。
+- 登录页 `.auth` 自持滚动；移动端同样只有内容容器滚动，抽屉/弹窗用 fixed 覆盖。

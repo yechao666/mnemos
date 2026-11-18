@@ -869,6 +869,9 @@
   position: sticky;
   top: 0;
   height: 100vh;
+  height: 100dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   width: var(--sidebar-w);
   flex-shrink: 0;
   display: flex;
@@ -1623,7 +1626,11 @@
 .auth {
   display: grid;
   grid-template-columns: 1.05fr 0.95fr;
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .auth-visual {
