@@ -13,6 +13,7 @@ import { blobToEmbedding, cosine, embedText } from './embed.ts';
 import { engineErrors } from './errors.ts';
 import { findPartitionById } from './partition.ts';
 import { resolvePersonRow } from './persons.ts';
+import { withPlaceholderCounts } from './privacy.ts';
 import {
   escapeLike,
   ftsQuery,
@@ -467,18 +468,24 @@ export function searchMemories(db: DatabaseSync, input: MemorySearchInput): Memo
       ? scored.filter((item) => item.keyword > 0.0001 || item.vector >= 0.15)
       : scored;
 
-  const hits: MemorySearchHit[] = withAttachmentCounts(db, relevant.slice(0, topK).map((item) => ({
-    ...item.memory,
-    score: round(item.score),
-    signals: {
-      vector: round(item.vector),
-      keyword: round(item.keyword),
-      recency: round(item.recency),
-      importance: round(item.importance),
-      entity: round(item.entity),
-    },
-    matchedOn: item.matchedOn,
-  })));
+  const hits: MemorySearchHit[] = withPlaceholderCounts(
+    db,
+    withAttachmentCounts(
+      db,
+      relevant.slice(0, topK).map((item) => ({
+        ...item.memory,
+        score: round(item.score),
+        signals: {
+          vector: round(item.vector),
+          keyword: round(item.keyword),
+          recency: round(item.recency),
+          importance: round(item.importance),
+          entity: round(item.entity),
+        },
+        matchedOn: item.matchedOn,
+      })),
+    ),
+  );
 
   return {
     hits,

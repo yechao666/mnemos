@@ -1,8 +1,8 @@
-# Mnemos v6.1 API 参考
+# Mnemos v6.2 API 参考
 
-> 契约：[`v6-architecture.md`](v6-architecture.md) + [`roadmap-v6.1.md`](roadmap-v6.1.md)。
-> 本文以 v6.1 代码为准（`server/src/http/routes/*.ts`、`server/src/http/serialize.ts`、
-> `server/src/http/schemas.ts`、`shared/src/types.ts`）。
+> 契约：[`v6-architecture.md`](v6-architecture.md) + [`roadmap-v6.1.md`](roadmap-v6.1.md) +
+> [`privacy-rules.md`](privacy-rules.md)（v6.2 隐私规则域）。
+> 本文以 v6.2 契约为准；v6.2 新增「隐私规则域」（第 6 节）与写入占位符协议，其余端点沿用 v6.1。
 >
 > 两套 JSON 命名约定，**不是两套能力**：
 >
@@ -12,7 +12,7 @@
 > | 控制台 API | `/api/...` | `Authorization: Bearer <登录会话令牌>` | `camelCase` |
 >
 > v6 **不保留** `/v1/memories`、`/v1/memories/search`、`/v1/context`、`/v1/projects`、`/v1/agents`、
-> `/v1/tasks`、`/v1/graph` 等旧端点；旧调用方需要迁移到分区 + 人模型（见[第 9 节](#9-与-v5-的差异)）。
+> `/v1/tasks`、`/v1/graph` 等旧端点；旧调用方需要迁移到分区 + 人模型（见[第 10 节](#10-与-v5-的差异)）。
 
 ---
 
@@ -24,7 +24,7 @@
 - **时间**：ISO 8601 UTC 字符串（如 `2026-11-17T16:00:44.852Z`）。
 - **请求 ID**：每个响应带 `x-request-id`；错误体里也有 `requestId`，可与日志关联。
 - **大小/超时**：请求体至少 1MB（`MNEMOS_BODY_LIMIT_BYTES` 可调大），请求超时默认 30s。
-- **探针**：`GET /health`、`GET /api/health`、`GET /healthz`、`GET /readyz`、`GET /metrics`（详见第 8 节）。
+- **探针**：`GET /health`、`GET /api/health`、`GET /healthz`、`GET /readyz`、`GET /metrics`（详见第 9 节）。
 - **幂等键**（v6.1，写接口）：请求头 `Idempotency-Key: <8–128 字符>`。服务端在
   `idempotency_keys` 表保留 **24 小时**：相同 key + 相同方法/路径/请求体直接回放首次响应
   （含状态码与响应体）；同一 key 用于不同方法/路径或不同 body 返回 `409 CONFLICT`。
@@ -182,7 +182,8 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
     "merge_threshold": 0.95,
     "dedupe_threshold": 0.98,
     "auto_extract_entities": true,
-    "pii_redaction": "off"
+    "pii_redaction": "off",
+    "privacy_llm_enabled": false
   },
   "created_at": "2026-11-17T16:00:44.840Z",
   "updated_at": "2026-11-17T16:00:44.840Z",
@@ -216,7 +217,8 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
 | `merge_threshold` | `mergeThreshold` | 0.95 | 余弦 ≥ 该值时新写入 MERGE 进已有记忆（0–1） |
 | `dedupe_threshold` | `dedupeThreshold` | 0.98 | 余弦 ≥ 该值时视为重复，返回 NOOP（0–1） |
 | `auto_extract_entities` | `autoExtractEntities` | true | 写入后异步 `extract` 实体（图谱依赖） |
-| `pii_redaction` | `piiRedaction` | `off` | `basic`：写入时脱敏手机号（保留后四位）/ 邮箱（`a***@domain`）/ 身份证 / 银行卡；`metadata.piiRedacted=true` 并写审计 |
+| `pii_redaction` | `piiRedaction` | `off` | `basic`：写入时执行隐私规则域的正则规则，脱敏手机号 / 邮箱 / 身份证 / 银行卡等（见第 6 节）；`metadata.piiRedacted=true` 并写审计 |
+| `privacy_llm_enabled` | `privacyLlmEnabled` | false | **v6.2** 是否执行 `kind=prompt` 的隐私规则（需配置 LLM；失败静默回退正则规则） |
 
 ### 4.2 PartitionStats
 
@@ -296,6 +298,7 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
   "feedback_up": 2,
   "feedback_down": 0,
   "attachment_count": 1,
+  "placeholder_count": 0,
   "attachments": [
     {
       "id": "att_9a1c2f3d4e5b6a7c",
@@ -328,6 +331,8 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&cursor=$CURSOR" \
 - `fact_key`：槽位键（如 `preference.language`）；同 key 新写入自动取代旧事实。
 - `feedback_up/down`：检索反馈计数；帮助度会按 ±0.05 微调 `confidence`（夹在 0.05–1）。
 - `attachment_count`：列表页只给数量；`attachments` 明细只在**详情 / 写入响应 / 导出**返回。
+- `placeholder_count`（v6.2）：正文中 `{{key}}` 占位符数量；列表 / 搜索 **不返回明文**，
+  详情默认只给占位符 key，`reveal` 才解密（见 [6.3](#63-占位符协议写入抽离)）。
 - `infer` / `mode` 字段被接受但忽略。
 
 ### 4.5 MemoryBrief / PersonContext / Dream
@@ -713,7 +718,7 @@ curl -s -X PUT "$BASE/v1/partitions/zhiwu-app/persons/user-123" \
 | `POST` | `/v1/partitions/:p/memories/search` | `memories:read` | v6.1 混合检索（`hits`/`signals`/`mode`/`strategy`；`results` 兼容） |
 | `GET` | `/v1/partitions/:p/memories/:id/history` | `memories:read` | 变更历史时间线 |
 | `POST` | `/v1/partitions/:p/memories/:id/feedback` | `memories:write` | 检索反馈（`helpful`） |
-| `GET` | `/v1/partitions/:p/memories/:id` | `memories:read` | 详情：`{ memory, person }`（含附件明细） |
+| `GET` | `/v1/partitions/:p/memories/:id` | `memories:read` | 详情：`{ memory, person }`（含附件明细）；`?reveal=placeholders`（或 `reveal=true`）返回解密占位符 |
 | `PATCH` | `/v1/partitions/:p/memories/:id` | `memories:write` | 更新 content/category/importance/confidence/status/tags/metadata/expires_at |
 | `DELETE` | `/v1/partitions/:p/memories/:id` | `memories:write` | 删除，返回 `204`（无响应体） |
 
@@ -782,6 +787,21 @@ curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/memories" \
   -d '{"text":"用户 123 喜欢黑咖啡，不加糖","scope":"person","category":"preference","importance":0.8,"tags":["drink"]}'
 ```
 
+隐私占位符（v6.2）：正文只写 `{{key}}`，真实值放 `placeholders`：
+
+```bash
+curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/memories" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{
+    "content": "张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。",
+    "placeholders": {
+      "phone_a1b2": "18334423321",
+      "mail_c3d4": "zhangsan@example.com"
+    },
+    "scope": "person"
+  }'
+```
+
 请求体：
 
 | 字段 | 类型 | 说明 |
@@ -796,6 +816,7 @@ curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/memories" \
 | `source` | 枚举 | 默认 `api` |
 | `tags` | string[]（≤20，每个≤64） | 默认 `[]` |
 | `metadata` | object | 默认 `{}` |
+| `placeholders` | object | **v6.2** 隐私占位符映射：正文写 `{{key}}`（key 为 `[A-Za-z0-9_-]{3,64}`），真实值放这里；正文只存 token，映射加密保存（见 6.3） |
 | `expires_at` | ISO/null | 过期时间 |
 | `supersedes_id` | string(≤128) | **v6.1** 显式取代某条记忆（旧记忆 `valid_to=now`） |
 | `fact_key` | string(≤120) | **v6.1** 事实槽位键；同 key 新写入自动取代旧事实 |
@@ -831,8 +852,9 @@ curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/memories" \
 - `NOOP`：完全重复（`normalized_hash` 相同）或余弦 ≥ `dedupe_threshold`；返回已有记忆，不新增。
 - `MERGE`：余弦 ≥ `merge_threshold`；更新已有记忆的内容/重要度/标签/metadata，返回合并后的记忆。
 - `SUPERSEDE`：显式 `supersedes_id` 或相同 `fact_key`；旧记忆被关闭，新记忆记录 `supersedes`。
-- PII：分区 `settings.pii_redaction=basic` 时正文落库前脱敏，`metadata.piiRedacted=true`，
-  写审计 `memory.pii_redacted`。
+- PII / 隐私规则（v6.2）：`settings.pii_redaction=basic` 时写入执行规则域的正则规则（落库前脱敏）；
+  `settings.privacy_llm_enabled=true` 时另外异步执行 `kind=prompt` 规则。主动抽离时传 `placeholders`，
+  正文只落 `{{key}}` token；详情需 `?reveal=placeholders` 才解密。详见[第 6 节](#6-隐私规则域v62)。
 
 带附件与演化字段的写入示例：
 
@@ -902,12 +924,223 @@ curl -s "$BASE/v1/partitions/mnemos-dev/entities?q=SQLite&limit=20" -H "authoriz
 
 ---
 
-## 6. 控制台 API（`/api`，会话鉴权）
+## 6. 隐私规则域（v6.2）
+
+> 契约：[`privacy-rules.md`](privacy-rules.md)。把 PII 脱敏从写死的 `basic` 逻辑升级为可维护的规则域：
+> **全局规则 + 分区规则**，每类规则支持 **正则（直接扫描）** 与 **提示词（LLM 抽取）**；
+> 写入支持**占位符 + 映射表**的隐私抽离协议；记忆整理（dream）同时执行规则与 LLM 隐私抽取。
+>
+> 实现状态：schema v8 `privacy_rules` / `memory_placeholders` 已上线，HTTP 端点已实现（规则 CRUD、preview、rescan、reveal）。
+> 请求 / 响应形状以 `privacy-rules.md` 与 `shared/src/types.ts` 为准，联调后如有调整会同步本文。
+
+### 6.1 PrivacyRule 字段
+
+`/api` 返回 camelCase（下表）；`/v1` 返回 snake_case（`partition_id`、`entity_type`、`mask_mode`、
+`mask_keep_last`、`mask_keep_first`、`created_at`、`updated_at`）。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 规则 id |
+| `scope` | `global` / `partition` | 全局规则 / 分区规则 |
+| `partitionId` | string? | `scope=partition` 时必填；`global` 为空 |
+| `code` | string | 规则编码：`email` / `phone` / `id_card` / `bank_card` / `name` / `address` / `credential` / `medical` / 自定义 |
+| `name` | string | 展示名 |
+| `kind` | `regex` / `prompt` | 正则扫描 / 提示词 LLM 抽取 |
+| `pattern` | string? | `kind=regex` 的正则源码 |
+| `flags` | string | 正则 flags，默认 `g` |
+| `instruction` | string? | `kind=prompt` 时告诉 LLM 抽取什么 |
+| `entityType` | string | 实体类型（`email` / `phone` / `name` / …） |
+| `action` | `mask` / `placeholder` | 命中后打码 / 生成占位符并记录映射 |
+| `maskMode` | `email` / `keepFirstLast` / `keepLast` / `full` | 打码方式（`action=mask`） |
+| `maskKeepFirst` / `maskKeepLast` | number | `keepFirstLast` 保留位数（默认 0 / 4） |
+| `enabled` | boolean | 是否启用 |
+| `priority` | number | 执行顺序，小者先（默认 100） |
+| `builtin` | boolean | 全局内置规则（不可删除，可覆盖 / 禁用） |
+| `createdAt` / `updatedAt` | ISO | 时间 |
+
+- 生效规则 = `global` 规则 + 该分区 `partition` 规则；同 `code` 时分区规则覆盖全局规则；
+  按 `priority` 升序执行，同 code 只保留一条。
+- 全局内置 regex：`email / id_card / phone / bank_card`（默认启用）；
+  全局内置 prompt：`name / address / credential / medical`（默认禁用，分区按需开启并需配置 LLM）。
+- 写入 / 更新入参（`PrivacyRuleInput`）：`code?`、`name`、`kind`、`pattern?`、`flags?`、
+  `instruction?`、`entityType?`、`action?`、`maskMode?`、`maskKeepLast?`、`maskKeepFirst?`、`enabled?`、`priority?`。
+
+### 6.2 开关与扫描
+
+| 设置 | 默认 | 说明 |
+| --- | --- | --- |
+| `piiRedaction`（`pii_redaction`） | `off` | 总开关；`basic` 时执行规则（regex + 已启用的 prompt 规则） |
+| `privacyLlmEnabled`（`privacy_llm_enabled`） | `false` | 是否执行 `kind=prompt` 规则；需可用 LLM，失败静默回退 regex |
+
+- 显式提交 `placeholders` 时，即使总开关 `off` 也保存（调用方主动抽离）。
+- 写入 / 更新后异步入队 `privacy` job；`dream` 整理时同步扫描输入记忆；
+  `memories.privacy_scanned_at` 防重复扫描；规则变更后可调 rescan 重扫。
+- regex 规则按 `priority` 执行，已替换片段（`*` 或 `{{token}}`）不会被后续规则重复命中；
+  prompt 规则由 LLM 返回 `{entities:[{code,value}]}`，服务端校验 value 确实出现在原文中（防幻觉）。
+
+### 6.3 占位符协议（写入抽离）
+
+```json
+{
+  "content": "张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。",
+  "placeholders": {
+    "phone_a1b2": "18334423321",
+    "mail_c3d4": "zhangsan@example.com"
+  },
+  "scope": "person"
+}
+```
+
+- token 格式 `{{key}}`；key 为 `[A-Za-z0-9_-]{3,64}`。
+- 正文里的每个 token 都必须有映射；映射中存在但正文未使用 → 忽略。
+- 值存入 `memory_placeholders`（AES-256-GCM，密钥 `MNEMOS_ENCRYPTION_KEY`；未配置时明文并标
+  `encrypted=0`）；记忆正文**只保存 token**（不落明文），`metadata.placeholderCount` 为数量。
+- 读取：
+  - 列表 / 搜索只返回 `placeholder_count` / `metadata.placeholderCount`；
+  - 详情默认返回占位符 keys：`placeholders: [{placeholder, kind, encrypted}]`；
+  - `?reveal=placeholders`（或 `reveal=true`）返回解密值，需 `memories:read`；
+  - `brief` / `context` 在服务端把 token 替换为真实值后再生成提示词（否则 LLM 无法使用）。
+- 工具 / SDK 文档：DSH 插件与 MCP 的 `mnemos_add`、TS `MemoryInput.placeholders`、
+  Python `memories.add(placeholders=...)` 均声明该协议（隐私值放映射，正文只写占位符）。
+
+### 6.4 端点
+
+隐私规则（控制台 `/api`，会话鉴权）：
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/privacy/rules?scope=global\|partition&partition_id=` | viewer+ | 读规则；global 需 org 成员，partition 需分区可见 |
+| `POST` | `/api/privacy/rules` | global=owner / partition=admin | 新建规则 |
+| `PATCH` | `/api/privacy/rules/:id` | 同上 | 部分更新（`pattern` / `instruction` / `action` / `enabled` / `priority` …） |
+| `DELETE` | `/api/privacy/rules/:id` | 同上 | 删除；`builtin` 不可删（可禁用 / 覆盖） |
+| `POST` | `/api/privacy/preview` | 分区 viewer+ | 试跑规则，不落库：`{partitionId, text}` → `PrivacyScanResult` |
+| `POST` | `/api/partitions/:p/privacy/rescan` | 分区 admin | 重扫已有记忆：`{personId?, limit?}` |
+
+公开 v1：
+
+| 方法 | 路径 | 作用域 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/v1/partitions/:p/privacy/rules` | `memories:read` | 读该分区生效规则（global + 分区合并结果） |
+| `GET` | `/v1/partitions/:p/memories/:id?reveal=placeholders` | `memories:read` | 记忆详情 + 解密后的占位符值 |
+
+新建一条分区 regex 规则（控制台）：
+
+```bash
+curl -s -X POST "$BASE/api/privacy/rules" \
+  -H "authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{
+    "scope": "partition",
+    "partitionId": "ptn_2c3dcb0f511c4c81",
+    "code": "employee_id",
+    "name": "工号",
+    "kind": "regex",
+    "pattern": "EMP-\\d{6}",
+    "entityType": "employee_id",
+    "action": "mask",
+    "maskMode": "keepLast",
+    "maskKeepLast": 4,
+    "enabled": true,
+    "priority": 50
+  }'
+```
+
+响应（`PrivacyRule`，节选；camelCase）：
+
+```json
+{
+  "id": "prv_…",
+  "scope": "partition",
+  "partitionId": "ptn_2c3dcb0f511c4c81",
+  "code": "employee_id",
+  "name": "工号",
+  "kind": "regex",
+  "pattern": "EMP-\\d{6}",
+  "flags": "g",
+  "entityType": "employee_id",
+  "action": "mask",
+  "maskMode": "keepLast",
+  "maskKeepLast": 4,
+  "maskKeepFirst": 0,
+  "enabled": true,
+  "priority": 50,
+  "builtin": false,
+  "createdAt": "2026-11-18T10:00:00.000Z",
+  "updatedAt": "2026-11-18T10:00:00.000Z"
+}
+```
+
+试跑（`POST /api/privacy/preview`，不落库）：
+
+```bash
+curl -s -X POST "$BASE/api/privacy/preview" \
+  -H "authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{"partitionId":"ptn_2c3dcb0f511c4c81","text":"联系 13800138000 或 zhangsan@example.com"}'
+```
+
+响应 `PrivacyScanResult`（示例，`start/end` 偏移以实际文本为准）：
+
+```json
+{
+  "text": "联系 138****8000 或 z***@example.com",
+  "redacted": true,
+  "hits": [
+    { "code": "phone", "entityType": "phone", "value": "13800138000", "start": 3, "end": 14, "action": "mask" },
+    { "code": "email", "entityType": "email", "value": "zhangsan@example.com", "start": 18, "end": 38, "action": "mask" }
+  ],
+  "placeholders": {}
+}
+```
+
+读取占位符映射（详情默认不含 `value`，`reveal` 才解密）：
+
+```bash
+curl -s "$BASE/v1/partitions/zhiwu-app/memories/mem_3238ae7e145445c0?reveal=placeholders" \
+  -H "authorization: Bearer $KEY"
+```
+
+```json
+{
+  "memory": {
+    "id": "mem_3238ae7e145445c0",
+    "content": "张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。",
+    "placeholder_count": 2
+  },
+  "person": { "id": "prs_…", "external_id": "user-123" },
+  "placeholders": [
+    { "placeholder": "phone_a1b2", "kind": "phone", "encrypted": true, "value": "18334423321" },
+    { "placeholder": "mail_c3d4", "kind": "email", "encrypted": true, "value": "zhangsan@example.com" }
+  ]
+}
+```
+
+重扫历史记忆（规则变更后；也可用 `POST /api/ops/jobs/tick` 触发 `privacy` job）：
+
+```bash
+curl -s -X POST "$BASE/api/partitions/ptn_2c3dcb0f511c4c81/privacy/rescan" \
+  -H "authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{"personId":"prs_5ed57a3928ec4518","limit":100}'
+```
+
+响应返回本次扫描 / 变更计数（示例：`{ "scanned": 100, "changed": 3, "placeholders": 4 }`，字段以实现为准）。
+
+### 6.5 限制与实现说明
+
+- **加密可选**：未配置 `MNEMOS_ENCRYPTION_KEY` 时占位符值明文存储（`encrypted=false`），仅适合本地开发；
+  生产必须配置。记忆正文本身不入加密（保护 FTS），靠「正文只存 token」隔离。
+- **prompt 规则依赖 LLM**：LLM 不可用 / 超时静默跳过，不阻塞写入；结果会校验 value 确实出现在原文中。
+- **异步扫描有延迟**：写入后由 worker tick 执行；刚写入的记忆可能尚未脱敏，规则变更后需 rescan 覆盖历史。
+- **规则隔离**：global 规则跨分区生效但仅 owner 可写；分区规则只影响本分区，不能读取其它分区。
+- **明文永不进列表 / 搜索**：`reveal` 需 `memories:read`；列表 / 搜索 / 导出只返回 token 或计数。
+- **与旧 `basic` 兼容**：`pii_redaction=basic` 继续生效，规则域可覆盖 / 禁用内置规则。
+
+---
+
+## 7. 控制台 API（`/api`，会话鉴权）
 
 与 v1 同构，camelCase。权限沿用组织角色：viewer 读、developer 写、admin 管理密钥/设置、
 owner 管理组织与组织级 Key。
 
-### 6.1 登录 / 会话
+### 7.1 登录 / 会话
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -927,7 +1160,7 @@ owner 管理组织与组织级 Key。
 - 账号禁用返回 **403**，`code = account_disabled`。
 - 会话令牌只存 SHA-256；默认有效期 `MNEMOS_SESSION_TTL_HOURS`（72h）。
 
-### 6.2 分区 / 人 / 记忆
+### 7.2 分区 / 人 / 记忆
 
 | 方法 | 路径 | 角色 | 说明 |
 | --- | --- | --- | --- |
@@ -952,7 +1185,7 @@ owner 管理组织与组织级 Key。
 | `GET` | `/api/partitions/:p/graph` | viewer | 实体关系图（`personId`/`limit`） |
 | `GET` | `/api/partitions/:p/entities` | viewer | 实体列表（`personId`/`q`/`limit`） |
 | `GET` | `/api/partitions/:partition/persons/:person/memories` | viewer | 该人记忆（游标 + scope/category/q） |
-| `POST` | `/api/partitions/:partition/persons/:person/memories` | developer | 写记忆，返回 `{ memory }`（无 events） |
+| `POST` | `/api/partitions/:partition/persons/:person/memories` | developer | 写记忆，返回 `{ memory }`（无 events）；隐私值用 body `placeholders` |
 | `GET` | `/api/partitions/:partition/memories` | viewer | 分区记忆（`personId`/`scope`/`category`/`q`/游标） |
 | `POST` | `/api/partitions/:p/memories/search` | viewer | v6.1 检索：返回 `{hits,took_ms,mode,strategy,took_ms}`（camelCase 响应） |
 | `GET` | `/api/partitions/:p/memories/:id/history` | viewer | 历史数组（camelCase） |
@@ -962,8 +1195,9 @@ owner 管理组织与组织级 Key。
 | `DELETE` | `/api/partitions/:partition/memories/:id` | developer | 204 |
 
 `GET /api/partitions/:partition` **带 `stats`**（v1 的同一路径不带），这是两套入口唯一的形状差异之一。
+隐私规则读写、`preview`、`rescan` 见 [6.4](#64-端点)。
 
-### 6.3 人级简报 / 上下文 / 做梦（控制台）
+### 7.3 人级简报 / 上下文 / 做梦（控制台）
 
 | 方法 | 路径 | 角色 | 说明 |
 | --- | --- | --- | --- |
@@ -974,7 +1208,7 @@ owner 管理组织与组织级 Key。
 | `GET` | `/api/partitions/:p/dream` | viewer | 分区级状态 |
 | `POST` | `/api/partitions/:p/dream/run` | developer | 分区级手动做梦 |
 
-### 6.4 用量 / 审计 / 密钥（分区）
+### 7.4 用量 / 审计 / 密钥（分区）
 
 | 方法 | 路径 | 角色 | 说明 |
 | --- | --- | --- | --- |
@@ -985,7 +1219,7 @@ owner 管理组织与组织级 Key。
 | `POST` | `/api/partitions/:p/keys/:id/rotate` | admin | `{graceHours}`（0–168，仅审计）；**旧 key 立即吊销** |
 | `DELETE` | `/api/partitions/:p/keys/:id` | admin | 吊销，204 |
 
-### 6.5 组织 / 组织级密钥 / 运维
+### 7.5 组织 / 组织级密钥 / 运维
 
 | 方法 | 路径 | 角色 | 说明 |
 | --- | --- | --- | --- |
@@ -1010,7 +1244,7 @@ owner 管理组织与组织级 Key。
 
 ---
 
-## 7. 健康检查与运维端点
+## 8. 健康检查与运维端点
 
 | 方法 | 路径 | 鉴权 | 说明 |
 | --- | --- | --- | --- |
@@ -1024,7 +1258,7 @@ owner 管理组织与组织级 Key。
 
 ---
 
-## 8. 错误码
+## 9. 错误码
 
 `code` 为稳定标识；同一 HTTP 状态可能对应多个 code。
 
@@ -1058,7 +1292,7 @@ owner 管理组织与组织级 Key。
 
 ---
 
-## 9. 与 v5 的差异
+## 10. 与 v5 的差异
 
 v6 是干净重建，**不兼容 v5 的端点与数据**：
 

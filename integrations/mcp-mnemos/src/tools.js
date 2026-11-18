@@ -121,11 +121,15 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'mnemos_add',
     description:
-      '写入一条记忆（原文入库）。重复内容返回 NOOP、相似内容 MERGE、同 fact_key/supersedes_id 会取代旧记忆；未知人会自动建档。',
+      '写入一条记忆（原文入库）。重复内容返回 NOOP、相似内容 MERGE、同 fact_key/supersedes_id 会取代旧记忆；未知人会自动建档。' +
+      '隐私值不要直接写进正文：手机号 / 邮箱 / 身份证 / 银行卡等真实值放进 placeholders 映射，正文只写 {{key}} 占位符' +
+      '（key 为 [A-Za-z0-9_-]{3,64}）。示例：content: "张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。", ' +
+      'placeholders: {"phone_a1b2":"18334423321","mail_c3d4":"zhangsan@example.com"}。' +
+      '正文只落 token（映射加密保存）；详情默认只给占位符 key，reveal 才返回真实值；brief/context 自动还原。',
     inputSchema: {
       type: 'object',
       properties: {
-        content: { type: 'string', description: '记忆正文（与 text/messages 至少一个）' },
+        content: { type: 'string', description: '记忆正文（与 text/messages 至少一个）；隐私值用 {{key}} 占位符，不写明文' },
         text: { type: 'string', description: '记忆正文（content 的别名）' },
         messages: {
           type: 'array',
@@ -135,6 +139,13 @@ export const TOOL_DEFINITIONS = [
             properties: { role: { type: 'string' }, content: { type: 'string' } },
             required: ['role', 'content'],
           },
+        },
+        placeholders: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description:
+            '隐私占位符映射 {"key":"真实值"}：正文对应位置写 {{key}}（key 为 [A-Za-z0-9_-]{3,64}）。' +
+            '真实值不落正文，服务端加密保存；brief/context 自动还原，详情需 reveal。',
         },
         person: PERSON_PROP,
         person_type: { type: 'string', enum: ['human', 'agent', 'service', 'other'], description: '未知人建档时的类型，默认 agent' },
@@ -170,6 +181,7 @@ export const TOOL_DEFINITIONS = [
         confidence: args.confidence,
         tags: args.tags,
         metadata: args.metadata,
+        placeholders: args.placeholders,
         expires_at: args.expires_at,
         supersedes_id: args.supersedes_id,
         fact_key: args.fact_key,

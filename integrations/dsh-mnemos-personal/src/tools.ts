@@ -322,6 +322,34 @@ function normalizeMessages(value: unknown): Array<{ role: string; content: strin
   return messages.length > 0 ? messages : undefined
 }
 
+/** 占位符 key 契约（与服务端一致）：`[A-Za-z0-9_-]{3,64}`。 */
+const PLACEHOLDER_KEY = /^[A-Za-z0-9_-]{3,64}$/
+
+/**
+ * 规整 placeholders 映射：只接受 `{ key: 非空 string }`，key 必须匹配 `[A-Za-z0-9_-]{3,64}`。
+ *
+ * 返回 `{ value }`（空映射视为未传）或 `{ error }`；错误由调用方拼进 `{ ok:false, error, action }`，
+ * 这样模型能直接看到「哪个 key / 哪个值不合法」并修正，而不是等服务端 400。
+ */
+function normalizePlaceholders(value: unknown): { value?: Record<string, string>; error?: string } {
+  if (value === undefined) return {}
+  const record = asRecord(value)
+  if (record === undefined) {
+    return { error: 'placeholders 必须是对象映射，例如 {"phone_a1b2":"18334423321"}。' }
+  }
+  const placeholders: Record<string, string> = {}
+  for (const [key, raw] of Object.entries(record)) {
+    if (!PLACEHOLDER_KEY.test(key)) {
+      return { error: `placeholders 的 key 必须匹配 [A-Za-z0-9_-]{3,64}，收到 ${JSON.stringify(key)}。` }
+    }
+    if (typeof raw !== 'string' || raw === '') {
+      return { error: `placeholders.${key} 必须是非空字符串（真实值）。` }
+    }
+    placeholders[key] = raw
+  }
+  return Object.keys(placeholders).length > 0 ? { value: placeholders } : {}
+}
+
 /* ------------------------------------------------------------------ */
 /* 1. mnemos_workspace                                                 */
 /* ------------------------------------------------------------------ */
@@ -453,6 +481,8 @@ function renderWorkspace(value: WorkspaceResult): string {
 
 interface AddArgs {
   text?: string
+  /** 记忆正文别名：与 text 二选一；占位符协议示例用 content。 */
+  content?: string
   messages?: string | Array<{ role: string; content: string }>
   person_id?: string
   scope?: 'person' | 'partition' | 'session'
@@ -460,6 +490,8 @@ interface AddArgs {
   category?: string
   tags?: string[]
   metadata?: Record<string, unknown>
+  /** 隐私占位符映射：正文写 `{{key}}`，真实值只放这里。 */
+  placeholders?: Record<string, string>
 }
 
 interface AddResult {
@@ -484,13 +516,19 @@ export function mnemosAddTool(
     name: 'mnemos_add',
     description:
       '把值得沉淀的结论 / 决策 / 约束 / 踩坑经验写进 Mnemos（v6 按原文入库，不做事实抽取）。' +
-      'text 与 messages 二选一；person_id 缺省为默认人（self）。' +
+      'text 与 messages 二选一（content 是 text 的别名）；person_id 缺省为默认人（self）。' +
+      '隐私值不要直接写进正文：手机号 / 邮箱 / 身份证 / 银行卡等真实值放进 placeholders 映射，正文只写 {{key}} 占位符' +
+      '（key 为 [A-Za-z0-9_-]{3,64}）。示例：text: "张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。", ' +
+      'placeholders: {"phone_a1b2":"18334423321","mail_c3d4":"zhangsan@example.com"}。' +
+      '正文只落 token（映射由服务端加密保存）；详情默认只给占位符 key，reveal 才返回真实值；' +
+      'mnemos_brief / mnemos_context 由服务端自动还原真实值。' +
       'scope：person=仅该人可见，partition=分区共享（协作知识），session=仅当前会话（必须带 session_id，缺省用当前会话）。' +
       '触发词：记住 / 记下来 / 写入记忆 / 沉淀结论 / save to memory / remember this.',
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: '要写入的记忆正文（最长 20000 字符）。' },
+        text: { type: 'string', description: '要写入的记忆正文（最长 20000 字符）；隐私值用 {{key}} 占位符，不写明文。' },
+        content: { type: 'string', description: '记忆正文别名（与 text 二选一）；隐私值用 {{key}} 占位符，不写明文。' },
         messages: {
           description: '对话式写入：字符串按 user 角色，或 [{role, content}] 数组。与 text 二选一。',
           anyOf: [
@@ -504,6 +542,13 @@ export function mnemosAddTool(
               },
             },
           ],
+        },
+        placeholders: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description:
+            '隐私占位符映射：{"key":"真实值"}，正文对应位置写 {{key}}（key 为 [A-Za-z0-9_-]{3,64}）。' +
+            '真实值不落正文，由服务端加密保存；brief / context 自动还原，详情需 reveal。',
         },
         person_id: {
           type: 'string',
@@ -546,12 +591,24 @@ export function mnemosAddTool(
         if (settings.readOnly) return readOnlyResult()
 
         const messages = normalizeMessages(args.messages)
-        const textValue = typeof args.text === 'string' && args.text.trim() !== '' ? args.text : undefined
+        const textArg = typeof args.text === 'string' && args.text.trim() !== '' ? args.text : undefined
+        const contentArg = typeof args.content === 'string' && args.content.trim() !== '' ? args.content : undefined
+        const textValue = textArg ?? contentArg
         if (textValue === undefined && messages === undefined) {
           return {
             ok: false,
-            error: 'mnemos_add 需要 text 或 messages 之一。',
-            action: '把要沉淀的内容放进 text（字符串），或按 [{role, content}] 传 messages。',
+            error: 'mnemos_add 需要 text / content 或 messages 之一。',
+            action: '把要沉淀的内容放进 text（content 是别名），或按 [{role, content}] 传 messages。',
+          }
+        }
+
+        const placeholders = normalizePlaceholders(args.placeholders)
+        if (placeholders.error !== undefined) {
+          return {
+            ok: false,
+            error: `mnemos_add：${placeholders.error}`,
+            action:
+              '按 {"phone_a1b2":"18334423321"} 的映射传 placeholders，正文写 {{phone_a1b2}}；key 为 3–64 位字母 / 数字 / 下划线 / 连字符。',
           }
         }
 
@@ -588,6 +645,7 @@ export function mnemosAddTool(
         const body: Parameters<MnemosClient['addMemory']>[2] = {}
         if (textValue !== undefined && messages === undefined) body.text = textValue
         if (messages !== undefined) body.messages = messages
+        if (placeholders.value !== undefined) body.placeholders = placeholders.value
         if (scope !== undefined) body.scope = scope
         if (sessionId !== undefined) body.session_id = sessionId
         if (typeof args.category === 'string' && args.category !== '') body.category = args.category

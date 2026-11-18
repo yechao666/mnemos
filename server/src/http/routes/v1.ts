@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { MemoryScope, PartitionInput, PartitionSettings, PersonType } from '../../../../shared/src/types.ts';
+import type { MemoryScope, PartitionInput, PartitionSettings, PersonType, PrivacyRule, PrivacyRuleInput } from '../../../../shared/src/types.ts';
 import type { RequestContext } from '../context.ts';
 import { requireOrgKey } from '../middleware/auth.ts';
 import { errors } from '../respond.ts';
@@ -81,6 +81,8 @@ const settingsV1Schema = z
     auto_extract_entities: z.boolean().optional(),
     /* v6.1 P2 合规 */
     pii_redaction: z.enum(['off', 'basic']).optional(),
+    /* v6.2 隐私规则 */
+    privacy_llm_enabled: z.boolean().optional(),
   })
   .passthrough();
 
@@ -106,6 +108,7 @@ function settingsFromV1(raw: unknown): Partial<PartitionSettings> | undefined {
   if (input.dedupe_threshold !== undefined) out.dedupeThreshold = Number(input.dedupe_threshold);
   if (input.auto_extract_entities !== undefined) out.autoExtractEntities = Boolean(input.auto_extract_entities);
   if (input.pii_redaction !== undefined) out.piiRedaction = input.pii_redaction as PartitionSettings['piiRedaction'];
+  if (input.privacy_llm_enabled !== undefined) out.privacyLlmEnabled = Boolean(input.privacy_llm_enabled);
   return out;
 }
 
@@ -234,6 +237,8 @@ const memoryAddV1Schema = z
       )
       .max(10)
       .optional(),
+    /* v6.2：占位符映射（正文用 {{key}}，敏感值放这里） */
+    placeholders: z.record(z.string().max(4000)).optional(),
   })
   .refine((value) => Boolean(value.text ?? value.content) || Boolean(value.messages?.length), {
     message: 'messages 与 text 至少提供一个',
@@ -259,6 +264,8 @@ const memoryPatchV1Schema = z
     tags: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
     metadata: z.record(z.unknown()).optional(),
     expires_at: z.string().trim().max(40).nullable().optional(),
+    /* v6.2：替换占位符映射（整体覆盖；正文未使用的键忽略） */
+    placeholders: z.record(z.string().max(4000)).optional(),
   })
   .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
 
@@ -303,6 +310,79 @@ const entityListQueryV1Schema = z.object({
   q: z.string().trim().max(200).optional(),
   limit: z.coerce.number().int().min(1).max(200).optional(),
 });
+
+/* v6.2：隐私规则（v1 只写分区作用域；global 由控制台 owner 维护） */
+const privacyRuleInputV1Schema = z.object({
+  code: z.string().trim().max(40).optional(),
+  name: z.string().trim().max(80).optional(),
+  kind: z.enum(['regex', 'prompt']).optional(),
+  pattern: z.string().max(2000).optional(),
+  flags: z.string().trim().max(8).optional(),
+  instruction: z.string().trim().max(2000).optional(),
+  entity_type: z.string().trim().max(60).optional(),
+  entityType: z.string().trim().max(60).optional(),
+  action: z.enum(['mask', 'placeholder']).optional(),
+  mask_mode: z.enum(['email', 'keepFirstLast', 'keepLast', 'full']).optional(),
+  maskMode: z.enum(['email', 'keepFirstLast', 'keepLast', 'full']).optional(),
+  mask_keep_last: z.coerce.number().int().min(0).max(64).optional(),
+  maskKeepLast: z.coerce.number().int().min(0).max(64).optional(),
+  mask_keep_first: z.coerce.number().int().min(0).max(64).optional(),
+  maskKeepFirst: z.coerce.number().int().min(0).max(64).optional(),
+  enabled: z.boolean().optional(),
+  priority: z.coerce.number().int().min(0).max(1_000_000).optional(),
+});
+
+const privacyRuleCreateV1Schema = privacyRuleInputV1Schema.extend({
+  code: z.string().trim().min(2).max(40),
+  name: z.string().trim().min(1).max(80),
+  kind: z.enum(['regex', 'prompt']),
+});
+
+const memoryDetailQueryV1Schema = z.object({
+  reveal: z.enum(['true', 'false', '1', '0', 'placeholders']).optional(),
+});
+
+function privacyRuleInputFromV1(body: z.output<typeof privacyRuleInputV1Schema>): PrivacyRuleInput {
+  return {
+    code: body.code,
+    name: body.name as string,
+    kind: body.kind as PrivacyRuleInput['kind'],
+    pattern: body.pattern,
+    flags: body.flags,
+    instruction: body.instruction,
+    entityType: body.entity_type ?? body.entityType,
+    action: body.action,
+    maskMode: body.mask_mode ?? body.maskMode,
+    maskKeepLast: body.mask_keep_last ?? body.maskKeepLast,
+    maskKeepFirst: body.mask_keep_first ?? body.maskKeepFirst,
+    enabled: body.enabled,
+    priority: body.priority,
+  };
+}
+
+function privacyRuleV1From(rule: PrivacyRule): Record<string, unknown> {
+  return {
+    id: rule.id,
+    scope: rule.scope,
+    partition_id: rule.partitionId ?? null,
+    code: rule.code,
+    name: rule.name,
+    kind: rule.kind,
+    pattern: rule.pattern ?? null,
+    flags: rule.flags,
+    instruction: rule.instruction ?? null,
+    entity_type: rule.entityType,
+    action: rule.action,
+    mask_mode: rule.maskMode,
+    mask_keep_last: rule.maskKeepLast,
+    mask_keep_first: rule.maskKeepFirst,
+    enabled: rule.enabled,
+    priority: rule.priority,
+    builtin: rule.builtin,
+    created_at: rule.createdAt,
+    updated_at: rule.updatedAt,
+  };
+}
 
 /* ------------------------------------------------------------------ */
 /* 辅助                                                                */
@@ -696,6 +776,85 @@ export function registerV1Routes(router: Router): void {
     },
   });
 
+  /* --- v6.2：隐私规则（v1 只写分区作用域） --- */
+  router.add({
+    method: 'GET',
+    path: '/v1/partitions/:partition/privacy/rules',
+    auth: 'apikey',
+    scopes: ['memories:read'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const rules = rc.app.engine.listPrivacyRules(partition.id);
+      markUsage(rc, partition, 'privacy.rules.list', 'api', rules.length);
+      rc.json({ items: rules.map(privacyRuleV1From) });
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/v1/partitions/:partition/privacy/rules',
+    auth: 'apikey',
+    scopes: ['admin'],
+    handler: async (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      assertWritable(partition);
+      const body = await rc.body(privacyRuleCreateV1Schema);
+      const rule = rc.app.engine.createPrivacyRule(
+        'partition',
+        partition.id,
+        privacyRuleInputFromV1(body),
+        actorOf(rc),
+        partition.orgId,
+      );
+      markUsage(rc, partition, 'privacy.rule.create', 'api', 1);
+      rc.json({ rule: privacyRuleV1From(rule) }, 201);
+    },
+  });
+
+  router.add({
+    method: 'PATCH',
+    path: '/v1/partitions/:partition/privacy/rules/:id',
+    auth: 'apikey',
+    scopes: ['admin'],
+    handler: async (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      assertWritable(partition);
+      const row = rc.app.db
+        .prepare("SELECT id, scope, partition_id FROM privacy_rules WHERE id = ?")
+        .get(rc.params.id ?? '') as unknown as { id: string; scope: string; partition_id: string } | undefined;
+      if (!row || row.scope !== 'partition' || row.partition_id !== partition.id) {
+        throw errors.notFound('隐私规则不存在');
+      }
+      const body = await rc.body(privacyRuleInputV1Schema);
+      const rule = rc.app.engine.updatePrivacyRule(
+        row.id,
+        privacyRuleInputFromV1(body),
+        actorOf(rc),
+        partition.orgId,
+      );
+      rc.json({ rule: privacyRuleV1From(rule) });
+    },
+  });
+
+  router.add({
+    method: 'DELETE',
+    path: '/v1/partitions/:partition/privacy/rules/:id',
+    auth: 'apikey',
+    scopes: ['admin'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const row = rc.app.db
+        .prepare("SELECT id, scope, partition_id FROM privacy_rules WHERE id = ?")
+        .get(rc.params.id ?? '') as unknown as { id: string; scope: string; partition_id: string } | undefined;
+      if (!row || row.scope !== 'partition' || row.partition_id !== partition.id) {
+        throw errors.notFound('隐私规则不存在');
+      }
+      rc.app.engine.deletePrivacyRule(row.id, actorOf(rc), partition.orgId);
+      rc.res.statusCode = 204;
+      rc.res.end();
+    },
+  });
+
   /* --- 记忆 --- */
   router.add({
     method: 'GET',
@@ -752,6 +911,7 @@ export function registerV1Routes(router: Router): void {
         factKey: body.fact_key,
         validFrom: body.valid_from,
         attachments: body.attachments,
+        placeholders: body.placeholders,
         actor: actorOf(rc),
       });
       rc.markUsage({ partitionId: partition.id, operation: 'add', channel: 'api', orgId: partition.orgId });
@@ -830,10 +990,22 @@ export function registerV1Routes(router: Router): void {
     scopes: ['memories:read'],
     handler: (rc: RequestContext) => {
       const partition = partitionOfPathForWrite(rc);
+      const query = rc.query(memoryDetailQueryV1Schema);
+      const reveal = query.reveal === 'true' || query.reveal === '1' || query.reveal === 'placeholders';
       const detail = rc.app.engine.getMemory(partition.id, rc.params.id ?? '');
       if (!detail) throw errors.notFound('记忆不存在');
+      const placeholders = rc.app.engine.memoryPlaceholders(partition.id, detail.memory.id, reveal);
       markUsage(rc, partition, 'get', 'api', 1);
-      rc.json({ memory: memoryV1(detail.memory), person: detail.person ? personV1(detail.person) : null });
+      rc.json({
+        memory: memoryV1(detail.memory),
+        person: detail.person ? personV1(detail.person) : null,
+        placeholders: placeholders.map((item) => ({
+          placeholder: item.placeholder,
+          kind: item.kind ?? null,
+          encrypted: item.encrypted,
+          ...(item.value !== undefined ? { value: item.value } : {}),
+        })),
+      });
     },
   });
 
@@ -886,6 +1058,7 @@ export function registerV1Routes(router: Router): void {
           tags: body.tags,
           metadata: body.metadata,
           expiresAt: body.expires_at,
+          placeholders: body.placeholders,
         },
         actorOf(rc),
       );

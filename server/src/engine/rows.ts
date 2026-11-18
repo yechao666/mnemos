@@ -100,6 +100,10 @@ export interface MemoryRow {
   fact_key: string | null;
   feedback_up: number;
   feedback_down: number;
+  /* --- v6.2 隐私规则 --- */
+  privacy_scanned_at?: string | null;
+  /** 批量查询附加列（可选；不来自表本身） */
+  placeholder_count?: number;
 }
 
 /** person_facts 行（当前有效 = valid_to IS NULL）。 */
@@ -248,6 +252,11 @@ export function parseSettings(raw: string | null | undefined): PartitionSettings
       ['off', 'basic'],
       DEFAULT_PARTITION_SETTINGS.piiRedaction,
     ),
+    /* --- v6.2 隐私规则 --- */
+    privacyLlmEnabled:
+      typeof parsed.privacyLlmEnabled === 'boolean'
+        ? parsed.privacyLlmEnabled
+        : DEFAULT_PARTITION_SETTINGS.privacyLlmEnabled,
   };
 }
 
@@ -287,6 +296,8 @@ export function mergeSettings(
   merged.autoExtractEntities =
     typeof merged.autoExtractEntities === 'boolean' ? merged.autoExtractEntities : base.autoExtractEntities;
   merged.piiRedaction = oneOf<'off' | 'basic'>(merged.piiRedaction, ['off', 'basic'], base.piiRedaction);
+  merged.privacyLlmEnabled =
+    typeof merged.privacyLlmEnabled === 'boolean' ? merged.privacyLlmEnabled : base.privacyLlmEnabled;
   return merged;
 }
 
@@ -388,6 +399,8 @@ export function toMemory(row: MemoryRow): Memory {
     factKey: row.fact_key ?? undefined,
     feedbackUp: row.feedback_up ?? 0,
     feedbackDown: row.feedback_down ?? 0,
+    ...(row.placeholder_count !== undefined ? { placeholderCount: row.placeholder_count } : {}),
+    privacyScannedAt: row.privacy_scanned_at ?? undefined,
   };
 }
 

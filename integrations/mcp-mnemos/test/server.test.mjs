@@ -190,6 +190,11 @@ test('tools/list 暴露 7 个工具，不含 handler', async () => {
     }
     const search = response.result.tools.find((tool) => tool.name === 'mnemos_search');
     assert.deepEqual(search.inputSchema.required, ['query']);
+
+    const add = response.result.tools.find((tool) => tool.name === 'mnemos_add');
+    assert.equal(add.inputSchema.properties.placeholders.type, 'object');
+    assert.equal(add.inputSchema.properties.placeholders.additionalProperties.type, 'string');
+    assert.match(add.description, /\{\{key\}\}/);
   } finally {
     await fake.close();
   }
@@ -249,7 +254,12 @@ test('mnemos_add：未知人 404 时先建档再重试，并支持幂等键', as
   });
   const { server } = makeServer(fake);
   try {
-    const result = await callTool(server, 'mnemos_add', { content: '新结论', category: 'decision', idempotency_key: 'idem-7' });
+    const result = await callTool(server, 'mnemos_add', {
+      content: '新结论',
+      category: 'decision',
+      idempotency_key: 'idem-7',
+      placeholders: { phone_a1b2: '18334423321' },
+    });
     const payload = jsonOf(result);
     assert.equal(payload.event, 'ADD');
     assert.equal(payload.memory.id, 'mem_new');
@@ -264,7 +274,9 @@ test('mnemos_add：未知人 404 时先建档再重试，并支持幂等键', as
     );
     assert.equal(fake.requests[0].headers['idempotency-key'], 'idem-7');
     assert.equal(fake.requests[0].body.content, '新结论');
+    assert.deepEqual(fake.requests[0].body.placeholders, { phone_a1b2: '18334423321' });
     assert.equal(fake.requests[2].body.category, 'decision');
+    assert.deepEqual(fake.requests[2].body.placeholders, { phone_a1b2: '18334423321' });
     assert.equal(fake.requests[1].body.type, 'agent');
   } finally {
     await fake.close();

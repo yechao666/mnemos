@@ -58,6 +58,18 @@ result = client.memories.add(
 )
 print(result.event, result.memory.id)   # ADD / MERGE / NOOP / SUPERSEDE
 
+# 2b) 隐私值走占位符协议：正文只存 {{key}} token，真实值放 placeholders（服务端加密保存，不落正文）
+private = client.memories.add(
+    "user-1",
+    content="张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。",
+    placeholders={
+        "phone_a1b2": "18334423321",
+        "mail_c3d4": "zhangsan@example.com",
+    },
+    scope="person",
+)
+print(private.memory.content)   # 只含 {{phone_a1b2}} / {{mail_c3d4}}
+
 # 3) 混合检索（默认 hybrid），信号可解释
 response = client.memories.search("评审偏好", top_k=5)
 for hit in response.hits:
@@ -126,7 +138,7 @@ client = MnemosClient(
 
 | 方法 | 端点 | 说明 |
 | --- | --- | --- |
-| `add(person=None, text=… / content=… / messages=…, …)` | `POST .../persons/:person/memories` | 写入；返回 `{memory, event, superseded_id}` |
+| `add(person=None, text=… / content=… / messages=…, placeholders=…, …)` | `POST .../persons/:person/memories` | 写入；返回 `{memory, event, superseded_id}`；隐私值用 `placeholders` 映射 |
 | `list(partition=None, person_id=…, person_external_id=…, scope=…, category=…, status=…, q=…, cursor=…, limit=…)` | `GET .../memories` | 分区记忆列表 |
 | `list_by_person(person=None, …)` | `GET .../persons/:person/memories` | 等价 `persons.memories` |
 | `search(query, top_k=…, mode=…, as_of=…, include_superseded=…)` | `POST .../memories/search` | 混合检索；返回 `hits` + `signals` |
@@ -219,6 +231,8 @@ result = client.memories.add(
 
 - `idempotency_key` 会以 `Idempotency-Key` 头发送，24h 内相同 key+body 返回首次响应；
 - 写记忆这类非幂等 POST **不会自动重试**，避免重复写入；
+- `placeholders`：把隐私值放映射、正文写 `{{key}}`（key 为 `[A-Za-z0-9_-]{3,64}`）；正文只落 token，
+  列表 / 搜索只给占位符计数，详情 `?reveal=placeholders` 才解密，`brief` / `context` 自动还原；
 - GET / PUT / PATCH / DELETE 与 `memories.search` 在 429/5xx/网络错误时指数退避重试，
   并尊重 `Retry-After`。
 

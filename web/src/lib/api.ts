@@ -30,9 +30,11 @@ import type {
   MemoryAttachmentInput,
   MemoryBrief,
   MemoryCategory,
+  MemoryDetail,
   MemoryFeedbackInput,
   MemoryHistoryEntry,
   MemoryHistoryEvent,
+  MemoryPlaceholder,
   MemorySearchHit,
   MemorySearchMode,
   MemorySearchResponse,
@@ -53,6 +55,14 @@ import type {
   PersonProfile,
   PersonStatus,
   PersonType,
+  PrivacyAction,
+  PrivacyMaskMode,
+  PrivacyRule,
+  PrivacyRuleInput,
+  PrivacyRuleKind,
+  PrivacyRuleScope,
+  PrivacyScanHit,
+  PrivacyScanResult,
   Role,
   UsageAnalytics,
   User,
@@ -262,6 +272,8 @@ function adaptSettings(value: unknown): Partition['settings'] {
     autoExtractEntities: bool(raw.autoExtractEntities ?? raw.auto_extract_entities, true),
     // v6.1 P2：默认不脱敏，保证旧分区行为不变。
     piiRedaction: raw.piiRedaction === 'basic' || raw.pii_redaction === 'basic' ? 'basic' : 'off',
+    // v6.2：prompt 规则默认关闭，需显式开启并配置 LLM。
+    privacyLlmEnabled: bool(raw.privacyLlmEnabled ?? raw.privacy_llm_enabled),
   };
 }
 
@@ -431,6 +443,7 @@ function adaptAttachments(value: unknown): MemoryAttachment[] | undefined {
 export function adaptMemory(value: unknown): Memory {
   const raw = asRecord(value);
   const attachments = adaptAttachments(raw.attachments);
+  const metadata = parseJsonRecord(raw.metadata);
   return {
     id: str(raw.id),
     partitionId: str(raw.partitionId ?? raw.partition_id ?? raw.projectId ?? raw.project_id),
@@ -460,6 +473,14 @@ export function adaptMemory(value: unknown): Memory {
     feedbackDown: num(raw.feedbackDown ?? raw.feedback_down),
     attachmentCount: num(raw.attachmentCount ?? raw.attachment_count) || attachments?.length || undefined,
     attachments,
+    // v6.2：占位符数量（列表/搜索只返回计数，不返回明文）。
+    placeholderCount:
+      num(
+        raw.placeholderCount ??
+          raw.placeholder_count ??
+          metadata.placeholderCount ??
+          metadata.placeholder_count,
+      ) || undefined,
   };
 }
 
@@ -786,6 +807,130 @@ function adaptUsage(value: unknown): UsageAnalytics {
 }
 
 /* ------------------------------------------------------------------ */
+/* v6.2：隐私规则 / 预览 / 占位符 归一化                                */
+/* ------------------------------------------------------------------ */
+
+function adaptPrivacyKind(value: unknown): PrivacyRuleKind {
+  return value === 'prompt' ? 'prompt' : 'regex';
+}
+
+function adaptPrivacyAction(value: unknown): PrivacyAction {
+  return value === 'placeholder' ? 'placeholder' : 'mask';
+}
+
+function adaptMaskMode(value: unknown): PrivacyMaskMode {
+  const text = str(value, 'email');
+  if (text === 'keepFirstLast' || text === 'keep_first_last') return 'keepFirstLast';
+  if (text === 'keepLast' || text === 'keep_last') return 'keepLast';
+  if (text === 'full') return 'full';
+  return 'email';
+}
+
+function adaptPrivacyRule(value: unknown): PrivacyRule {
+  const raw = asRecord(value);
+  const code = str(raw.code);
+  return {
+    id: str(raw.id ?? raw.ruleId ?? raw.rule_id, code),
+    scope: raw.scope === 'global' ? 'global' : 'partition',
+    partitionId: optStr(raw.partitionId ?? raw.partition_id),
+    code,
+    name: str(raw.name, code),
+    kind: adaptPrivacyKind(raw.kind),
+    pattern: optStr(raw.pattern),
+    flags: str(raw.flags, 'g'),
+    instruction: optStr(raw.instruction),
+    entityType: str(raw.entityType ?? raw.entity_type, code || 'pii'),
+    action: adaptPrivacyAction(raw.action),
+    maskMode: adaptMaskMode(raw.maskMode ?? raw.mask_mode),
+    maskKeepLast: num(raw.maskKeepLast ?? raw.mask_keep_last, 4),
+    maskKeepFirst: num(raw.maskKeepFirst ?? raw.mask_keep_first, 0),
+    enabled: raw.enabled !== false,
+    priority: num(raw.priority, 100),
+    builtin: bool(raw.builtin),
+    createdAt: str(raw.createdAt ?? raw.created_at),
+    updatedAt: str(raw.updatedAt ?? raw.updated_at),
+  };
+}
+
+/** 规则列表兼容裸数组、{items} 与 {rules}。 */
+function adaptPrivacyRuleList(value: unknown): PrivacyRule[] {
+  const outer = asRecord(value);
+  const list = Array.isArray(value)
+    ? value
+    : Array.isArray(outer.items)
+      ? outer.items
+      : Array.isArray(outer.rules)
+        ? outer.rules
+        : Array.isArray(outer.data)
+          ? outer.data
+          : [];
+  return list.map(adaptPrivacyRule);
+}
+
+function adaptScanHit(value: unknown): PrivacyScanHit {
+  const raw = asRecord(value);
+  return {
+    code: str(raw.code, 'pii'),
+    entityType: str(raw.entityType ?? raw.entity_type, str(raw.code, 'pii')),
+    value: str(raw.value),
+    start: num(raw.start),
+    end: num(raw.end),
+    action: adaptPrivacyAction(raw.action),
+  };
+}
+
+/** 预览结果：兼容 {result} / {preview} 包裹与 placeholders 的数组/对象两种形状。 */
+function adaptScanResult(value: unknown): PrivacyScanResult {
+  const outer = asRecord(value);
+  const raw = asRecord(outer.result ?? outer.preview ?? outer);
+  const hits = (Array.isArray(raw.hits) ? raw.hits : []).map(adaptScanHit);
+  const placeholders: Record<string, string> = {};
+  const placeholdersRaw = raw.placeholders;
+  if (Array.isArray(placeholdersRaw)) {
+    for (const item of placeholdersRaw) {
+      const row = asRecord(item);
+      const key = str(row.placeholder ?? row.key ?? row.token);
+      if (key) placeholders[key] = str(row.value);
+    }
+  } else {
+    for (const [key, entry] of Object.entries(asRecord(placeholdersRaw))) {
+      if (typeof entry === 'string') placeholders[key] = entry;
+    }
+  }
+  return {
+    text: str(raw.text ?? raw.redactedText ?? raw.redacted_text ?? outer.text),
+    redacted: bool(raw.redacted ?? raw.changed, hits.length > 0),
+    hits,
+    placeholders,
+  };
+}
+
+function adaptPlaceholder(value: unknown): MemoryPlaceholder {
+  const raw = asRecord(value);
+  const encryptedRaw = raw.encrypted;
+  const encrypted =
+    encryptedRaw === false || encryptedRaw === 0 || encryptedRaw === '0' || encryptedRaw === 'false'
+      ? false
+      : true;
+  return {
+    placeholder: str(raw.placeholder ?? raw.key ?? raw.token),
+    kind: optStr(raw.kind ?? raw.type ?? raw.entityType ?? raw.entity_type),
+    encrypted,
+    value: optStr(raw.value),
+  };
+}
+
+function adaptPlaceholders(value: unknown): MemoryPlaceholder[] {
+  if (Array.isArray(value)) return value.map(adaptPlaceholder);
+  const record = asRecord(value);
+  if (Array.isArray(record.items)) return record.items.map(adaptPlaceholder);
+  // 兼容 { token: value } 形式的映射表
+  return Object.entries(record)
+    .filter(([, entry]) => typeof entry === 'string')
+    .map(([placeholder, entry]) => ({ placeholder, encrypted: true, value: String(entry) }));
+}
+
+/* ------------------------------------------------------------------ */
 /* 入参类型                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -867,6 +1012,9 @@ export interface MemoryCreateInput {
   /* --- v6.1 P2 多模态 --- */
   /** 附件（≤10）：URL 由调用方托管，caption 参与检索。 */
   attachments?: MemoryAttachmentInput[];
+  /* --- v6.2 隐私占位符 --- */
+  /** 占位符映射：正文用 {{key}}，敏感真实值放这里（服务端加密存储）。 */
+  placeholders?: Record<string, string>;
 }
 
 export interface KeyCreateInput {
@@ -899,6 +1047,29 @@ const partitionPath = (partitionId: string): string => `/api/partitions/${encode
 
 const personPath = (partitionId: string, personRef: string): string =>
   `${partitionPath(partitionId)}/persons/${encodeURIComponent(personRef)}`;
+
+/** 隐私规则写请求体：camelCase（控制台契约）+ 关键字段 snake_case 兼容并行实现。 */
+function privacyRuleBody(input: PrivacyRuleInput): Record<string, unknown> {
+  return {
+    code: input.code,
+    name: input.name,
+    kind: input.kind,
+    pattern: input.pattern,
+    flags: input.flags,
+    instruction: input.instruction,
+    entityType: input.entityType,
+    entity_type: input.entityType,
+    action: input.action,
+    maskMode: input.maskMode,
+    mask_mode: input.maskMode,
+    maskKeepLast: input.maskKeepLast,
+    mask_keep_last: input.maskKeepLast,
+    maskKeepFirst: input.maskKeepFirst,
+    mask_keep_first: input.maskKeepFirst,
+    enabled: input.enabled,
+    priority: input.priority,
+  };
+}
 
 /* ------------------------------------------------------------------ */
 /* API                                                                 */
@@ -1184,6 +1355,8 @@ export const api = {
           valid_from: input.validFrom,
           // v6.1 P2：附件（kind/url/mime/size/caption，≤10）
           attachments: input.attachments,
+          // v6.2：隐私占位符映射（正文只存 {{key}}，真实值由服务端加密存储）
+          placeholders: input.placeholders,
         }),
       });
       // 控制台写入返回 { memory }；适配裸 Memory 与包裹两种形状。
@@ -1294,20 +1467,126 @@ export const api = {
       // MemoryDetail = { memory, person }
       return adaptMemory(asRecord(raw).memory ?? raw);
     },
+    /**
+     * v6.2 记忆详情（MemoryDetail）：默认返回占位符 key/kind/encrypted，
+     * `reveal=true` 时按 `?reveal=placeholders` 取解密后的真实值（需 memories:read）。
+     */
+    detail: async (
+      partitionId: string,
+      memoryId: string,
+      params: { reveal?: boolean } = {},
+    ): Promise<MemoryDetail> => {
+      const raw = await request<unknown>(
+        `${partitionPath(partitionId)}/memories/${encodeURIComponent(memoryId)}${qs({
+          reveal: params.reveal ? 'placeholders' : undefined,
+        })}`,
+      );
+      const record = asRecord(raw);
+      const memoryRaw = asRecord(record.memory ?? raw);
+      const holdersRaw = record.placeholders ?? memoryRaw.placeholders;
+      return {
+        memory: adaptMemory(memoryRaw),
+        person: record.person ? adaptPerson(record.person) : null,
+        placeholders: holdersRaw === undefined ? undefined : adaptPlaceholders(holdersRaw),
+      };
+    },
+    /** 占位符映射：默认只返回 key/kind/encrypted；reveal=true 才带解密值。 */
+    placeholders: async (
+      partitionId: string,
+      memoryId: string,
+      reveal = false,
+    ): Promise<MemoryPlaceholder[]> => {
+      const detail = await api.memories.detail(partitionId, memoryId, { reveal });
+      return detail.placeholders ?? [];
+    },
     update: async (
       partitionId: string,
       memoryId: string,
-      input: { content?: string; category?: string; importance?: number; status?: string; tags?: string[] },
+      input: {
+        content?: string;
+        category?: string;
+        importance?: number;
+        status?: string;
+        tags?: string[];
+        placeholders?: Record<string, string>;
+      },
     ): Promise<Memory> =>
       adaptMemory(
         await request<unknown>(`${partitionPath(partitionId)}/memories/${encodeURIComponent(memoryId)}`, {
           method: 'PATCH',
-          body: JSON.stringify(input),
+          body: JSON.stringify({
+            ...input,
+            // v6.2：替换占位符映射（整体覆盖；正文未使用的键由服务端忽略）
+            placeholders: input.placeholders,
+          }),
         }),
       ),
     remove: (partitionId: string, memoryId: string) =>
       request<{ ok: boolean }>(`${partitionPath(partitionId)}/memories/${encodeURIComponent(memoryId)}`, {
         method: 'DELETE',
+      }),
+  },
+
+  /* --- v6.2：隐私规则域 --- */
+  privacy: {
+    /** 规则列表：scope=global 读组织全局规则；scope=partition 读指定分区（需 partitionId）。 */
+    listRules: async (params: { scope: PrivacyRuleScope; partitionId?: string }): Promise<PrivacyRule[]> => {
+      const raw = await request<unknown>(
+        `/api/privacy/rules${qs({
+          scope: params.scope,
+          partition_id: params.partitionId,
+          partitionId: params.partitionId,
+        })}`,
+      );
+      return adaptPrivacyRuleList(raw);
+    },
+    /** 新建规则：global 需 owner，partition 需 admin+（权限由服务端校验）。 */
+    createRule: async (
+      input: PrivacyRuleInput & { scope: PrivacyRuleScope; partitionId?: string },
+    ): Promise<PrivacyRule> => {
+      const { scope, partitionId, ...rule } = input;
+      const raw = await request<unknown>('/api/privacy/rules', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...privacyRuleBody(rule),
+          scope,
+          partitionId,
+          partition_id: partitionId,
+        }),
+      });
+      return adaptPrivacyRule(asRecord(raw).rule ?? raw);
+    },
+    /** 更新规则（含启停）：PATCH /api/privacy/rules/:id。 */
+    updateRule: async (id: string, input: Partial<PrivacyRuleInput>): Promise<PrivacyRule> => {
+      const raw = await request<unknown>(`/api/privacy/rules/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(privacyRuleBody(input as PrivacyRuleInput)),
+      });
+      return adaptPrivacyRule(asRecord(raw).rule ?? raw);
+    },
+    removeRule: (id: string) =>
+      request<{ ok: boolean }>(`/api/privacy/rules/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    /** 试跑：不落库，返回命中、替换后文本与占位符映射。 */
+    preview: async (input: { partitionId?: string; text: string }): Promise<PrivacyScanResult> => {
+      const raw = await request<unknown>('/api/privacy/preview', {
+        method: 'POST',
+        body: JSON.stringify({
+          partitionId: input.partitionId,
+          partition_id: input.partitionId,
+          text: input.text,
+        }),
+      });
+      return adaptScanResult(raw);
+    },
+    /** 重扫分区记忆（规则变更后使用；admin+）。 */
+    rescan: (partitionId: string, params: { personId?: string; limit?: number } = {}) =>
+      request<Record<string, unknown>>(`${partitionPath(partitionId)}/privacy/rescan`, {
+        method: 'POST',
+        body: JSON.stringify({
+          personId: params.personId,
+          person_id: params.personId,
+          limit: params.limit,
+        }),
       }),
   },
 

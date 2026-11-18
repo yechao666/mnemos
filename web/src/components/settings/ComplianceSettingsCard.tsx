@@ -1,30 +1,41 @@
+import { useNavigate } from 'react-router-dom';
 import type { PiiRedactionMode } from '@lib/types.ts';
 import { PII_REDACTION_EXAMPLES, PII_REDACTION_OPTIONS } from '@lib/constants.ts';
-import { Badge, Callout, Card, SectionHead, Segmented } from '@ui';
+import { Badge, Button, Callout, Card, SectionHead, Segmented, Switch } from '@ui';
 
 /**
- * 分区设置里的「PII 与合规」卡片（v6.1 P2）：
- *  - settings.piiRedaction = off | basic；
- *  - basic 在写入时对手机号 / 邮箱 / 身份证 / 银行卡做正则脱敏；
- *  - 展示脱敏示例与边界（只影响新写入，不回溯改写历史记忆）。
+ * 分区设置里的「PII 与合规」卡片（v6.1 P2 / v6.2）：
+ *  - settings.piiRedaction = off | basic（总开关）；
+ *  - settings.privacyLlmEnabled：是否执行 kind=prompt 的隐私规则（需 LLM）；
+ *  - 入口跳转到隐私规则页（分区 / 全局）。
  *
  * 表单受控于 SettingsPage 的 FormState，随「保存设置」一起 PATCH /api/partitions/:p。
  */
 export function ComplianceSettingsCard({
   value,
   onChange,
+  llmEnabled = false,
+  onLlmChange,
+  partitionId,
 }: {
   value: PiiRedactionMode;
   onChange: (next: PiiRedactionMode) => void;
+  /** settings.privacyLlmEnabled：提示词规则开关 */
+  llmEnabled?: boolean;
+  onLlmChange?: (next: boolean) => void;
+  /** 当前分区（用于跳转隐私规则页） */
+  partitionId?: string;
 }) {
+  const navigate = useNavigate();
   const current = PII_REDACTION_OPTIONS.find((option) => option.value === value) ?? PII_REDACTION_OPTIONS[0]!;
+  const rulesPath = partitionId ? `/partitions/${partitionId}/privacy` : '/org/privacy';
 
   return (
     <Card pad>
       <SectionHead
         title="PII 与合规"
-        desc="写入记忆前对个人敏感信息做脱敏；开关按分区生效，随「保存设置」一起提交。"
-        actions={<Badge tone="amber" size="sm">v6.1 P2</Badge>}
+        desc="写入记忆前按隐私规则做脱敏 / 占位符抽离；开关按分区生效，随「保存设置」一起提交。"
+        actions={<Badge tone="amber" size="sm">v6.2</Badge>}
       />
       <div className="vstack gap-14 mt-14">
         <div className="between wrap gap-10">
@@ -37,6 +48,42 @@ export function ComplianceSettingsCard({
             value={value}
             onChange={(next) => onChange(next as PiiRedactionMode)}
           />
+        </div>
+
+        <div className="divider" />
+
+        <div className="between wrap gap-10">
+          <div>
+            <div className="small">提示词隐私规则（settings.privacyLlmEnabled）</div>
+            <div className="tiny dim mt-4">
+              开启后执行 <span className="mono">kind=prompt</span> 的规则（人名 / 地址 / 凭据等），
+              需要分区已配置 LLM；LLM 不可用时静默回退正则规则。正则规则不受此开关影响。
+            </div>
+          </div>
+          <Switch
+            checked={llmEnabled}
+            disabled={!onLlmChange}
+            onChange={(next) => onLlmChange?.(next)}
+          />
+        </div>
+
+        {llmEnabled && value === 'off' ? (
+          <Callout tone="amber" icon="alert">
+            提示词规则已开启，但 PII 总开关仍是「关闭」。总开关为 <span className="mono">off</span> 时规则不会执行；
+            请把脱敏级别切到「基础脱敏」后保存。
+          </Callout>
+        ) : null}
+
+        <div className="hstack gap-8 wrap">
+          <Button size="sm" variant="secondary" icon="shield" onClick={() => navigate(rulesPath)}>
+            管理隐私规则
+          </Button>
+          <Button size="sm" variant="ghost" icon="globe" onClick={() => navigate('/org/privacy')}>
+            全局规则
+          </Button>
+          <span className="tiny dim">
+            全局与分区规则按 <span className="mono">code</span> 合并，同 code 时分区的规则覆盖全局。
+          </span>
         </div>
 
         <div className="pii-examples">

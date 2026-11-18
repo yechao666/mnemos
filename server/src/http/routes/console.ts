@@ -1,4 +1,12 @@
-import type { ApiKey, MemoryScope, Partition, PartitionSettings, PersonType } from '../../../../shared/src/types.ts';
+import type {
+  ApiKey,
+  MemoryScope,
+  Partition,
+  PartitionSettings,
+  PersonType,
+  PrivacyRuleInput,
+  PrivacyRuleScope,
+} from '../../../../shared/src/types.ts';
 import { writeAudit } from '../../lib/audit.ts';
 import { newApiKeySecret, newId, nowIso } from '../../lib/ids.ts';
 import { listAudit, partitionUsage } from '../analytics.ts';
@@ -24,6 +32,7 @@ import {
   memoryListQuerySchema,
   memoryPatchSchema,
   memorySearchSchema,
+  memoryDetailQuerySchema,
   partitionPatchSchema,
   partitionUpsertSchema,
   personBriefQuerySchema,
@@ -35,6 +44,11 @@ import {
   personProfileQuerySchema,
   personUpdateSchema,
   personUpsertSchema,
+  privacyPreviewSchema,
+  privacyRescanSchema,
+  privacyRuleCreateSchema,
+  privacyRulePatchSchema,
+  privacyRuleQuerySchema,
   usageQuerySchema,
 } from '../schemas.ts';
 
@@ -76,6 +90,48 @@ function loadKey(rc: RequestContext, partitionId: string, keyId: string): ApiKey
     .prepare("SELECT * FROM api_keys WHERE id = ? AND partition_id = ? AND kind = 'partition'")
     .get(keyId, partitionId) as unknown as ApiKeyRow | undefined;
   return row ?? null;
+}
+
+interface PrivacyRuleScopeRow {
+  id: string;
+  scope: string;
+  partition_id: string;
+}
+
+function privacyRuleScopeRow(rc: RequestContext, id: string): PrivacyRuleScopeRow {
+  const row = rc.app.db
+    .prepare('SELECT id, scope, partition_id FROM privacy_rules WHERE id = ?')
+    .get(id) as unknown as PrivacyRuleScopeRow | undefined;
+  if (!row) throw errors.notFound('隐私规则不存在');
+  return row;
+}
+
+/** global 规则仅 owner 可写；分区规则需要该分区 admin+。 */
+function assertPrivacyRuleWrite(rc: RequestContext, row: PrivacyRuleScopeRow): void {
+  if (row.scope === 'global') {
+    requireConsoleRole(rc, 'owner');
+    return;
+  }
+  assertWritable(requireConsolePartition(rc, row.partition_id, 'admin'));
+}
+
+/** 控制台请求体 → PrivacyRuleInput（camelCase 为主，兼容 snake_case）。 */
+function privacyRuleInputFromBody(body: Record<string, unknown>): PrivacyRuleInput {
+  return {
+    code: body.code as string | undefined,
+    name: body.name as string | undefined,
+    kind: body.kind as PrivacyRuleInput['kind'] | undefined,
+    pattern: body.pattern as string | undefined,
+    flags: body.flags as string | undefined,
+    instruction: body.instruction as string | undefined,
+    entityType: (body.entityType ?? body.entity_type) as string | undefined,
+    action: body.action as PrivacyRuleInput['action'] | undefined,
+    maskMode: (body.maskMode ?? body.mask_mode) as PrivacyRuleInput['maskMode'] | undefined,
+    maskKeepLast: (body.maskKeepLast ?? body.mask_keep_last) as number | undefined,
+    maskKeepFirst: (body.maskKeepFirst ?? body.mask_keep_first) as number | undefined,
+    enabled: body.enabled as boolean | undefined,
+    priority: body.priority as number | undefined,
+  } as PrivacyRuleInput;
 }
 
 export function registerConsoleRoutes(router: Router): void {
@@ -477,6 +533,7 @@ export function registerConsoleRoutes(router: Router): void {
         factKey: body.factKey,
         validFrom: body.validFrom,
         attachments: body.attachments,
+        placeholders: body.placeholders,
         actor: actorForUser(rc, auth.user),
       });
       rc.markUsage({ partitionId: partition.id, operation: 'add', channel: 'console' });
@@ -568,8 +625,12 @@ export function registerConsoleRoutes(router: Router): void {
     auth: 'console',
     handler: (rc: RequestContext) => {
       const partition = partitionFor(rc);
+      const query = rc.query(memoryDetailQuerySchema);
+      const reveal = query.reveal === 'true' || query.reveal === '1' || query.reveal === 'placeholders';
       const detail = rc.app.engine.getMemory(partition.id, rc.params.id ?? '');
       if (!detail) throw errors.notFound('记忆不存在');
+      // v6.2：默认只返回 key/kind/encrypted；reveal=placeholders 解密真实值。
+      detail.placeholders = rc.app.engine.memoryPlaceholders(partition.id, detail.memory.id, reveal);
       rc.json(detail);
     },
   });
@@ -594,6 +655,7 @@ export function registerConsoleRoutes(router: Router): void {
           tags: body.tags,
           metadata: body.metadata,
           expiresAt: body.expiresAt,
+          placeholders: body.placeholders,
         },
         actorForUser(rc, auth.user),
       );
@@ -611,6 +673,130 @@ export function registerConsoleRoutes(router: Router): void {
       rc.app.engine.removeMemory(partition.id, rc.params.id ?? '', actorForUser(rc, auth.user));
       rc.res.statusCode = 204;
       rc.res.end();
+    },
+  });
+
+  /* --- v6.2：隐私规则域 --- */
+  router.add({
+    method: 'GET',
+    path: '/api/privacy/rules',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      requireConsoleAuth(rc);
+      const query = rc.query(privacyRuleQuerySchema);
+      const scope = query.scope as PrivacyRuleScope;
+      if (scope === 'global') {
+        rc.json({ items: rc.app.engine.listPrivacyRules() });
+        return;
+      }
+      const ref = query.partition_id ?? query.partitionId;
+      if (!ref) throw errors.badRequest('scope=partition 时必须提供 partition_id');
+      const partition = requireConsolePartition(rc, ref, 'viewer');
+      // scope=partition 只返回分区自有规则；生效规则（含全局覆盖）由 preview / 扫描路径合并。
+      const items = rc.app.engine
+        .listPrivacyRules(partition.id)
+        .filter((rule) => rule.scope === 'partition');
+      rc.json({ items });
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/privacy/rules',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const auth = requireConsoleAuth(rc);
+      const body = (await rc.body(privacyRuleCreateSchema)) as Record<string, unknown>;
+      const scope = body.scope as PrivacyRuleScope;
+      const partitionRef = (body.partitionId ?? body.partition_id) as string | undefined;
+      let partitionId: string | null = null;
+      if (scope === 'global') {
+        requireConsoleRole(rc, 'owner');
+      } else {
+        if (!partitionRef) throw errors.badRequest('分区规则必须提供 partition_id');
+        const partition = requireConsolePartition(rc, partitionRef, 'admin');
+        assertWritable(partition);
+        partitionId = partition.id;
+      }
+      const rule = rc.app.engine.createPrivacyRule(
+        scope,
+        partitionId,
+        privacyRuleInputFromBody(body),
+        actorForUser(rc, auth.user),
+        auth.org.id,
+      );
+      rc.json({ rule }, 201);
+    },
+  });
+
+  router.add({
+    method: 'PATCH',
+    path: '/api/privacy/rules/:id',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const auth = requireConsoleAuth(rc);
+      const row = privacyRuleScopeRow(rc, rc.params.id ?? '');
+      assertPrivacyRuleWrite(rc, row);
+      const body = (await rc.body(privacyRulePatchSchema)) as Record<string, unknown>;
+      const rule = rc.app.engine.updatePrivacyRule(
+        row.id,
+        privacyRuleInputFromBody(body),
+        actorForUser(rc, auth.user),
+        auth.org.id,
+      );
+      rc.json({ rule });
+    },
+  });
+
+  router.add({
+    method: 'DELETE',
+    path: '/api/privacy/rules/:id',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const auth = requireConsoleAuth(rc);
+      const row = privacyRuleScopeRow(rc, rc.params.id ?? '');
+      assertPrivacyRuleWrite(rc, row);
+      rc.app.engine.deletePrivacyRule(row.id, actorForUser(rc, auth.user), auth.org.id);
+      rc.res.statusCode = 204;
+      rc.res.end();
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/privacy/preview',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      requireConsoleAuth(rc);
+      const body = await rc.body(privacyPreviewSchema);
+      const ref = body.partition_id ?? body.partitionId;
+      const partitionId = ref ? requireConsolePartition(rc, ref, 'viewer').id : null;
+      rc.json(rc.app.engine.previewPrivacy(partitionId, body.text));
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/partitions/:partition/privacy/rescan',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const partition = partitionFor(rc, 'admin');
+      const auth = requireConsoleAuth(rc);
+      const body = await rc.body(privacyRescanSchema);
+      const personRef = body.person_id ?? body.personId;
+      let personId: string | undefined;
+      if (personRef) {
+        const person = rc.app.engine.getPerson(partition.id, personRef);
+        if (!person) throw errors.notFound('人不存在');
+        personId = person.id;
+      }
+      if (!rc.app.engine.rescanPrivacy) throw errors.internal('当前服务未启用隐私重扫');
+      const result = await rc.app.engine.rescanPrivacy(
+        partition.id,
+        { personId, limit: body.limit },
+        actorForUser(rc, auth.user),
+      );
+      rc.json(result);
     },
   });
 

@@ -122,11 +122,100 @@ export interface PartitionSettings {
   /* --- v6.1 P2 合规 --- */
   /** PII 脱敏：off=原文落库；basic=手机/邮箱/身份证/银行卡正则脱敏 */
   piiRedaction?: PiiRedactionMode;
+  /* --- v6.2 隐私规则域 --- */
+  /** 是否执行 kind=prompt 的隐私规则（需配置 LLM；失败静默回退 regex） */
+  privacyLlmEnabled?: boolean;
   [key: string]: unknown;
 }
 
 /** PII 脱敏级别（分区设置 settings.piiRedaction）。 */
 export type PiiRedactionMode = 'off' | 'basic';
+
+/* ------------------------------------------------------------------ */
+/* v6.2：隐私规则域                                                     */
+/* ------------------------------------------------------------------ */
+
+export type PrivacyRuleScope = 'global' | 'partition';
+export type PrivacyRuleKind = 'regex' | 'prompt';
+export type PrivacyAction = 'mask' | 'placeholder';
+export type PrivacyMaskMode = 'email' | 'keepFirstLast' | 'keepLast' | 'full';
+
+/** 隐私规则：全局（builtin 标记）或分区规则；同 code 时分区的覆盖全局。 */
+export interface PrivacyRule {
+  id: string;
+  scope: PrivacyRuleScope;
+  /** global 规则为空 */
+  partitionId?: string;
+  /** email/phone/id_card/bank_card/name/address/... */
+  code: string;
+  name: string;
+  kind: PrivacyRuleKind;
+  /** regex 源码（kind=regex） */
+  pattern?: string;
+  /** regex flags，默认 g */
+  flags: string;
+  /** prompt：告诉 LLM 抽取什么（kind=prompt） */
+  instruction?: string;
+  entityType: string;
+  action: PrivacyAction;
+  maskMode: PrivacyMaskMode;
+  maskKeepLast: number;
+  maskKeepFirst: number;
+  enabled: boolean;
+  /** 小者先执行，默认 100 */
+  priority: number;
+  builtin: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrivacyRuleInput {
+  code?: string;
+  name: string;
+  kind: PrivacyRuleKind;
+  pattern?: string;
+  flags?: string;
+  instruction?: string;
+  entityType?: string;
+  action?: PrivacyAction;
+  maskMode?: PrivacyMaskMode;
+  maskKeepLast?: number;
+  maskKeepFirst?: number;
+  enabled?: boolean;
+  priority?: number;
+}
+
+export interface PrivacyScanHit {
+  code: string;
+  entityType: string;
+  value: string;
+  start: number;
+  end: number;
+  action: PrivacyAction;
+}
+
+export interface PrivacyScanResult {
+  /** 替换后的文本（未命中时通常与输入一致） */
+  text: string;
+  redacted: boolean;
+  hits: PrivacyScanHit[];
+  /** 占位符映射：token → 命中的真实值（placeholder 动作时） */
+  placeholders: Record<string, string>;
+}
+
+/** 记忆占位符：默认只返回值外的元信息；reveal 时才有 value。 */
+export interface MemoryPlaceholder {
+  placeholder: string;
+  kind?: string;
+  encrypted: boolean;
+  value?: string;
+}
+
+export interface MemoryDetail {
+  memory: Memory;
+  person: Person | null;
+  placeholders?: MemoryPlaceholder[];
+}
 
 export interface Partition {
   id: string;
@@ -323,6 +412,8 @@ export interface Memory {
   attachmentCount?: number;
   /** 详情（GET 记忆）才返回附件明细；批量列表只带 attachmentCount */
   attachments?: MemoryAttachment[];
+  /** v6.2：占位符数量（正文只存 token，真实值在映射表） */
+  placeholderCount?: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -359,7 +450,8 @@ export type MemoryHistoryEvent =
   | 'DELETE'
   | 'NOOP'
   | 'FEEDBACK'
-  | 'RESTORE';
+  | 'RESTORE'
+  | 'PRIVACY';
 
 /** 单条记忆的变更历史（控制台抽屉时间线）。 */
 export interface MemoryHistoryEntry {

@@ -31,13 +31,16 @@ export {
   claimDueJobs,
   enqueueJob,
   enqueueMemoryJobs,
+  enqueuePrivacyJob,
   executeJob,
   extractEntities,
   linkCoOccurringRelations,
   MAX_JOB_ATTEMPTS,
   processJobs,
+  processJobsAsync,
   requeueStaleJobs,
   runEmbedJob,
+  runPrivacyJob,
   runProfileJob,
   startMemoryJobWorker,
   toMemoryJob,
@@ -75,4 +78,31 @@ export {
 } from './attachments.ts';
 export { redactPii, applyPiiRedaction } from '../lib/pii.ts';
 export { decryptField, encryptField, encryptionKeyFromEnv, isEncryptedField } from '../lib/crypto.ts';
+/* --- v6.2 隐私规则域 --- */
+export {
+  applyPrivacyToMemory,
+  applyPrivacyToMemorySync,
+  countMemoryPlaceholders,
+  countPlaceholderTokens,
+  createPrivacyRule,
+  deletePrivacyRule,
+  extractPromptEntities,
+  findPrivacyRule,
+  listMemoryPlaceholders,
+  listPrivacyRules,
+  maskPrivacyValue,
+  placeholderTokensOf,
+  privacyJobNeeded,
+  pruneMemoryPlaceholders,
+  rescanPrivacy,
+  resolveMemoryPlaceholders,
+  scanText,
+  scanTextAsync,
+  toPrivacyRule,
+  updatePrivacyRule,
+  validatePlaceholders,
+  withPlaceholderCounts,
+  writeMemoryPlaceholders,
+} from './privacy.ts';
+export type { PrivacyApplyResult, PrivacyRuleRow, PrivacyScanOptions, PrivacyRescanResult } from './privacy.ts';
 export type { LlmConfig };

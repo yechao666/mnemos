@@ -1,7 +1,7 @@
 # Mnemos v6.1 架构
 
 > 契约：[`v6-architecture.md`](v6-architecture.md) + [`roadmap-v6.1.md`](roadmap-v6.1.md)。
-> 本文描述 v6.1 的实现结构：分层、schema v7 表与索引、FTS 与触发器、计数维护、
+> 本文描述 v6.2 的实现结构：分层、schema v8 表与索引、FTS 与触发器、计数维护、
 > 混合检索与融合、写入/异步任务管线、画像与生命周期、图/附件/PII/加密、鉴权隔离、
 > 控制台与百万级列表的性能预算。
 >
@@ -37,7 +37,7 @@
 └───────────────┬──────────────────────────────────────────────────┘
                 │ node:sqlite（内置，无第三方驱动）
 ┌───────────────▼──────────────────────────────────────────────────┐
-│ SQLite（WAL，schema v7）                                          │
+│ SQLite（WAL，schema v8）                                          │
 │  partitions · persons(+fts) · memories(+fts) · sessions           │
 │  partition_stats（触发器维护） · memory_briefs · dream_runs      │
 │  memory_history · memory_feedback · memory_jobs                   │
@@ -141,7 +141,7 @@ idx_memories_recent   (partition_id, created_at DESC, id DESC)
 idx_memories_session  (partition_id, session_id)
 ```
 
-v6.1 新增（schema v7）索引：
+v6.1/v6.2 新增（schema v7/v8）索引与隐私表：
 
 ```sql
 idx_memories_valid  (partition_id, person_id, valid_to, created_at DESC)  -- 默认列表 + 时序

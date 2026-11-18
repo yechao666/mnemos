@@ -236,6 +236,58 @@ describe('mnemos_add：默认人与写路径（v6 人级端点）', () => {
     }
   })
 
+  it('placeholders：正文只写 {{key}}、真实值放映射；schema / description 声明协议', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const { byName, exec } = makeHarness(fake)
+      const add = byName.get('mnemos_add')
+      assert.equal(add.parameters.properties.placeholders.type, 'object')
+      assert.equal(add.parameters.properties.placeholders.additionalProperties.type, 'string')
+      assert.equal(add.parameters.properties.content.type, 'string', 'content 是 text 的别名')
+      assert.match(add.description, /placeholders/)
+      assert.match(add.description, /\{\{key\}\}/)
+
+      const result = await add.execute(
+        {
+          content: '张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。',
+          placeholders: { phone_a1b2: '18334423321', mail_c3d4: 'zhangsan@example.com' },
+        },
+        exec(),
+      )
+      assert.equal(result.ok, true, result.error)
+      const body = addRequestOf(fake).body
+      assert.equal(body.text, '张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。')
+      assert.deepEqual(body.placeholders, {
+        phone_a1b2: '18334423321',
+        mail_c3d4: 'zhangsan@example.com',
+      })
+      assert.doesNotMatch(body.text, /18334423321|zhangsan@example\.com/, '正文不得出现真实值')
+    } finally {
+      await fake.close()
+    }
+  })
+
+  it('placeholders：非法 key / 非字符串值返回可操作错误，不发写请求', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const { byName, exec } = makeHarness(fake)
+      const add = byName.get('mnemos_add')
+
+      const badKey = await add.execute({ text: 'x {{bad key}}', placeholders: { 'bad key': 'v' } }, exec())
+      assert.equal(badKey.ok, false)
+      assert.match(badKey.error, /key/)
+      assert.match(badKey.action, /placeholders/)
+
+      const badValue = await add.execute({ text: 'x', placeholders: { phone_a1b2: 18334423321 } }, exec())
+      assert.equal(badValue.ok, false)
+      assert.match(badValue.error, /非空字符串/)
+
+      assert.equal(addRequestOf(fake), undefined)
+    } finally {
+      await fake.close()
+    }
+  })
+
   it('scope=session 缺省用当前 DSH 会话 id；没有会话 id 时报错并给 action', async () => {
     const fake = await createMnemosFake()
     try {

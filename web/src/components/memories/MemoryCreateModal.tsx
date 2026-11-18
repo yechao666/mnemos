@@ -18,6 +18,13 @@ import {
   validateAttachmentDrafts,
   type AttachmentDraft,
 } from './Attachments.tsx';
+import {
+  PlaceholderEditor,
+  extractPlaceholderKeys,
+  placeholderDraftsToMap,
+  validatePlaceholderDrafts,
+  type PlaceholderDraft,
+} from './Placeholders.tsx';
 
 const MAX_TAGS = 20;
 const MAX_TAG_LENGTH = 64;
@@ -61,8 +68,10 @@ export function MemoryCreateModal({
   const [category, setCategory] = useState<MemoryCategory>(defaultCategory);
   const [tags, setTags] = useState('');
   const [attachments, setAttachments] = useState<AttachmentDraft[]>([]);
+  const [placeholders, setPlaceholders] = useState<PlaceholderDraft[]>([]);
   const [formError, setFormError] = useState<string | null>(null);
   const [showAttachmentErrors, setShowAttachmentErrors] = useState(false);
+  const [showPlaceholderErrors, setShowPlaceholderErrors] = useState(false);
   const [saving, setSaving] = useState(false);
 
   // 每次打开重置表单（保留调用方传入的默认人 / scope / 分类）。
@@ -74,10 +83,24 @@ export function MemoryCreateModal({
     setCategory(defaultCategory);
     setTags('');
     setAttachments([]);
+    setPlaceholders([]);
     setFormError(null);
     setShowAttachmentErrors(false);
+    setShowPlaceholderErrors(false);
     setSaving(false);
   }, [open, defaultPersonRef, defaultScope, defaultCategory]);
+
+  // 正文出现新的 {{key}} 时自动补映射行（值由用户填写；删行不会被自动加回除非正文再次变化）。
+  useEffect(() => {
+    if (!open) return;
+    const tokens = extractPlaceholderKeys(text);
+    if (!tokens.length) return;
+    setPlaceholders((current) => {
+      const existing = new Set(current.map((draft) => draft.key.trim()));
+      const missing = tokens.filter((key) => !existing.has(key));
+      return missing.length ? [...current, ...missing.map((key) => ({ key, value: '' }))] : current;
+    });
+  }, [open, text]);
 
   const submit = async () => {
     if (saving) return;
@@ -107,6 +130,13 @@ export function MemoryCreateModal({
       setFormError(attachmentError);
       return;
     }
+    const placeholderError = validatePlaceholderDrafts(content, placeholders);
+    if (placeholderError) {
+      setShowPlaceholderErrors(true);
+      setFormError(placeholderError);
+      return;
+    }
+    const placeholderMap = placeholderDraftsToMap(content, placeholders);
 
     setSaving(true);
     setFormError(null);
@@ -117,10 +147,11 @@ export function MemoryCreateModal({
         category,
         tags: parsedTags,
         attachments: attachments.length ? attachmentDraftsToInputs(attachments) : undefined,
+        placeholders: Object.keys(placeholderMap).length ? placeholderMap : undefined,
       });
       toast.success(
-        attachments.length
-          ? `已写入记忆，并附带 ${attachments.length} 个附件`
+        attachments.length || Object.keys(placeholderMap).length
+          ? `已写入记忆，并附带 ${attachments.length} 个附件、${Object.keys(placeholderMap).length} 个隐私占位符`
           : '已写入记忆（服务端会自动去重 / 合并并异步抽取实体）',
       );
       onClose();
@@ -167,16 +198,33 @@ export function MemoryCreateModal({
           />
         </Field>
 
-        <Field label="记忆内容" required htmlFor="memory-create-text" hint="自然语言事实、偏好、决策或上下文；越具体越利于检索。">
+        <Field
+          label="记忆内容"
+          required
+          htmlFor="memory-create-text"
+          hint="自然语言事实、偏好、决策或上下文；敏感值请用 {{key}} 占位并在下方映射中填写真实值，正文不会落明文。"
+        >
           <Textarea
             id="memory-create-text"
             value={text}
             maxLength={20_000}
-            placeholder="例如：Alice 负责「阿尔法项目」的设计评审，偏好周二下午开会。"
+            placeholder="例如：Alice 负责「阿尔法项目」的设计评审，偏好周二下午开会；手机号 {{phone_a1b2}}。"
             style={{ minHeight: 112 }}
             onChange={(event) => setText(event.target.value)}
           />
         </Field>
+
+        <PlaceholderEditor
+          value={placeholders}
+          onChange={(next) => {
+            setPlaceholders(next);
+            setFormError(null);
+            setShowPlaceholderErrors(false);
+          }}
+          content={text}
+          showErrors={showPlaceholderErrors}
+          disabled={saving}
+        />
 
         <div className="grid grid-2" style={{ gap: 12 }}>
           <Field label="可见范围" htmlFor="memory-create-scope" hint={MEMORY_SCOPES.find((item) => item.value === scope)?.desc}>
@@ -224,6 +272,8 @@ export function MemoryCreateModal({
 
         <div className="tiny dim">
           附件只保存 URL 与描述（媒体本体由调用方托管）；每记忆最多 10 个，URL 必须以 http(s) 开头。
+          占位符映射按 <span className="mono">docs/privacy-rules.md</span> 协议提交：正文只存 token，真实值加密入库；
+          分区总开关 <span className="mono">piiRedaction</span> 关闭时，显式提交的映射仍会保存。
         </div>
       </div>
     </Modal>

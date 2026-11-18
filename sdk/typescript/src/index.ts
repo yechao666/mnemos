@@ -1012,6 +1012,7 @@ function memoryAddBody(input: MemoryInput): JsonRecord {
     supersedes_id: pick(input.supersedesId, input.supersedes_id),
     fact_key: pick(input.factKey, input.fact_key),
     valid_from: pick(input.validFrom, input.valid_from),
+    placeholders: input.placeholders,
     attachments: memoryAttachmentsBody(input.attachments),
   });
 }

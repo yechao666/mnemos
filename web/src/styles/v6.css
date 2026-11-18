@@ -919,3 +919,191 @@
     grid-column: 2 / 3;
   }
 }
+
+/* ==========================================================================
+   v6.2 — 隐私规则页 / 占位符映射 / 试跑预览
+   ========================================================================== */
+
+/* ------------------------------ 规则页工具栏 ------------------------------ */
+.privacy-toolbar {
+  padding: 10px 12px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.014);
+}
+
+.privacy-toolbar .toolbar-left {
+  gap: 14px;
+}
+
+/* ------------------------------ 试跑预览 ------------------------------ */
+.privacy-preview-text {
+  margin: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.privacy-hit-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.privacy-hit-row {
+  display: grid;
+  grid-template-columns: 84px 130px 100px minmax(140px, 1.6fr) 96px;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 11px;
+  border-top: 1px solid var(--border-faint);
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.privacy-hit-row:first-child {
+  border-top: 0;
+}
+
+.privacy-hit-row.is-head {
+  background: rgba(0, 0, 0, 0.18);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.privacy-hit-value {
+  color: #f5c26b;
+  overflow-wrap: anywhere;
+}
+
+.privacy-placeholder-map,
+.placeholder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.placeholder-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(140px, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.placeholder-token {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 2px 7px;
+  border: 1px solid rgba(139, 124, 255, 0.28);
+  border-radius: var(--radius-full);
+  background: rgba(139, 124, 255, 0.09);
+  color: #c4bcff;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.placeholder-token.is-mapped {
+  border-color: rgba(110, 231, 183, 0.35);
+  background: rgba(110, 231, 183, 0.08);
+  color: #6ee7b7;
+}
+
+.placeholder-token.is-missing {
+  border-color: rgba(245, 194, 107, 0.4);
+  background: rgba(245, 194, 107, 0.08);
+  color: #f5c26b;
+}
+
+.placeholder-value {
+  font-size: 12px;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+
+.placeholder-value.is-hidden {
+  letter-spacing: 2px;
+  color: var(--text-dim);
+  user-select: none;
+}
+
+/* ------------------------------ 占位符编辑器 ------------------------------ */
+.placeholder-editor {
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.01);
+}
+
+.placeholder-editor-empty {
+  padding: 8px 0 2px;
+}
+
+.placeholder-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 1fr) minmax(190px, 1.7fr) auto 32px;
+  gap: 8px;
+  align-items: center;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-faint);
+}
+
+.placeholder-row:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.placeholder-row .input {
+  min-width: 0;
+}
+
+.placeholder-example {
+  padding: 8px 10px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+}
+
+@media (max-width: 760px) {
+  .privacy-hit-row {
+    grid-template-columns: 76px minmax(0, 1.2fr) minmax(0, 1.4fr);
+  }
+
+  .privacy-hit-row > :nth-child(3),
+  .privacy-hit-row > :nth-child(5) {
+    display: none;
+  }
+
+  .placeholder-row {
+    grid-template-columns: minmax(0, 1fr) 32px;
+  }
+
+  .placeholder-row > .input:nth-child(2) {
+    grid-column: 1 / 2;
+  }
+
+  .placeholder-row > .tiny {
+    grid-column: 1 / -1;
+  }
+
+  .placeholder-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

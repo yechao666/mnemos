@@ -12,6 +12,7 @@ import type { LlmConfig } from '../env.ts';
 import { newId, nowIso } from '../lib/ids.ts';
 import { EngineError, engineErrors } from './errors.ts';
 import { llmText } from './llm.ts';
+import { applyPrivacyToMemory } from './privacy.ts';
 import {
   addMemory,
   markDreamed,
@@ -164,7 +165,27 @@ export async function runDream(
       return { run: toDreamRun(row), status: dreamStatus(db, input.partitionId, input.personId) };
     }
 
-    const content = await polishInsight(llm, memories);
+    // v6.2：批次内对输入记忆执行一次隐私抽取（regex + 可选 prompt），有变更则更新 content/占位符/历史。
+    const privacyUpdated = new Map<string, string>();
+    let privacyRedacted = 0;
+    let privacyHits = 0;
+    for (const memory of memories) {
+      const result = await applyPrivacyToMemory(db, llm, input.partitionId, memory.id, {
+        reason: 'privacy:dream',
+        allowPrompt: Boolean(llm),
+      });
+      if (result.changed) {
+        privacyRedacted += 1;
+        privacyUpdated.set(memory.id, result.content);
+      }
+      privacyHits += result.hits.length;
+    }
+    const effectiveMemories = memories.map((memory) => {
+      const updated = privacyUpdated.get(memory.id);
+      return updated === undefined ? memory : { ...memory, content: updated };
+    });
+
+    const content = await polishInsight(llm, effectiveMemories);
     const importance = Math.max(0.7, ...memories.map((memory) => memory.importance));
 
     let ownerPersonId = input.personId;
@@ -208,10 +229,24 @@ export async function runDream(
     );
     // 洞见本身也是「已巩固」，否则下一轮会把自己当输入无限循环。
     db.prepare('UPDATE memories SET dreamed_at = ? WHERE id = ?').run(finishedAt, insight.id);
-    finishRun(db, runId, 'completed', memories.length, 1, `已巩固 ${memories.length} 条记忆并生成 1 条洞见`);
+    const privacySummary =
+      privacyRedacted > 0 || privacyHits > 0 ? `；隐私脱敏 ${privacyRedacted} 条（${privacyHits} 处）` : '';
+    finishRun(
+      db,
+      runId,
+      'completed',
+      memories.length,
+      1,
+      `已巩固 ${memories.length} 条记忆并生成 1 条洞见${privacySummary}`,
+    );
 
     const row = db.prepare('SELECT * FROM dream_runs WHERE id = ?').get(runId) as unknown as DreamRunRow;
-    return { run: toDreamRun(row), status: dreamStatus(db, input.partitionId, input.personId) };
+    return {
+      run: toDreamRun(row),
+      status: dreamStatus(db, input.partitionId, input.personId),
+      privacyRedacted,
+      privacyHits,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     try {

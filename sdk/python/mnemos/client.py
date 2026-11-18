@@ -526,6 +526,7 @@ class MemoriesResource:
         source: Optional[str] = None,
         tags: Optional[Sequence[str]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        placeholders: Optional[Mapping[str, str]] = None,
         expires_at: Optional[str] = None,
         supersedes_id: Optional[str] = None,
         fact_key: Optional[str] = None,
@@ -537,6 +538,11 @@ class MemoriesResource:
         ``event`` 为 ``ADD`` / ``MERGE`` / ``NOOP`` / ``SUPERSEDE`` —— 重复写入不会
         新增（``NOOP``），相似写入会合并（``MERGE``），``supersedes_id`` / 同
         ``fact_key`` 会让旧记忆失效（``SUPERSEDE``）。
+
+        隐私占位符：把手机号 / 邮箱等真实值放进 ``placeholders``，正文用
+        ``{{key}}`` 占位符（如 ``content="手机 {{phone_a1b2}}"``、
+        ``placeholders={"phone_a1b2": "18334423321"}``）。正文只存 token，
+        真实值由服务端加密保存；``brief`` / ``context`` 自动还原。
         """
         if not text and not content and not messages:
             raise ValueError("memories.add: text / content / messages 至少提供一个")
@@ -556,6 +562,7 @@ class MemoriesResource:
                 "source": source,
                 "tags": list(tags) if tags is not None else None,
                 "metadata": dict(metadata) if metadata is not None else None,
+                "placeholders": dict(placeholders) if placeholders is not None else None,
                 "expires_at": expires_at,
                 "supersedes_id": supersedes_id,
                 "fact_key": fact_key,

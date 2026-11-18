@@ -371,6 +371,7 @@ test('memories.add：按人路径、snake_case 请求体与响应事件归一化
     sessionTitle: '评审',
     tags: ['偏好'],
     metadata: { channel: 'test' },
+    placeholders: { phone_a1b2: '18334423321' },
   });
 
   const call = mock.calls[0] as CapturedCall;
@@ -385,6 +386,7 @@ test('memories.add：按人路径、snake_case 请求体与响应事件归一化
     importance: 0.7,
     tags: ['偏好'],
     metadata: { channel: 'test' },
+    placeholders: { phone_a1b2: '18334423321' },
   });
 
   assert.equal(result.memory.id, 'mem_1');

@@ -77,6 +77,25 @@ printf '%s\n' \
 {"content": "评审必须覆盖回滚方案", "category": "constraint", "scope": "partition", "tags": ["评审"]}
 ```
 
+**隐私占位符**：手机号 / 邮箱 / 身份证 / 银行卡等真实值放 `placeholders`，正文只写 `{{key}}`
+（key 为 `[A-Za-z0-9_-]{3,64}`）；正文只落 token，真实值由服务端加密保存：
+
+```json
+{
+  "content": "张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。",
+  "placeholders": {
+    "phone_a1b2": "18334423321",
+    "mail_c3d4": "zhangsan@example.com"
+  },
+  "scope": "person"
+}
+```
+
+- 列表 / 搜索只返回占位符计数；详情默认给占位符 key，`?reveal=placeholders`（需 `memories:read`）才解密真实值；
+  `mnemos_brief` / `mnemos_context` 由服务端自动还原真实值。
+- 显式传 `placeholders` 时即使分区 `pii_redaction=off` 也保存；服务端正则 / 提示词规则作为兜底
+  （见 [`docs/privacy-rules.md`](../../docs/privacy-rules.md)）。
+
 ### `mnemos_brief` / `mnemos_context`
 
 - `mnemos_brief`：人的记忆简报，返回文本 + `{count, cached, generated_at}`；

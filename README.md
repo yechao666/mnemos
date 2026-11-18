@@ -14,7 +14,7 @@
 - **单文件 SQLite**：`node:sqlite` 内置，无外部数据库/消息队列；离线可用，配置 LLM 后可选增强。
 - **生态齐全**：TypeScript SDK、Python SDK、MCP server、LangChain `BaseStore` 适配器、DSH 插件。
 
-> **版本 6.1.0**（schema v7）。v6 是干净重建：旧领域（Agent 注册表 / 任务 / 任务简报 / 项目记录 /
+> **版本 6.2.0**（schema v8）。v6 是干净重建：旧领域（Agent 注册表 / 任务 / 任务简报 / 项目记录 /
 > 复盘 / Webhooks）已从代码、表、路由与文档中删除，**不兼容 v5 端点**。v5 保留在 `v5` 分支，
 > 数据目录也彼此分离（v5 `data/`，v6.1 `data-v6/`）。详见[与 v5 的关系](#与-v5-的关系)。
 
@@ -34,6 +34,7 @@
 | 实体图谱 | `extract` 任务写 entities/memory_entities/relations；图/实体 API + 控制台图谱 | `GET .../graph`、`.../entities` |
 | 多模态附件 | 写记忆带 `attachments[]`（URL/caption）；详情返回、列表只给 count；caption 参与检索 | 写记忆 body |
 | PII / 合规 | `settings.piiRedaction=basic` 脱敏手机/邮箱/身份证/银行卡；`persons.consent`；审计 | settings + person PATCH |
+| 隐私规则（v6.2） | 全局 + 分区规则；regex 直接扫描 / prompt LLM 抽取；写入占位符 + 映射表抽离（正文只存 token，reveal 才解密） | `/api/privacy/rules`、`POST /api/privacy/preview`、写记忆 `placeholders` |
 | 可选加密 | `MNEMOS_ENCRYPTION_KEY` → 附件 URL AES-256-GCM 加密（不加密正文，保护 FTS） | 环境变量 |
 | 幂等写入 | `Idempotency-Key` 24h 回放；不同 body 409 | 写接口请求头 |
 | 评测 | 7 场景：改写召回/时效/冲突/隔离/反馈/合并/画像 | `pnpm eval` |
@@ -479,7 +480,7 @@ DeepSeek Harness（dsh）：
 
 - v6 在分支 `v6-rebuild`/`main` 上**重建**；v5 完整保留在 `v5` 分支，可继续检出使用。
 - **数据不迁移**：v5 使用 `data/`（`projects` 等旧表），v6.1 使用 `data-v6/`。
-  v6 启动时检测到 v5 schema 会**拒绝启动**；v6 库会自动升级到 schema v7。
+  v6 启动时检测到 v5 schema 会**拒绝启动**；v6/v6.1 库会自动升级到 schema v8（含隐私规则表）。
 - **端点不兼容**：`/v1/projects/...`、`/v1/agents/...`、`/v1/tasks/...`、`/v1/memories`、
   `/v1/memories/search`、`/v1/context`、`/v1/graph` 等全部移除；改为
   `/v1/partitions/:p/persons/:person/...`。v5 的 `page/page_size + total` 改为游标分页。
@@ -519,8 +520,9 @@ mnemos/
 | --- | --- |
 | [`docs/roadmap-v6.1.md`](docs/roadmap-v6.1.md) | v6.1 契约、P0/P1/P2 完成状态与验收证据 |
 | [`docs/v6-architecture.md`](docs/v6-architecture.md) | v6 唯一契约：模型、存储、API、控制台、性能、插件、验收 |
-| [`docs/architecture.md`](docs/architecture.md) | 实现架构：schema v7、索引、检索融合、写管线、jobs、画像、图、附件、加密 |
-| [`docs/api.md`](docs/api.md) | API 参考：鉴权、游标、v1 与控制台端点、检索信号、历史/反馈、画像/生命周期、错误码 |
+| [`docs/architecture.md`](docs/architecture.md) | 实现架构：schema v8、索引、检索融合、写管线、jobs、画像、图、附件、隐私规则、加密 |
+| [`docs/api.md`](docs/api.md) | API 参考：鉴权、游标、v1 与控制台端点、检索信号、历史/反馈、画像/生命周期、隐私规则与占位符、错误码 |
+| [`docs/privacy-rules.md`](docs/privacy-rules.md) | v6.2 隐私规则域：模型与合并、regex/prompt 扫描、占位符协议、端点、实现与限制 |
 | [`docs/v6-scale.md`](docs/v6-scale.md) | 百万级设计、检索候选/延迟预算、seed-scale/perf-persons、验收步骤 |
 | [`docs/eval.md`](docs/eval.md) | 评测 harness（`pnpm eval`）：7 场景、阈值、JSON 输出与 CI |
 | [`docs/operations.md`](docs/operations.md) | 部署、配置、备份恢复、jobs/回填/reconcile、维护、升级、排障 |

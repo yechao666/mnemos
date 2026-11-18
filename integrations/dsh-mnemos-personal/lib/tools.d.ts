@@ -45,6 +45,8 @@ interface WorkspaceResult {
 export declare function mnemosWorkspaceTool(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): ToolDefinition<Record<string, never>, WorkspaceResult>;
 interface AddArgs {
     text?: string;
+    /** 记忆正文别名：与 text 二选一；占位符协议示例用 content。 */
+    content?: string;
     messages?: string | Array<{
         role: string;
         content: string;
@@ -55,6 +57,8 @@ interface AddArgs {
     category?: string;
     tags?: string[];
     metadata?: Record<string, unknown>;
+    /** 隐私占位符映射：正文写 `{{key}}`，真实值只放这里。 */
+    placeholders?: Record<string, string>;
 }
 interface AddResult {
     ok: boolean;

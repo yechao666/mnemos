@@ -79,6 +79,8 @@ export const partitionSettingsSchema = z
     autoExtractEntities: z.boolean(),
     /* v6.1 P2 合规 */
     piiRedaction: z.enum(['off', 'basic']),
+    /* v6.2 隐私规则 */
+    privacyLlmEnabled: z.boolean(),
   })
   .partial();
 
@@ -180,6 +182,8 @@ export const memoryAttachmentSchema = z.object({
   caption: z.string().trim().max(1000).optional(),
 });
 
+export const placeholdersSchema = z.record(z.string().max(4000));
+
 export const memoryAddSchema = z.object({
   text: z.string().min(1).max(20_000).optional(),
   content: z.string().min(1).max(20_000).optional(),
@@ -199,6 +203,8 @@ export const memoryAddSchema = z.object({
   validFrom: z.string().trim().max(40).optional(),
   /* v6.1 P2 多模态附件 */
   attachments: z.array(memoryAttachmentSchema).max(10).optional(),
+  /* v6.2 隐私占位符映射 */
+  placeholders: placeholdersSchema.optional(),
 }).refine((value) => Boolean(value.text ?? value.content), {
   message: 'text 不能为空',
   path: ['text'],
@@ -214,6 +220,8 @@ export const memoryPatchSchema = z
     tags: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
     metadata: z.record(z.unknown()).optional(),
     expiresAt: z.string().trim().max(40).nullable().optional(),
+    /* v6.2 隐私占位符映射（整体覆盖；正文未使用的键忽略） */
+    placeholders: placeholdersSchema.optional(),
   })
   .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
 
@@ -279,6 +287,70 @@ export const auditQuerySchema = cursorQuerySchema;
 
 export const usageQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(90).default(30),
+});
+
+/* ------------------------------------------------------------------ */
+/* v6.2：隐私规则 / 预览 / 重扫                                        */
+/* ------------------------------------------------------------------ */
+
+export const privacyRuleScopeSchema = z.enum(['global', 'partition']);
+export const privacyRuleKindSchema = z.enum(['regex', 'prompt']);
+export const privacyActionSchema = z.enum(['mask', 'placeholder']);
+export const privacyMaskModeSchema = z.enum(['email', 'keepFirstLast', 'keepLast', 'full']);
+
+export const privacyRuleInputSchema = z.object({
+  code: z.string().trim().max(40).optional(),
+  name: z.string().trim().min(1).max(80).optional(),
+  kind: privacyRuleKindSchema.optional(),
+  pattern: z.string().max(2000).optional(),
+  flags: z.string().trim().max(8).optional(),
+  instruction: z.string().trim().max(2000).optional(),
+  entityType: z.string().trim().max(60).optional(),
+  entity_type: z.string().trim().max(60).optional(),
+  action: privacyActionSchema.optional(),
+  maskMode: privacyMaskModeSchema.optional(),
+  mask_mode: privacyMaskModeSchema.optional(),
+  maskKeepLast: z.coerce.number().int().min(0).max(64).optional(),
+  mask_keep_last: z.coerce.number().int().min(0).max(64).optional(),
+  maskKeepFirst: z.coerce.number().int().min(0).max(64).optional(),
+  mask_keep_first: z.coerce.number().int().min(0).max(64).optional(),
+  enabled: z.boolean().optional(),
+  priority: z.coerce.number().int().min(0).max(1_000_000).optional(),
+});
+
+export const privacyRuleCreateSchema = privacyRuleInputSchema.extend({
+  scope: privacyRuleScopeSchema,
+  partitionId: z.string().trim().max(128).optional(),
+  partition_id: z.string().trim().max(128).optional(),
+  code: z.string().trim().min(2).max(40),
+  name: z.string().trim().min(1).max(80),
+  kind: privacyRuleKindSchema,
+});
+
+export const privacyRulePatchSchema = privacyRuleInputSchema
+  .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
+
+export const privacyRuleQuerySchema = z.object({
+  scope: privacyRuleScopeSchema.default('global'),
+  partition_id: z.string().trim().max(128).optional(),
+  partitionId: z.string().trim().max(128).optional(),
+});
+
+export const privacyPreviewSchema = z.object({
+  partition_id: z.string().trim().max(128).optional(),
+  partitionId: z.string().trim().max(128).optional(),
+  text: z.string().min(1).max(20_000),
+});
+
+export const privacyRescanSchema = z.object({
+  person_id: z.string().trim().max(128).optional(),
+  personId: z.string().trim().max(128).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+
+/** GET 记忆详情：reveal=placeholders/true 时解密占位符值。 */
+export const memoryDetailQuerySchema = z.object({
+  reveal: z.enum(['true', 'false', '1', '0', 'placeholders']).optional(),
 });
 
 /* ------------------------------------------------------------------ */

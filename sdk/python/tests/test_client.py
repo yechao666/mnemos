@@ -233,6 +233,7 @@ class SdkTestCase(unittest.TestCase):
             scope="partition",
             tags=["偏好"],
             metadata={"from": "test"},
+            placeholders={"phone_a1b2": "18334423321"},
             supersedes_id="mem_0",
             fact_key="preference.language",
             idempotency_key="idem-1",
@@ -251,6 +252,7 @@ class SdkTestCase(unittest.TestCase):
         self.assertEqual(body["supersedes_id"], "mem_0")
         self.assertEqual(body["fact_key"], "preference.language")
         self.assertEqual(body["tags"], ["偏好"])
+        self.assertEqual(body["placeholders"], {"phone_a1b2": "18334423321"})
         self.assertNotIn("content", body)
         self.assertNotIn("expires_at", body)
 

@@ -72,6 +72,17 @@ const { memory, event } = await client.memories.add(
 );
 console.log(event); // ADD / MERGE / NOOP / SUPERSEDE
 
+// 3b) 隐私值走占位符协议：正文只存 {{key}} token，真实值放 placeholders（服务端加密保存，不落正文）
+const privateWrite = await client.memories.add(partition.slug, person.external_id, {
+  content: '张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。',
+  placeholders: {
+    phone_a1b2: '18334423321',
+    mail_c3d4: 'zhangsan@example.com',
+  },
+  scope: 'person',
+});
+console.log(privateWrite.memory.content); // 只含 {{phone_a1b2}} / {{mail_c3d4}}
+
 // 4) 混合检索：hits 带信号分解
 const search = await client.memories.search(partition.slug, {
   query: '评审偏好',
@@ -204,7 +215,7 @@ const client = new MnemosClient({
 | --- | --- | --- |
 | `memories.list(p, query?)` | `GET .../memories` | 分区全局列表：`person_id` / `person_external_id` / scope / category / status / q / cursor / limit |
 | `memories.listByPerson(p, personRef, query?)` | `GET .../persons/:person/memories` | 某人的记忆 |
-| `memories.add(p, personRef, input, options?)` | `POST .../persons/:person/memories` | 写入；返回 `{ memory, event, superseded_id, events }` |
+| `memories.add(p, personRef, input, options?)` | `POST .../persons/:person/memories` | 写入；返回 `{ memory, event, superseded_id, events }`；隐私值用 `input.placeholders` |
 | `memories.search(p, input)` | `POST .../memories/search` | 混合检索：`hits` / `signals` / `mode` / `strategy` |
 | `memories.get(p, id)` | `GET .../memories/:id` | 详情（含 `person` 与附件明细） |
 | `memories.update(p, id, input)` | `PATCH .../memories/:id` | 更新，返回 `{ memory }` |
@@ -212,7 +223,9 @@ const client = new MnemosClient({
 | `memories.feedback(p, id, input)` | `POST .../memories/:id/feedback` | `{helpful, query?, reason?}`，±0.05 调 confidence |
 | `memories.delete(p, id)` | `DELETE .../memories/:id` | 删除（204） |
 
-写记忆可选字段：`supersedesId`、`factKey`、`validFrom`、`attachments[]`
+写记忆可选字段：`supersedesId`、`factKey`、`validFrom`、`attachments[]`、`placeholders`（隐私占位符映射：
+正文写 `{{key}}`，真实值放映射；key 为 `[A-Za-z0-9_-]{3,64}`；列表/搜索只返回计数，详情 `?reveal=placeholders`
+才解密，`brief/context` 自动还原）。
 （每记忆 ≤10，`kind` = image/audio/video/file，`url` ≤2000，`caption` ≤1000）。
 
 ### 图 / 实体

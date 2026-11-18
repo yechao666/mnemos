@@ -193,7 +193,8 @@ CREATE TABLE IF NOT EXISTS memories (
   supersedes      TEXT,
   fact_key        TEXT,
   feedback_up     INTEGER NOT NULL DEFAULT 0,
-  feedback_down   INTEGER NOT NULL DEFAULT 0
+  feedback_down   INTEGER NOT NULL DEFAULT 0,
+  privacy_scanned_at TEXT
 );
 -- 排序键放在 status 之前：列表默认不带 status 过滤，保证 ORDER BY created_at 可直接走索引。
 CREATE INDEX IF NOT EXISTS idx_memories_person ON memories(partition_id, person_id, created_at DESC, id DESC);
@@ -599,4 +600,45 @@ CREATE TABLE IF NOT EXISTS relations (
 );
 CREATE INDEX IF NOT EXISTS idx_relations_partition ON relations(partition_id, weight DESC);
 
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '7');
+/* ------------------------------------------------------------------ */
+/* v6.2：隐私规则域（schema v8）                                        */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS privacy_rules (
+  id              TEXT PRIMARY KEY,
+  scope           TEXT NOT NULL,                 -- global | partition
+  partition_id    TEXT NOT NULL DEFAULT '',      -- global 为空串
+  code            TEXT NOT NULL,                 -- email/phone/id_card/...
+  name            TEXT NOT NULL,
+  kind            TEXT NOT NULL,                 -- regex | prompt
+  pattern         TEXT,
+  flags           TEXT NOT NULL DEFAULT 'g',
+  instruction     TEXT,
+  entity_type     TEXT NOT NULL DEFAULT 'pii',
+  action          TEXT NOT NULL DEFAULT 'mask',  -- mask | placeholder
+  mask_mode       TEXT NOT NULL DEFAULT 'keepLast',
+  mask_keep_last  INTEGER NOT NULL DEFAULT 4,
+  mask_keep_first INTEGER NOT NULL DEFAULT 0,
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  priority        INTEGER NOT NULL DEFAULT 100,
+  builtin         INTEGER NOT NULL DEFAULT 0,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  UNIQUE (scope, partition_id, code)
+);
+CREATE INDEX IF NOT EXISTS idx_privacy_rules_scope ON privacy_rules(scope, partition_id, enabled, priority);
+
+CREATE TABLE IF NOT EXISTS memory_placeholders (
+  id            TEXT PRIMARY KEY,
+  partition_id  TEXT NOT NULL,
+  memory_id     TEXT NOT NULL,
+  placeholder   TEXT NOT NULL,
+  value_cipher  TEXT NOT NULL,
+  encrypted     INTEGER NOT NULL DEFAULT 0,
+  kind          TEXT,
+  created_at    TEXT NOT NULL,
+  UNIQUE (memory_id, placeholder)
+);
+CREATE INDEX IF NOT EXISTS idx_placeholders_memory ON memory_placeholders(memory_id);
+
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '8');

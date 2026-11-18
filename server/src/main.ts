@@ -82,7 +82,7 @@ try {
 }
 
 const server = createHttpServer(context);
-const jobWorker = startMemoryJobWorker({ db, logger, tickMs: 1_000, batchSize: 10 });
+const jobWorker = startMemoryJobWorker({ db, logger, tickMs: 1_000, batchSize: 10, llm: env.llm });
 logger.info('memory_jobs.worker_started', { tickMs: 1_000, batchSize: 10 });
 let stopDreamScheduler: () => void = () => {};
 

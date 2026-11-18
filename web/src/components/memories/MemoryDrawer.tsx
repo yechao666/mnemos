@@ -28,6 +28,7 @@ import {
   MemoryTemporalBadge,
 } from './shared.tsx';
 import { AttachmentGallery } from './Attachments.tsx';
+import { PlaceholderBadges, PlaceholderValue } from './Placeholders.tsx';
 import { SearchHitInsight } from './SearchSignals.tsx';
 
 /** 判断一条记忆是否来自检索结果（带 score/signals/matchedOn）。 */
@@ -223,10 +224,12 @@ export function MemoryDrawer({
   const [detail, setDetail] = useState<Memory | null>(memory);
   const [reason, setReason] = useState('');
   const [submitting, setSubmitting] = useState<'' | 'up' | 'down'>('');
+  const [revealPlaceholders, setRevealPlaceholders] = useState(false);
 
   useEffect(() => {
     setDetail(memory);
     setReason('');
+    setRevealPlaceholders(false);
   }, [memory]);
 
   const memoryId = memory?.id ?? '';
@@ -249,6 +252,28 @@ export function MemoryDrawer({
   const insight = asSearchHit(memory);
   // 切换记忆时丢弃上一条记忆的历史，避免 useAsync 保留旧 data 造成串台。
   const history = (historyQuery.data ?? []).filter((entry) => !entry.memoryId || entry.memoryId === memoryId);
+
+  // v6.2：只有确实存在占位符（计数或正文 token）时才请求映射，避免给旧数据制造无谓错误态。
+  const metadataPlaceholderCount =
+    current?.metadata && typeof current.metadata.placeholderCount === 'number'
+      ? current.metadata.placeholderCount
+      : 0;
+  const placeholderHint = Boolean(
+    (current?.placeholderCount ?? 0) > 0 ||
+      metadataPlaceholderCount > 0 ||
+      (current?.content && /\{\{[A-Za-z0-9_-]{3,64}\}\}/.test(current.content)),
+  );
+  const placeholdersQuery = useAsync(
+    () => api.memories.placeholders(partitionId, memoryId, revealPlaceholders),
+    [partitionId, memoryId, revealPlaceholders, placeholderHint],
+    enabled && placeholderHint,
+  );
+  const placeholders = placeholdersQuery.data ?? [];
+  const placeholderCount = Math.max(
+    current?.placeholderCount ?? 0,
+    metadataPlaceholderCount,
+    placeholders.length,
+  );
 
   const refreshAll = async () => {
     setDetail((prev) => prev ?? memory);
@@ -394,6 +419,72 @@ export function MemoryDrawer({
               <div className="mt-10">
                 <AttachmentGallery attachments={current.attachments} count={current.attachmentCount} />
               </div>
+            </section>
+          ) : null}
+
+          {placeholderHint ? (
+            <section>
+              <div className="between wrap gap-8">
+                <div>
+                  <div className="section-title">隐私占位符</div>
+                  <div className="tiny dim mt-4">
+                    正文只保存 <span className="mono">{'{{token}}'}</span>，真实值加密存于映射表；
+                    「显示真实值」会调用 reveal 接口并记录到审计日志。
+                  </div>
+                </div>
+                <div className="hstack gap-8">
+                  <Badge tone="slate" size="sm">{fmtInt(placeholderCount)} 个</Badge>
+                  <Button
+                    size="sm"
+                    variant={revealPlaceholders ? 'ghost' : 'secondary'}
+                    icon={revealPlaceholders ? 'x' : 'eye'}
+                    loading={revealPlaceholders && placeholdersQuery.loading}
+                    onClick={() => setRevealPlaceholders((value) => !value)}
+                  >
+                    {revealPlaceholders ? '隐藏真实值' : '显示真实值'}
+                  </Button>
+                </div>
+              </div>
+
+              {placeholdersQuery.error ? (
+                <div className="mt-10">
+                  <Callout tone="amber" icon="info">
+                    占位符接口尚未就绪或读取失败：<span className="mono">{placeholdersQuery.error}</span>。
+                    记忆正文仍只保存 token，不影响本条记忆的展示。
+                  </Callout>
+                  <div className="mt-8">
+                    <Button size="sm" icon="refresh" onClick={() => void placeholdersQuery.refresh()}>
+                      重试
+                    </Button>
+                  </div>
+                </div>
+              ) : placeholdersQuery.loading && placeholders.length === 0 ? (
+                <div className="vstack gap-8 mt-10">
+                  {[0, 1].map((index) => <Skeleton key={index} h={40} style={{ borderRadius: 8 }} />)}
+                </div>
+              ) : placeholders.length === 0 ? (
+                <div className="tiny dim mt-10">
+                  服务端暂未返回占位符映射（可能为旧数据、映射已清理，或该接口尚未返回 placeholders 字段）。
+                </div>
+              ) : (
+                <div className="placeholder-list mt-10">
+                  {placeholders.map((placeholder) => (
+                    <div className="placeholder-item" key={placeholder.placeholder}>
+                      <PlaceholderBadges placeholder={placeholder} />
+                      <PlaceholderValue
+                        placeholder={placeholder}
+                        revealed={revealPlaceholders && !placeholdersQuery.loading}
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {revealPlaceholders && placeholders.length > 0 ? (
+                <div className="tiny dim mt-8">
+                  <Icon name="shield" size={11} /> 真实值来自解密后的映射表（需 memories:read）；请勿在共享屏幕上长时间展示。
+                </div>
+              ) : null}
             </section>
           ) : null}
 

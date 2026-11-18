@@ -6,6 +6,7 @@ import { generateBrief } from './brief.ts';
 import { engineErrors } from './errors.ts';
 import { personMemories, sharedMemories } from './memories.ts';
 import { findPartitionById } from './partition.ts';
+import { resolveMemoryPlaceholders } from './privacy.ts';
 import { resolvePerson } from './persons.ts';
 
 function trimToBudget(lines: string[], budgetChars: number): string[] {
@@ -43,9 +44,16 @@ export async function buildContext(
   });
 
   const query = (input.query ?? '').trim() || undefined;
-  const memories = personMemories(db, input.partitionId, person.id, query, 20);
+  // v6.2：上下文注入前把占位符还原为真实值（服务端内部使用，不直接回传数据库明文）。
+  const memories = resolveMemoryPlaceholders(
+    db,
+    input.partitionId,
+    personMemories(db, input.partitionId, person.id, query, 20),
+  );
   const includePartition = input.includePartition !== false;
-  const shared = includePartition ? sharedMemories(db, input.partitionId, query, 10) : [];
+  const shared = includePartition
+    ? resolveMemoryPlaceholders(db, input.partitionId, sharedMemories(db, input.partitionId, query, 10))
+    : [];
 
   const header = [
     '## 人物资料',

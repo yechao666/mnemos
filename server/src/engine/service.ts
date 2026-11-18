@@ -30,6 +30,11 @@ import type {
   PersonListQuery,
   PersonMergeResult,
   PersonProfile,
+  PrivacyRule,
+  PrivacyRuleInput,
+  PrivacyRuleScope,
+  PrivacyScanResult,
+  MemoryPlaceholder,
   ReconcileResult,
   UpdateMemoryInput,
 } from '../../../shared/src/types.ts';
@@ -48,6 +53,15 @@ import {
   updateMemory,
 } from './memories.ts';
 import { buildEntityGraph, listEntities as listEntityRecords } from './graph.ts';
+import {
+  createPrivacyRule as createPrivacyRuleRecord,
+  deletePrivacyRule as deletePrivacyRuleRecord,
+  listMemoryPlaceholders,
+  listPrivacyRules as listPrivacyRulesRecord,
+  rescanPrivacy as rescanPrivacyRecord,
+  scanText,
+  updatePrivacyRule as updatePrivacyRuleRecord,
+} from './privacy.ts';
 import { searchMemories } from './retrieval.ts';
 import {
   getPartition,
@@ -383,6 +397,78 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
     },
     listEntities(query) {
       return listEntityRecords(db, query);
+    },
+
+    /* --- v6.2：隐私规则域 --- */
+    listPrivacyRules(partitionId?: string): PrivacyRule[] {
+      return listPrivacyRulesRecord(db, partitionId);
+    },
+    createPrivacyRule(
+      scope: PrivacyRuleScope,
+      partitionId: string | null,
+      input: PrivacyRuleInput,
+      actor: Actor,
+      orgId?: string,
+    ): PrivacyRule {
+      const rule = createPrivacyRuleRecord(db, scope, partitionId, input);
+      audit(db, {
+        orgId: rule.partitionId ? orgOfPartition(db, rule.partitionId) : orgId,
+        partitionId: rule.partitionId,
+        actor,
+        action: 'privacy.rule.create',
+        resourceType: 'privacy_rule',
+        resourceId: rule.id,
+        detail: { scope: rule.scope, code: rule.code, kind: rule.kind, action: rule.action },
+      });
+      return rule;
+    },
+    updatePrivacyRule(id: string, input: Partial<PrivacyRuleInput>, actor: Actor, orgId?: string): PrivacyRule {
+      const rule = updatePrivacyRuleRecord(db, id, input);
+      audit(db, {
+        orgId: rule.partitionId ? orgOfPartition(db, rule.partitionId) : orgId,
+        partitionId: rule.partitionId,
+        actor,
+        action: 'privacy.rule.update',
+        resourceType: 'privacy_rule',
+        resourceId: rule.id,
+        detail: { scope: rule.scope, code: rule.code, ...input },
+      });
+      return rule;
+    },
+    deletePrivacyRule(id: string, actor: Actor, orgId?: string): void {
+      const rule = deletePrivacyRuleRecord(db, id);
+      audit(db, {
+        orgId: rule.partitionId ? orgOfPartition(db, rule.partitionId) : orgId,
+        partitionId: rule.partitionId,
+        actor,
+        action: 'privacy.rule.delete',
+        resourceType: 'privacy_rule',
+        resourceId: rule.id,
+        detail: { scope: rule.scope, code: rule.code },
+      });
+    },
+    previewPrivacy(partitionId: string | null, text: string): PrivacyScanResult {
+      return scanText(db, partitionId, text);
+    },
+    memoryPlaceholders(partitionId: string, memoryId: string, reveal = false): MemoryPlaceholder[] {
+      return listMemoryPlaceholders(db, partitionId, memoryId, reveal);
+    },
+    async rescanPrivacy(
+      partitionId: string,
+      options: { personId?: string; limit?: number } = {},
+      actor?: Actor,
+    ): Promise<{ scanned: number; changed: number; placeholders: number; hits: number }> {
+      const result = await rescanPrivacyRecord(db, llm, partitionId, options);
+      audit(db, {
+        orgId: orgOfPartition(db, partitionId),
+        partitionId,
+        actor: actor ?? { type: 'system', id: 'privacy', label: '隐私重扫' },
+        action: 'memory.privacy.scan',
+        resourceType: 'partition',
+        resourceId: partitionId,
+        detail: { ...options, ...result },
+      });
+      return result;
     },
 
     /* --- 简报 / 上下文 / 做梦 --- */

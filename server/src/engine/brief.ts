@@ -5,6 +5,7 @@ import { sha256 } from '../lib/ids.ts';
 import { engineErrors } from './errors.ts';
 import { llmText } from './llm.ts';
 import { briefSourceMemories } from './memories.ts';
+import { resolveMemoryPlaceholders } from './privacy.ts';
 import { findPartitionById } from './partition.ts';
 import { resolvePersonRow } from './persons.ts';
 import { parseSettings, toBrief, type BriefRow } from './rows.ts';
@@ -95,7 +96,12 @@ export async function generateBrief(
 
   const maxChars = Math.min(5000, Math.max(100, Math.trunc(input.maxChars ?? settings.briefMaxChars)));
   const scopeKey = personId ? `person:${personId}` : 'partition';
-  const sources = briefSourceMemories(db, input.partitionId, personId, 100);
+  // v6.2：注入 LLM/提示词前把 {{token}} 还原为真实值（否则模型读不懂占位符）。
+  const sources = resolveMemoryPlaceholders(
+    db,
+    input.partitionId,
+    briefSourceMemories(db, input.partitionId, personId, 100),
+  );
   const sourceHash = sha256(
     `${sources.map((memory) => `${memory.id}:${memory.updatedAt}`).join('|')}|${maxChars}|v6|${llm?.model ?? CONDENSE_MODEL}`,
   );

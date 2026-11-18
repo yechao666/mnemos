@@ -172,6 +172,13 @@ export function MemoryMeta({
           <Icon name="package" size={10} /> 附件 {memory.attachmentCount}
         </Badge>
       ) : null}
+      {memory.placeholderCount ? (
+        <span title="正文只存 token，真实值加密存于映射表">
+          <Badge tone="cyan" size="sm">
+            <Icon name="shield" size={10} /> 占位符 {memory.placeholderCount}
+          </Badge>
+        </span>
+      ) : null}
       {memory.source === 'dream' ? (
         <Badge tone="violet" size="sm" dot>
           <Icon name="sparkles" size={10} /> 做梦沉淀

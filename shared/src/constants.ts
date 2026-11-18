@@ -14,7 +14,7 @@ import type {
 
 export const APP_NAME = 'Mnemos';
 export const APP_TAGLINE = '企业级 AI 记忆基础设施';
-export const APP_VERSION = '6.1.0';
+export const APP_VERSION = '6.2.0';
 export const DEFAULT_SERVER_PORT = 4380;
 
 /** 游标分页：默认 50，最大 200。 */
@@ -154,6 +154,7 @@ export const DEFAULT_PARTITION_SETTINGS: PartitionSettings = {
   dedupeThreshold: 0.98,
   autoExtractEntities: true,
   piiRedaction: 'off',
+  privacyLlmEnabled: false,
 };
 
 /** 多模态附件（P2）上限：每记忆最多 10 个、URL 最长 2000 字符。 */
@@ -172,4 +173,11 @@ export const RETRIEVAL_MODES: { value: 'hybrid' | 'keyword' | 'vector'; label: s
 export const EMBEDDING_MODELS = [
   { value: 'mnemos-hash-384', label: 'Mnemos Hash-384（本地、免密钥）' },
   { value: 'text-embedding-3-small', label: 'OpenAI text-embedding-3-small（外部）' },
+];
+
+
+/** 隐私规则类型选项（控制台/文档共用）。 */
+export const PRIVACY_RULE_KINDS: { value: 'regex' | 'prompt'; label: string; desc: string }[] = [
+  { value: 'regex', label: '正则扫描', desc: '直接对文本做确定性匹配与替换，无需 LLM。' },
+  { value: 'prompt', label: '提示词（LLM）', desc: '把抽取指令交给 LLM 识别，适合人名/地址/凭据等。' },
 ];

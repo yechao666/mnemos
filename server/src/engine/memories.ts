@@ -14,11 +14,11 @@ import type {
   MemorySource,
   MemoryStatus,
   PersonType,
+  PrivacyScanResult,
   UpdateMemoryInput,
 } from '../../../shared/src/types.ts';
 import { tx } from '../db/index.ts';
 import { newId, nowIso } from '../lib/ids.ts';
-import { applyPiiRedaction } from '../lib/pii.ts';
 import { memoryContentHash } from '../lib/text.ts';
 import { attachmentCounts, insertAttachments, listAttachments, normalizeAttachments, withAttachmentCounts } from './attachments.ts';
 import { decodeCursor, encodeCursor, normalizeLimit } from './cursor.ts';
@@ -26,6 +26,18 @@ import { blobToEmbedding, cosine, embedText, EMBEDDING_DIM, EMBEDDING_MODEL, emb
 import { engineErrors } from './errors.ts';
 import { listMemoryHistory, writeHistory } from './history.ts';
 import { enqueueMemoryJobs } from './jobs.ts';
+import {
+  countMemoryPlaceholders,
+  countPlaceholderTokens,
+  listMemoryPlaceholders,
+  placeholderTokensOf,
+  pruneMemoryPlaceholders,
+  privacyJobNeeded,
+  scanText,
+  validatePlaceholders,
+  withPlaceholderCounts,
+  writeMemoryPlaceholders,
+} from './privacy.ts';
 import { findPartitionById, loadStatsRow } from './partition.ts';
 import { findPersonRow, resolvePerson, resolvePersonRow, upsertPerson } from './persons.ts';
 import {
@@ -179,7 +191,65 @@ function fetchMemoryRow(db: DatabaseSync, partitionId: string, id: string): Memo
 function memoryOf(db: DatabaseSync, partitionId: string, id: string): Memory {
   const row = fetchMemoryRow(db, partitionId, id);
   if (!row) throw engineErrors.notFound('记忆不存在');
-  return withAttachmentCounts(db, [toMemory(row)])[0];
+  return withPlaceholderCounts(db, withAttachmentCounts(db, [toMemory(row)]))[0];
+}
+
+const EMPTY_SCAN: PrivacyScanResult = { text: '', redacted: false, hits: [], placeholders: {} };
+
+function scanKinds(scan: PrivacyScanResult): Record<string, string> {
+  if (Object.keys(scan.placeholders).length === 0) return {};
+  const kinds: Record<string, string> = {};
+  for (const [token, value] of Object.entries(scan.placeholders)) {
+    const hit = scan.hits.find((item) => item.value === value);
+    if (hit) kinds[token] = hit.entityType;
+  }
+  return kinds;
+}
+
+/** 以实际行数回填 metadata.placeholderCount（NOOP/MERGE 时用）。 */
+function syncPlaceholderMetadata(db: DatabaseSync, memoryId: string): number {
+  const count = countMemoryPlaceholders(db, memoryId);
+  const row = db.prepare('SELECT metadata FROM memories WHERE id = ?').get(memoryId) as unknown as
+    | { metadata: string }
+    | undefined;
+  if (!row) return count;
+  const metadata = parseJson<Record<string, unknown>>(row.metadata, {});
+  if (count > 0) metadata.placeholderCount = count;
+  else delete metadata.placeholderCount;
+  db.prepare('UPDATE memories SET metadata = ? WHERE id = ?').run(JSON.stringify(metadata), memoryId);
+  return count;
+}
+
+function writePrivacyHistory(
+  db: DatabaseSync,
+  input: {
+    partitionId: string;
+    personId: string;
+    memoryId: string;
+    oldContent: string;
+    newContent: string;
+    actor: Actor;
+    hits: PrivacyScanResult['hits'];
+    placeholders: number;
+    reason: string;
+  },
+): void {
+  writeHistory(db, {
+    partitionId: input.partitionId,
+    personId: input.personId,
+    memoryId: input.memoryId,
+    event: 'PRIVACY',
+    oldContent: input.oldContent,
+    newContent: input.newContent,
+    actor: input.actor,
+    reason: input.reason,
+    meta: {
+      hits: input.hits.length,
+      codes: [...new Set(input.hits.map((hit) => hit.code))],
+      kinds: [...new Set(input.hits.map((hit) => hit.entityType))],
+      placeholders: input.placeholders,
+    },
+  });
 }
 
 interface NearDuplicate {
@@ -239,9 +309,15 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
   const rawContent = typeof input.content === 'string' ? input.content.trim() : '';
   if (!rawContent) throw engineErrors.validation('content 不能为空');
   if (rawContent.length > MAX_CONTENT_CHARS) throw engineErrors.validation('content 最长 20000 字符');
-  // P2：按分区设置做 basic PII 脱敏（off 时原样）；附件校验在事务外完成。
-  const redaction = applyPiiRedaction(settings, rawContent);
-  const content = redaction.text;
+  // v6.2：显式占位符映射在总开关 off 时也保存（调用方主动抽离）；映射必须覆盖正文全部 token。
+  const explicit = validatePlaceholders(rawContent, input.placeholders);
+  // 写入同步路径只跑 regex；prompt 规则由 privacy job 异步补齐。off 时原样落库。
+  const scan = settings.piiRedaction === 'basic' ? scanText(db, input.partitionId, rawContent) : EMPTY_SCAN;
+  const content = settings.piiRedaction === 'basic' ? scan.text : rawContent;
+  const placeholderValues: Record<string, string> = { ...explicit.mapping, ...scan.placeholders };
+  const placeholderKinds = scanKinds(scan);
+  const placeholderCount = countPlaceholderTokens(content);
+  const schedulePrivacyScan = privacyJobNeeded(db, input.partitionId);
   const attachments = normalizeAttachments(input.attachments);
 
   const person = resolveWritePerson(db, input.partitionId, input, settings.personAutoCreate);
@@ -275,8 +351,10 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
   const source = sourceOf(input.source);
   const tags = JSON.stringify(input.tags ?? []);
   const metadataObject: Record<string, unknown> = { ...(input.metadata ?? {}) };
-  if (redaction.redacted) metadataObject.piiRedacted = true;
+  if (scan.redacted) metadataObject.piiRedacted = true;
+  if (placeholderCount > 0) metadataObject.placeholderCount = placeholderCount;
   const metadata = JSON.stringify(metadataObject);
+  const privacyScannedAt = settings.piiRedaction === 'basic' ? now : null;
   const expiresAt = input.expiresAt === null ? null : input.expiresAt ?? null;
   const supersedesId = input.supersedesId?.trim() || null;
 
@@ -306,7 +384,35 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
       });
       // 内容重复（NOOP）仍允许补充附件：附件是独立资源，不改变记忆内容。
       insertAttachments(db, input.partitionId, duplicate.id, attachments);
-      return { memory: withAttachmentCounts(db, [memoryOf(db, input.partitionId, duplicate.id)])[0], event: 'NOOP' };
+      // v6.2：NOOP 时合并/追加占位符映射（已有 token 不覆盖），并回填 metadata.placeholderCount。
+      const written = writeMemoryPlaceholders(db, {
+        partitionId: input.partitionId,
+        memoryId: duplicate.id,
+        content,
+        mapping: placeholderValues,
+        kinds: placeholderKinds,
+        mode: 'merge',
+      });
+      pruneMemoryPlaceholders(db, duplicate.id, content);
+      syncPlaceholderMetadata(db, duplicate.id);
+      if (scan.redacted || written > 0) {
+        writePrivacyHistory(db, {
+          partitionId: input.partitionId,
+          personId: person.id,
+          memoryId: duplicate.id,
+          oldContent: duplicate.content,
+          newContent: duplicate.content,
+          actor: input.actor,
+          hits: scan.hits,
+          placeholders: Object.keys(scan.placeholders).length,
+          reason: scan.redacted ? 'privacy:scan' : 'privacy:placeholders',
+        });
+      }
+      return {
+        memory: withPlaceholderCounts(db, withAttachmentCounts(db, [memoryOf(db, input.partitionId, duplicate.id)]))[0],
+        event: 'NOOP',
+        ...(scan.redacted ? { piiRedacted: true } : {}),
+      };
     }
 
     /* 2) 近重复 / 合并：同人同分区余弦（显式取代 / factKey 优先，不做自动合并） */
@@ -325,11 +431,38 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
       });
       // 近重复（NOOP）同样允许补充附件。
       insertAttachments(db, input.partitionId, near.row.id, attachments);
-      return { memory: withAttachmentCounts(db, [memoryOf(db, input.partitionId, near.row.id)])[0], event: 'NOOP' };
+      const written = writeMemoryPlaceholders(db, {
+        partitionId: input.partitionId,
+        memoryId: near.row.id,
+        content,
+        mapping: placeholderValues,
+        kinds: placeholderKinds,
+        mode: 'merge',
+      });
+      pruneMemoryPlaceholders(db, near.row.id, content);
+      syncPlaceholderMetadata(db, near.row.id);
+      if (scan.redacted || written > 0) {
+        writePrivacyHistory(db, {
+          partitionId: input.partitionId,
+          personId: person.id,
+          memoryId: near.row.id,
+          oldContent: near.row.content,
+          newContent: near.row.content,
+          actor: input.actor,
+          hits: scan.hits,
+          placeholders: Object.keys(scan.placeholders).length,
+          reason: scan.redacted ? 'privacy:scan' : 'privacy:placeholders',
+        });
+      }
+      return {
+        memory: withPlaceholderCounts(db, withAttachmentCounts(db, [memoryOf(db, input.partitionId, near.row.id)]))[0],
+        event: 'NOOP',
+        ...(scan.redacted ? { piiRedacted: true } : {}),
+      };
     }
     if (near && near.similarity >= settings.mergeThreshold) {
       const mergedTags = unionTags(near.row.tags, input.tags);
-      const mergedMetadata = JSON.stringify({
+      const mergedMetadataObject = {
         ...(() => {
           try {
             return JSON.parse(near.row.metadata) as Record<string, unknown>;
@@ -338,13 +471,18 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
           }
         })(),
         ...(input.metadata ?? {}),
-      });
+        ...(scan.redacted ? { piiRedacted: true } : {}),
+        ...(placeholderCount > 0 ? { placeholderCount } : {}),
+      };
+      if (placeholderCount === 0) delete mergedMetadataObject.placeholderCount;
+      const mergedMetadata = JSON.stringify(mergedMetadataObject);
       const mergedImportance = Math.max(near.row.importance, importance);
       const mergedConfidence = Math.max(near.row.confidence, confidence);
       db.prepare(
         `UPDATE memories
             SET content = ?, normalized_hash = ?, embedding = ?, embedding_model = ?, dim = ?,
-                importance = ?, confidence = ?, tags = ?, metadata = ?, category = ?, updated_at = ?
+                importance = ?, confidence = ?, tags = ?, metadata = ?, category = ?, privacy_scanned_at = ?,
+                updated_at = ?
           WHERE id = ?`,
       ).run(
         content,
@@ -357,9 +495,33 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
         mergedTags,
         mergedMetadata,
         category,
+        privacyScannedAt,
         now,
         near.row.id,
       );
+      writeMemoryPlaceholders(db, {
+        partitionId: input.partitionId,
+        memoryId: near.row.id,
+        content,
+        mapping: placeholderValues,
+        kinds: placeholderKinds,
+        mode: 'replace',
+      });
+      pruneMemoryPlaceholders(db, near.row.id, content);
+      syncPlaceholderMetadata(db, near.row.id);
+      if (scan.redacted || placeholderCount > 0) {
+        writePrivacyHistory(db, {
+          partitionId: input.partitionId,
+          personId: person.id,
+          memoryId: near.row.id,
+          oldContent: near.row.content,
+          newContent: content,
+          actor: input.actor,
+          hits: scan.hits,
+          placeholders: Object.keys(scan.placeholders).length,
+          reason: scan.redacted ? 'privacy:scan' : 'privacy:placeholders',
+        });
+      }
       writeHistory(db, {
         partitionId: input.partitionId,
         personId: person.id,
@@ -378,11 +540,12 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
         hasEmbedding: true,
         autoExtractEntities: settings.autoExtractEntities,
         factKey,
+        privacyScan: schedulePrivacyScan,
       });
       // P2：合并写入同样接受附件（追加到已有记忆）。
       insertAttachments(db, input.partitionId, near.row.id, attachments);
-      const merged = withAttachmentCounts(db, [memoryOf(db, input.partitionId, near.row.id)])[0];
-      return { memory: merged, event: 'MERGE', ...(redaction.redacted ? { piiRedacted: true } : {}) };
+      const merged = withPlaceholderCounts(db, withAttachmentCounts(db, [memoryOf(db, input.partitionId, near.row.id)]))[0];
+      return { memory: merged, event: 'MERGE', ...(scan.redacted ? { piiRedacted: true } : {}) };
     }
 
     /* 3) 取代：显式 supersedesId 或同 factKey 的旧记忆 */
@@ -421,9 +584,9 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
          (id, partition_id, person_id, actor_person_id, scope, session_id, category, content,
           importance, confidence, source, status, tags, metadata, created_at, updated_at, expires_at, dreamed_at,
           normalized_hash, embedding, embedding_model, dim, valid_from, valid_to, superseded_by, supersedes,
-          fact_key, feedback_up, feedback_down)
+          fact_key, feedback_up, feedback_down, privacy_scanned_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL,
-               ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 0, 0)`,
+               ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 0, 0, ?)`,
     ).run(
       id,
       input.partitionId,
@@ -448,9 +611,33 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
       validFrom,
       oldRows[0]?.id ?? null,
       factKey,
+      privacyScannedAt,
     );
     // P2：多模态附件（memory_attachments），写入与主体同事务。
     insertAttachments(db, input.partitionId, id, attachments);
+    // v6.2：占位符映射（显式 + 扫描自动生成）与记忆同事务落库。
+    writeMemoryPlaceholders(db, {
+      partitionId: input.partitionId,
+      memoryId: id,
+      content,
+      mapping: placeholderValues,
+      kinds: placeholderKinds,
+      mode: 'replace',
+    });
+    pruneMemoryPlaceholders(db, id, content);
+    if (scan.redacted || placeholderCount > 0) {
+      writePrivacyHistory(db, {
+        partitionId: input.partitionId,
+        personId: person.id,
+        memoryId: id,
+        oldContent: '',
+        newContent: content,
+        actor: input.actor,
+        hits: scan.hits,
+        placeholders: Object.keys(scan.placeholders).length,
+        reason: scan.redacted ? 'privacy:scan' : 'privacy:placeholders',
+      });
+    }
 
     for (const old of oldRows) {
       db.prepare(
@@ -495,13 +682,14 @@ export function addMemory(db: DatabaseSync, input: AddMemoryInput): MemoryAddRes
       hasEmbedding: true,
       autoExtractEntities: settings.autoExtractEntities,
       factKey,
+      privacyScan: schedulePrivacyScan,
     });
 
     return {
-      memory: withAttachmentCounts(db, [memoryOf(db, input.partitionId, id)])[0],
+      memory: withPlaceholderCounts(db, withAttachmentCounts(db, [memoryOf(db, input.partitionId, id)]))[0],
       event: oldRows.length > 0 ? 'SUPERSEDE' : 'ADD',
       supersededId: oldRows[0]?.id,
-      ...(redaction.redacted ? { piiRedacted: true } : {}),
+      ...(scan.redacted ? { piiRedacted: true } : {}),
     };
   });
 }
@@ -578,7 +766,10 @@ export function listMemories(db: DatabaseSync, query: MemoryListQuery): CursorPa
     .all(...params, limit + 1) as unknown as MemoryRow[];
 
   const hasMore = rows.length > limit;
-  const items = withAttachmentCounts(db, (hasMore ? rows.slice(0, limit) : rows).map(memoryFromJoinedRow));
+  const items = withPlaceholderCounts(
+    db,
+    withAttachmentCounts(db, (hasMore ? rows.slice(0, limit) : rows).map(memoryFromJoinedRow)),
+  );
   const last = items[items.length - 1];
   const nextCursor =
     hasMore && last ? encodeCursor({ v: last.createdAt, id: last.id, s: 'recent' }) : null;
@@ -607,9 +798,13 @@ export function getMemory(db: DatabaseSync, partitionId: string, id: string): Me
   const attachments = listAttachments(db, id);
   memory.attachmentCount = attachments.length;
   memory.attachments = attachments;
+  // v6.2：详情默认返回占位符 key/kind/encrypted；?reveal=placeholders 由路由层再解密。
+  const placeholders = listMemoryPlaceholders(db, partitionId, id, false);
+  memory.placeholderCount = placeholders.length;
   return {
     memory,
     person: personRow ? toPerson(personRow) : null,
+    ...(placeholders.length > 0 ? { placeholders } : {}),
   };
 }
 
@@ -630,20 +825,41 @@ export function updateMemory(
       | { settings: string }
       | undefined;
     const settings = parseSettings(partitionRow?.settings ?? null);
+    const at = nowIso();
+    const existingPlaceholders = listMemoryPlaceholders(db, partitionId, id, false);
+    const existingKeySet = new Set(existingPlaceholders.map((item) => item.placeholder));
+    const existingKinds: Record<string, string> = {};
+    for (const item of existingPlaceholders) if (item.kind) existingKinds[item.placeholder] = item.kind;
 
     const sets: string[] = [];
     const params: (string | number | null | Uint8Array)[] = [];
     let nextContent = existing.content;
     let piiRedacted = false;
+    let scan: PrivacyScanResult = EMPTY_SCAN;
+    let explicit: ReturnType<typeof validatePlaceholders> | null = null;
+    let mappingToWrite: Record<string, string> | null = null;
+    let mappingMode: 'replace' | 'merge' = 'merge';
+    let contentChanged = false;
+
     if (input.content !== undefined) {
       const raw = input.content.trim();
       if (!raw) throw engineErrors.validation('content 不能为空');
       if (raw.length > MAX_CONTENT_CHARS) throw engineErrors.validation('content 最长 20000 字符');
-      // P2：更新内容时同样按分区设置脱敏。
-      const redaction = applyPiiRedaction(settings, raw);
-      const content = redaction.text;
-      piiRedacted = redaction.redacted;
+      if (input.placeholders !== undefined) {
+        explicit = validatePlaceholders(raw, input.placeholders);
+      } else {
+        // 未提交映射时，正文 token 必须已有映射（更新不改变既有占位符值）。
+        const missing = placeholderTokensOf(raw).filter((token) => !existingKeySet.has(token));
+        if (missing.length > 0) {
+          throw engineErrors.validation(`以下占位符缺少映射值：${missing.map((token) => `{{${token}}}`).join('、')}`);
+        }
+      }
+      // v6.2：更新内容时按规则扫描（同步只跑 regex；prompt 交给 privacy job）。
+      scan = settings.piiRedaction === 'basic' ? scanText(db, partitionId, raw) : EMPTY_SCAN;
+      const content = settings.piiRedaction === 'basic' ? scan.text : raw;
+      piiRedacted = scan.redacted;
       nextContent = content;
+      contentChanged = content !== existing.content;
       sets.push('content = ?', 'normalized_hash = ?', 'embedding = ?', 'embedding_model = ?', 'dim = ?');
       params.push(
         content,
@@ -652,7 +868,21 @@ export function updateMemory(
         EMBEDDING_MODEL,
         EMBEDDING_DIM,
       );
+      sets.push('privacy_scanned_at = ?');
+      params.push(settings.piiRedaction === 'basic' ? at : null);
+    } else if (input.placeholders !== undefined) {
+      explicit = validatePlaceholders(existing.content, input.placeholders);
     }
+
+    if (explicit) {
+      mappingToWrite = { ...explicit.mapping, ...scan.placeholders };
+      mappingMode = 'replace';
+    } else if (Object.keys(scan.placeholders).length > 0) {
+      mappingToWrite = scan.placeholders;
+      mappingMode = 'merge';
+    }
+
+    const nextPlaceholderCount = countPlaceholderTokens(nextContent);
     if (input.category !== undefined) {
       if (!(MEMORY_CATEGORIES as string[]).includes(input.category)) throw engineErrors.validation('category 不合法');
       sets.push('category = ?');
@@ -675,11 +905,13 @@ export function updateMemory(
       sets.push('tags = ?');
       params.push(JSON.stringify(input.tags));
     }
-    if (input.metadata !== undefined || piiRedacted) {
+    if (input.metadata !== undefined || piiRedacted || mappingToWrite) {
       const metadataObject: Record<string, unknown> = {
         ...(input.metadata ?? parseJson<Record<string, unknown>>(existing.metadata, {})),
       };
       if (piiRedacted) metadataObject.piiRedacted = true;
+      if (nextPlaceholderCount > 0) metadataObject.placeholderCount = nextPlaceholderCount;
+      else delete metadataObject.placeholderCount;
       sets.push('metadata = ?');
       params.push(JSON.stringify(metadataObject));
     }
@@ -689,10 +921,23 @@ export function updateMemory(
     }
     if (sets.length === 0) throw engineErrors.validation('至少提供一个待更新字段');
 
-    const at = nowIso();
     sets.push('updated_at = ?');
     params.push(at);
     db.prepare(`UPDATE memories SET ${sets.join(', ')} WHERE partition_id = ? AND id = ?`).run(...params, partitionId, id);
+
+    let placeholdersWritten = 0;
+    if (mappingToWrite) {
+      placeholdersWritten = writeMemoryPlaceholders(db, {
+        partitionId,
+        memoryId: id,
+        content: nextContent,
+        mapping: mappingToWrite,
+        kinds: { ...existingKinds, ...scanKinds(scan) },
+        mode: mappingMode,
+      });
+    }
+    if (contentChanged) pruneMemoryPlaceholders(db, id, nextContent);
+    if (mappingToWrite || contentChanged) syncPlaceholderMetadata(db, id);
 
     writeHistory(db, {
       partitionId,
@@ -716,6 +961,32 @@ export function updateMemory(
       },
       createdAt: at,
     });
+
+    if (scan.redacted || mappingToWrite || placeholdersWritten > 0) {
+      writePrivacyHistory(db, {
+        partitionId,
+        personId: existing.person_id,
+        memoryId: id,
+        oldContent: existing.content,
+        newContent: nextContent,
+        actor,
+        hits: scan.hits,
+        placeholders: Object.keys(scan.placeholders).length,
+        reason: scan.redacted ? 'privacy:scan' : 'privacy:placeholders',
+      });
+    }
+
+    if (contentChanged && privacyJobNeeded(db, partitionId)) {
+      enqueueMemoryJobs(db, {
+        partitionId,
+        personId: existing.person_id,
+        memoryId: id,
+        hasEmbedding: true,
+        autoExtractEntities: settings.autoExtractEntities,
+        factKey: existing.fact_key ?? undefined,
+        privacyScan: true,
+      });
+    }
 
     return memoryOf(db, partitionId, id);
   });
@@ -741,6 +1012,7 @@ export function removeMemory(db: DatabaseSync, partitionId: string, id: string, 
     db.prepare('DELETE FROM relations WHERE memory_id = ?').run(id);
     db.prepare('DELETE FROM memory_entities WHERE memory_id = ?').run(id);
     db.prepare('DELETE FROM memory_attachments WHERE memory_id = ?').run(id);
+    db.prepare('DELETE FROM memory_placeholders WHERE memory_id = ?').run(id);
     db.prepare('DELETE FROM memories WHERE partition_id = ? AND id = ?').run(partitionId, id);
   });
 }

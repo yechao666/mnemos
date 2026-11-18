@@ -251,12 +251,16 @@ export interface MnemosClientOptions {
 /** 写记忆的请求体（由工具层组装；person 在路径里，不重复进 body）。 */
 export interface AddMemoryBody {
   text?: string
+  /** 记忆正文别名（与 text 二选一；占位符协议示例用 content）。 */
+  content?: string
   messages?: Array<{ role: string; content: string }>
   scope?: MemoryScope
   session_id?: string
   category?: string
   tags?: string[]
   metadata?: Record<string, unknown>
+  /** 占位符映射：正文里的 `{{key}}` → 真实值；正文只存 token，值由服务端加密保存。 */
+  placeholders?: Record<string, string>
 }
 
 /** 检索的请求体。 */

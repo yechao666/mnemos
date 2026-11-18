@@ -172,8 +172,10 @@ export interface PartitionSettings {
   /** 写入后异步抽取实体 */
   autoExtractEntities: boolean;
   /* --- v6.1 P2 合规 --- */
-  /** PII 脱敏：off=不处理；basic=写入时脱敏手机号/邮箱/身份证/银行卡（保留后四位） */
+  /** PII 脱敏：off=不处理；basic=写入时按隐私规则扫描（默认 off） */
   piiRedaction: 'off' | 'basic';
+  /** v6.2：是否执行提示词（LLM）隐私规则（需配置 LLM；失败静默回退正则） */
+  privacyLlmEnabled: boolean;
 }
 
 export interface RetrievalWeights {
@@ -395,11 +397,87 @@ export interface Memory {
   attachmentCount?: number;
   /** 详情（GET 记忆）才返回附件明细；批量列表只带 attachmentCount */
   attachments?: MemoryAttachment[];
+  /** v6.2：正文中的 {{token}} 占位符数量（列表/检索只带计数，不带值） */
+  placeholderCount?: number;
+  /** v6.2：最近一次隐私规则扫描时间（ISO） */
+  privacyScannedAt?: string;
 }
 
 export interface MemoryDetail {
   memory: Memory;
   person: Person | null;
+  /** 默认只返回 key/元信息；reveal=true 时 value 有值 */
+  placeholders?: MemoryPlaceholder[];
+}
+
+/* ------------------------------------------------------------------ */
+/* v6.2：隐私规则域                                                     */
+/* ------------------------------------------------------------------ */
+
+export type PrivacyRuleScope = 'global' | 'partition';
+export type PrivacyRuleKind = 'regex' | 'prompt';
+export type PrivacyAction = 'mask' | 'placeholder';
+export type PrivacyMaskMode = 'email' | 'keepFirstLast' | 'keepLast' | 'full';
+
+export interface PrivacyRule {
+  id: string;
+  scope: PrivacyRuleScope;
+  partitionId?: string;
+  code: string;
+  name: string;
+  kind: PrivacyRuleKind;
+  pattern?: string;
+  flags: string;
+  instruction?: string;
+  entityType: string;
+  action: PrivacyAction;
+  maskMode: PrivacyMaskMode;
+  maskKeepLast: number;
+  maskKeepFirst: number;
+  enabled: boolean;
+  priority: number;
+  builtin: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrivacyRuleInput {
+  code?: string;
+  name: string;
+  kind: PrivacyRuleKind;
+  pattern?: string;
+  flags?: string;
+  instruction?: string;
+  entityType?: string;
+  action?: PrivacyAction;
+  maskMode?: PrivacyMaskMode;
+  maskKeepLast?: number;
+  maskKeepFirst?: number;
+  enabled?: boolean;
+  priority?: number;
+}
+
+export interface PrivacyScanHit {
+  code: string;
+  entityType: string;
+  value: string;
+  start: number;
+  end: number;
+  action: PrivacyAction;
+}
+
+export interface PrivacyScanResult {
+  text: string;
+  redacted: boolean;
+  hits: PrivacyScanHit[];
+  placeholders: Record<string, string>;
+}
+
+export interface MemoryPlaceholder {
+  placeholder: string;
+  kind?: string;
+  encrypted: boolean;
+  value?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -522,7 +600,8 @@ export type MemoryHistoryEvent =
   | 'DELETE'
   | 'NOOP'
   | 'FEEDBACK'
-  | 'RESTORE';
+  | 'RESTORE'
+  | 'PRIVACY';
 
 export interface MemoryHistoryEntry {
   id: string;
@@ -544,7 +623,7 @@ export interface MemoryFeedbackInput {
   reason?: string;
 }
 
-export type MemoryJobType = 'embed' | 'consolidate' | 'extract' | 'profile' | 'summarize';
+export type MemoryJobType = 'embed' | 'consolidate' | 'extract' | 'profile' | 'summarize' | 'privacy';
 export type MemoryJobStatus = 'pending' | 'running' | 'done' | 'failed';
 
 export interface MemoryJob {
@@ -597,6 +676,8 @@ export interface AddMemoryInput {
   validFrom?: string;
   /** v6.1 P2：多模态附件（≤10，url≤2000） */
   attachments?: MemoryAttachmentInput[];
+  /** v6.2：占位符映射（正文用 {{key}}，敏感值放这里） */
+  placeholders?: Record<string, string>;
   actor: Actor;
 }
 
@@ -622,6 +703,8 @@ export interface UpdateMemoryInput {
   tags?: string[];
   metadata?: Record<string, unknown>;
   expiresAt?: string | null;
+  /** v6.2：替换占位符映射（整体覆盖；未出现在正文的键忽略） */
+  placeholders?: Record<string, string>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -741,6 +824,10 @@ export interface MemoryDreamInput {
 export interface MemoryDreamResult {
   run: MemoryDreamRun | null;
   status: MemoryDreamStatus;
+  /** v6.2：本批次被隐私规则改写的记忆条数 */
+  privacyRedacted?: number;
+  /** v6.2：本批次隐私命中（替换处数） */
+  privacyHits?: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -956,6 +1043,26 @@ export interface MemoryService {
   /* --- v6.1 P2：实体 / 关系图 --- */
   entityGraph(query: EntityGraphQuery): EntityGraph;
   listEntities(query: EntityListQuery): EntityList;
+
+  /* --- v6.2：隐私规则 --- */
+  listPrivacyRules(partitionId?: string): PrivacyRule[];
+  createPrivacyRule(
+    scope: PrivacyRuleScope,
+    partitionId: string | null,
+    input: PrivacyRuleInput,
+    actor: Actor,
+    orgId?: string,
+  ): PrivacyRule;
+  updatePrivacyRule(id: string, input: Partial<PrivacyRuleInput>, actor: Actor, orgId?: string): PrivacyRule;
+  deletePrivacyRule(id: string, actor: Actor, orgId?: string): void;
+  previewPrivacy(partitionId: string | null, text: string): PrivacyScanResult;
+  memoryPlaceholders(partitionId: string, memoryId: string, reveal?: boolean): MemoryPlaceholder[];
+  /** v6.2：规则变更后重扫分区记忆（regex + 可选 prompt）；返回统计 */
+  rescanPrivacy?(
+    partitionId: string,
+    options?: { personId?: string; limit?: number },
+    actor?: Actor,
+  ): Promise<{ scanned: number; changed: number; placeholders: number; hits: number }>;
 
   /* --- v6.1 P1：画像 / 生命周期 --- */
   personProfile(partitionId: string, personRef: string): PersonProfile;

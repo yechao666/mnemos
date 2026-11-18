@@ -396,6 +396,8 @@ export interface MemoryInput {
   /** 事实生效时间（ISO；缺省为服务端 now）。 */
   validFrom?: string;
   valid_from?: string;
+  /** 隐私占位符映射：正文写 `{{key}}`，真实值放这里（服务端加密保存，不落正文）。 */
+  placeholders?: Record<string, string>;
   /** 多模态附件（≤10；url ≤2000）。 */
   attachments?: MemoryAttachmentInput[];
 }

@@ -1,7 +1,9 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { MemoryJob, MemoryJobStatus, MemoryJobType } from '../../../shared/src/types.ts';
+import type { LlmConfig } from '../env.ts';
 import { newId, nowIso } from '../lib/ids.ts';
 import { blobToEmbedding, embedText, EMBEDDING_DIM, EMBEDDING_MODEL, embeddingToBlob } from './embed.ts';
+import { applyPrivacyToMemory, applyPrivacyToMemorySync } from './privacy.ts';
 import { getPersonProfile } from './profile.ts';
 import { resolvePerson } from './persons.ts';
 import { parseJson } from './rows.ts';
@@ -74,6 +76,8 @@ export interface EnqueueMemoryJobsInput {
   hasEmbedding: boolean;
   autoExtractEntities: boolean;
   factKey?: string | null;
+  /** v6.2：是否需要异步执行 prompt 隐私规则（basic + privacyLlmEnabled + 有 prompt 规则）。 */
+  privacyScan?: boolean;
 }
 
 /**
@@ -109,7 +113,28 @@ export function enqueueMemoryJobs(db: DatabaseSync, input: EnqueueMemoryJobsInpu
       }),
     );
   }
+  if (input.privacyScan) {
+    ids.push(
+      enqueueJob(db, {
+        partitionId: input.partitionId,
+        type: 'privacy',
+        payload: { memoryId: input.memoryId, personId: input.personId },
+      }),
+    );
+  }
   return ids;
+}
+
+/** v6.2：入队一条 privacy 任务（写入/更新/重扫统一入口）。 */
+export function enqueuePrivacyJob(
+  db: DatabaseSync,
+  input: { partitionId: string; memoryId: string; personId?: string },
+): string {
+  return enqueueJob(db, {
+    partitionId: input.partitionId,
+    type: 'privacy',
+    payload: { memoryId: input.memoryId, personId: input.personId },
+  });
 }
 
 /** 崩溃恢复：running 且锁定超过 STALE_LOCK_MS 的任务回到 pending。 */
@@ -297,9 +322,35 @@ export function executeJob(db: DatabaseSync, job: JobRow): void {
     case 'consolidate':
       runProfileJob(db, job.partition_id, payload);
       return;
+    case 'privacy': {
+      const memoryId = typeof payload.memoryId === 'string' ? payload.memoryId : '';
+      if (!memoryId) throw new Error('privacy 任务缺少 memoryId');
+      applyPrivacyToMemorySync(db, job.partition_id, memoryId, { reason: 'privacy:job' });
+      return;
+    }
     default:
       throw new Error(`未知任务类型：${job.type}`);
   }
+}
+
+/** privacy 任务异步执行（regex + prompt；无 LLM 时等价于 regex）。 */
+export async function runPrivacyJob(
+  db: DatabaseSync,
+  llm: LlmConfig | null,
+  partitionId: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  const memoryId = typeof payload.memoryId === 'string' ? payload.memoryId : '';
+  if (!memoryId) throw new Error('privacy 任务缺少 memoryId');
+  await applyPrivacyToMemory(db, llm, partitionId, memoryId, { reason: 'privacy:job' });
+}
+
+async function executeJobAsync(db: DatabaseSync, llm: LlmConfig | null, job: JobRow): Promise<void> {
+  if (job.type === 'privacy') {
+    await runPrivacyJob(db, llm, job.partition_id, parseJson<Record<string, unknown>>(job.payload, {}));
+    return;
+  }
+  executeJob(db, job);
 }
 
 export interface ProcessJobsResult {
@@ -354,9 +405,52 @@ export function processJobs(
   return { processed: jobs.length, succeeded, failed, requeued, pending: pendingCount(db) };
 }
 
+/**
+ * 异步任务执行（生产 worker 使用）：privacy 任务可以 await LLM；其余任务与 processJobs 同语义。
+ * processJobs 保持同步（测试/运维 tick 兼容），privacy 任务退化为仅 regex。
+ */
+export async function processJobsAsync(
+  db: DatabaseSync,
+  llm: LlmConfig | null,
+  options: { limit?: number; maxAttempts?: number; now?: number } = {},
+): Promise<ProcessJobsResult> {
+  const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_JOB_ATTEMPTS);
+  const jobs = claimDueJobs(db, options.limit ?? 10, options.now);
+  let succeeded = 0;
+  let failed = 0;
+  let requeued = 0;
+  for (const job of jobs) {
+    try {
+      await executeJobAsync(db, llm, job);
+      db.prepare(
+        "UPDATE memory_jobs SET status = 'done', locked_at = NULL, error = NULL, updated_at = ? WHERE id = ?",
+      ).run(nowIso(), job.id);
+      succeeded += 1;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (job.attempts >= maxAttempts) {
+        db.prepare(
+          "UPDATE memory_jobs SET status = 'failed', locked_at = NULL, error = ?, updated_at = ? WHERE id = ?",
+        ).run(message.slice(0, 1000), nowIso(), job.id);
+        failed += 1;
+      } else {
+        const backoffMs = Math.min(300_000, 2 ** job.attempts * 1_000);
+        const runAfter = new Date(Date.now() + backoffMs).toISOString();
+        db.prepare(
+          "UPDATE memory_jobs SET status = 'pending', locked_at = NULL, error = ?, run_after = ?, updated_at = ? WHERE id = ?",
+        ).run(message.slice(0, 1000), runAfter, nowIso(), job.id);
+        requeued += 1;
+      }
+    }
+  }
+  return { processed: jobs.length, succeeded, failed, requeued, pending: pendingCount(db) };
+}
+
 export interface JobWorker {
-  /** 立即触发一次（测试/运维用）。 */
+  /** 立即触发一次（测试/运维用；同步执行，privacy 任务退化为仅 regex）。 */
   tick(): ProcessJobsResult;
+  /** 异步触发一次（privacy 任务可调用 LLM）。 */
+  tickAsync(): Promise<ProcessJobsResult>;
   stop(): void;
 }
 
@@ -365,45 +459,76 @@ export interface StartJobWorkerOptions {
   logger?: { debug(message: string, fields?: Record<string, unknown>): void; warn(message: string, fields?: Record<string, unknown>): void };
   tickMs?: number;
   batchSize?: number;
+  /** v6.2：prompt 隐私规则需要的 LLM 配置（缺省则 privacy 任务只跑 regex）。 */
+  llm?: LlmConfig | null;
 }
 
 /** 启动同进程 worker：默认 1s tick、每批 10 条；timer.unref 不阻止进程退出。 */
 export function startMemoryJobWorker(options: StartJobWorkerOptions): JobWorker {
   const { db, logger } = options;
+  const llm = options.llm ?? null;
   const tickMs = Math.max(100, options.tickMs ?? 1_000);
   const batchSize = Math.max(1, options.batchSize ?? 10);
   let stopped = false;
   let running = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
+  const idle = (): ProcessJobsResult => ({
+    processed: 0,
+    succeeded: 0,
+    failed: 0,
+    requeued: 0,
+    pending: pendingCount(db),
+  });
+
   const schedule = (): void => {
     if (stopped) return;
     if (timer) clearTimeout(timer);
-    timer = setTimeout(run, tickMs);
+    timer = setTimeout(() => {
+      void runAsync();
+    }, tickMs);
     timer.unref?.();
   };
 
-  const run = (): ProcessJobsResult => {
-    if (stopped || running) return { processed: 0, succeeded: 0, failed: 0, requeued: 0, pending: pendingCount(db) };
+  const logResult = (result: ProcessJobsResult): void => {
+    if (result.processed === 0) return;
+    logger?.debug('memory_jobs.tick', {
+      processed: result.processed,
+      succeeded: result.succeeded,
+      failed: result.failed,
+      requeued: result.requeued,
+      pending: result.pending,
+    });
+  };
+
+  const runAsync = async (): Promise<ProcessJobsResult> => {
+    if (stopped || running) return idle();
     running = true;
     try {
-      const result = processJobs(db, { limit: batchSize });
-      if (result.processed > 0) {
-        logger?.debug('memory_jobs.tick', {
-          processed: result.processed,
-          succeeded: result.succeeded,
-          failed: result.failed,
-          requeued: result.requeued,
-          pending: result.pending,
-        });
-      }
+      const result = await processJobsAsync(db, llm, { limit: batchSize });
+      logResult(result);
       return result;
     } catch (error) {
       logger?.warn('memory_jobs.tick_failed', { error: error instanceof Error ? error.message : String(error) });
-      return { processed: 0, succeeded: 0, failed: 0, requeued: 0, pending: 0 };
+      return idle();
     } finally {
       running = false;
       schedule();
+    }
+  };
+
+  const runSync = (): ProcessJobsResult => {
+    if (stopped || running) return idle();
+    running = true;
+    try {
+      const result = processJobs(db, { limit: batchSize });
+      logResult(result);
+      return result;
+    } catch (error) {
+      logger?.warn('memory_jobs.tick_failed', { error: error instanceof Error ? error.message : String(error) });
+      return idle();
+    } finally {
+      running = false;
     }
   };
 
@@ -411,7 +536,10 @@ export function startMemoryJobWorker(options: StartJobWorkerOptions): JobWorker 
 
   return {
     tick() {
-      return run();
+      return runSync();
+    },
+    tickAsync() {
+      return runAsync();
     },
     stop() {
       stopped = true;

@@ -49,6 +49,8 @@ export function settingsV1(settings: PartitionSettings): Json {
     auto_extract_entities: settings.autoExtractEntities,
     /* --- v6.1 P2 合规 --- */
     pii_redaction: settings.piiRedaction,
+    /* --- v6.2 隐私规则 --- */
+    privacy_llm_enabled: settings.privacyLlmEnabled,
   };
 }
 
@@ -138,6 +140,9 @@ export function memoryV1(memory: Memory): Json {
     /* --- v6.1 P2 多模态 --- */
     attachment_count: memory.attachmentCount ?? memory.attachments?.length ?? 0,
     ...(memory.attachments ? { attachments: memory.attachments.map(attachmentV1) } : {}),
+    /* --- v6.2 隐私规则 --- */
+    placeholder_count: memory.placeholderCount ?? 0,
+    privacy_scanned_at: memory.privacyScannedAt ?? null,
   };
 }
 
@@ -260,6 +265,8 @@ export function dreamResultV1(result: MemoryDreamResult): Json {
   return {
     run: result.run ? dreamRunV1(result.run) : null,
     status: dreamStatusV1(result.status),
+    ...(result.privacyRedacted !== undefined ? { privacy_redacted: result.privacyRedacted } : {}),
+    ...(result.privacyHits !== undefined ? { privacy_hits: result.privacyHits } : {}),
   };
 }
 

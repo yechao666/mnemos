@@ -37,6 +37,8 @@ interface FormState {
   dreamIntervalMinutes: string;
   retrieval: RetrievalFormValue;
   piiRedaction: PiiRedactionMode;
+  /** v6.2：是否执行 kind=prompt 的隐私规则（需 LLM） */
+  privacyLlmEnabled: boolean;
 }
 
 function formFromPartition(partition: {
@@ -57,6 +59,7 @@ function formFromPartition(partition: {
     dreamIntervalMinutes: String(settings.dreamIntervalMinutes ?? 1440),
     retrieval: retrievalFormDefaults(settings),
     piiRedaction: settings.piiRedaction === 'basic' ? 'basic' : 'off',
+    privacyLlmEnabled: settings.privacyLlmEnabled === true,
   };
 }
 
@@ -85,6 +88,13 @@ export function SettingsPage() {
   useEffect(() => {
     if (location.hash !== '#retrieval') return;
     const target = document.getElementById('retrieval');
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [location.hash, partitionId, partition?.id, initial]);
+
+  // 从隐私规则页跳转过来时滚动到合规卡片（#compliance）。
+  useEffect(() => {
+    if (location.hash !== '#compliance') return;
+    const target = document.getElementById('compliance');
     if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, [location.hash, partitionId, partition?.id, initial]);
 
@@ -161,6 +171,8 @@ export function SettingsPage() {
           autoExtractEntities: form.retrieval.autoExtractEntities,
           /* --- v6.1 P2 合规 --- */
           piiRedaction: form.piiRedaction,
+          /* --- v6.2 隐私规则域 --- */
+          privacyLlmEnabled: form.privacyLlmEnabled,
         },
       });
       await refresh();
@@ -286,10 +298,15 @@ export function SettingsPage() {
 
       <RetrievalSettingsCard value={form.retrieval} onChange={patchRetrieval} />
 
-      <ComplianceSettingsCard
-        value={form.piiRedaction}
-        onChange={(next) => patch({ piiRedaction: next })}
-      />
+      <div id="compliance">
+        <ComplianceSettingsCard
+          value={form.piiRedaction}
+          onChange={(next) => patch({ piiRedaction: next })}
+          llmEnabled={form.privacyLlmEnabled}
+          onLlmChange={(next) => patch({ privacyLlmEnabled: next })}
+          partitionId={partitionId}
+        />
+      </div>
 
       <Card pad>
         <SectionHead

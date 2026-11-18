@@ -60,7 +60,7 @@
 | 工具 | 作用 | 关键参数 | 会写入？ |
 | --- | --- | --- | --- |
 | `mnemos_workspace` | 确保分区 + 默认人存在，返回分区 / 人 / `partition_stats` | 无 | 首次会（建分区 / 建档） |
-| `mnemos_add` | 给默认人（或指定人）写记忆（v6 按原文入库，不做事实抽取） | `text` 或 `messages`、`person_id`（默认 self）、`scope`、`session_id`、`category`、`tags`、`metadata` | 是 |
+| `mnemos_add` | 给默认人（或指定人）写记忆（v6 按原文入库，不做事实抽取） | `text`（或 `content` 别名）或 `messages`、`placeholders`（隐私占位符映射）、`person_id`（默认 self）、`scope`、`session_id`、`category`、`tags`、`metadata` | 是 |
 | `mnemos_search` | 检索（默认按人；`scope=partition` 只看分区共享），返回带分数结果 | `query`、`person_id`、`scope`、`category`、`top_k` | 否 |
 | `mnemos_get` | 传 `id` 取详情；否则按人 / scope / category 用**游标**列记忆 | `id`、`person_id`、`scope`、`category`、`cursor`、`limit` | 否 |
 | `mnemos_brief` | 人的简报（v6 人级；最近 person 记忆 + 相关分区共享，压缩文本） | `person_id`（默认 self） | 否 |
@@ -76,6 +76,33 @@
 所有工具的 `execute()` 都**不抛异常**：失败返回 `{ ok: false, error, action }`，`action` 是可直接照着做的下一步
 （检查 orgApiKey / 作用域、先 `mnemos_workspace`、换 `person_id` 等）。
 
+### 3.1 隐私占位符写入协议（推荐）
+
+写记忆遇到手机号 / 邮箱 / 身份证 / 银行卡等隐私值时，**不要把真实值直接写进正文**：
+把真实值放进 `placeholders` 映射，正文只写 `{{key}}` 占位符。
+
+```json
+{
+  "text": "张三的手机号是 {{phone_a1b2}}，邮箱是 {{mail_c3d4}}。",
+  "placeholders": {
+    "phone_a1b2": "18334423321",
+    "mail_c3d4": "zhangsan@example.com"
+  }
+}
+```
+
+- key 规则：`[A-Za-z0-9_-]{3,64}`；正文里的每个 token 都必须在映射里（映射里多出来的 key 会被忽略）。
+- **正文只存 token**（不落明文）；真实值存 `memory_placeholders`，服务端用 AES-256-GCM 加密
+  （`MNEMOS_ENCRYPTION_KEY`；未配置时明文并标 `encrypted=0`）。
+- 列表 / 搜索只返回 `placeholder_count`；详情默认只给占位符 key
+  （`placeholders: [{placeholder, kind, encrypted}]`），`?reveal=placeholders`（或 `reveal=true`）
+  才解密真实值，需 `memories:read`。
+- `mnemos_brief` / `mnemos_context` 会在服务端把 token 还原成真实值后再生成提示词，否则 LLM 无法使用。
+- 显式传 `placeholders` 时，即使分区 `pii_redaction=off` 也保存（调用方主动抽离）；
+  服务端规则扫描（regex / 提示词 LLM）作为兜底，见 [`docs/privacy-rules.md`](../../docs/privacy-rules.md)。
+- 插件当前 `mnemos_get` 未透出 `reveal` 参数：需要解密真实值时用 `mnemos_brief` / `mnemos_context`，
+  或直接调 `GET /v1/partitions/:p/memories/:id?reveal=placeholders`。
+
 ---
 
 ## 4. 系统提示（默认开启）
@@ -85,6 +112,9 @@ Mnemos 记忆系统（dsh-mnemos-personal）：本工作区已绑定分区 ws-de
 使用时机：
 - 开始任务前先调 mnemos_context 取默认人的上下文……
 - 想快速了解「关于这个人已知什么」用 mnemos_brief；……用游标翻页列表用 mnemos_get……
+- 写记忆遇到隐私值（手机号 / 邮箱 / 身份证 / 银行卡等）时用 placeholders 抽离：真实值放映射，
+  正文只写 {{key}} 占位符（如 text: "手机号是 {{phone_a1b2}}", placeholders: {"phone_a1b2":"18334423321"}）；
+  正文只落 token，mnemos_brief / mnemos_context 会由服务端自动还原。
 硬性限制：readOnly 模式会拦截记忆写入与人变更；orgApiKey 不要出现在回复里……
 ```
 
@@ -106,7 +136,7 @@ node --test test/*.test.mjs       # 或 pnpm test（= build + 测试）
 
 - `pnpm build`：`tsc -p tsconfig.build.json` 产出 `lib/`，再 `tsc -p tsconfig.json --noEmit` 类型检查。
 - 测试：`node --test` + 本地 `http.createServer` **假 Mnemos v6**（实现 partitions / stats / persons 游标列表 / 人级 memories / brief / context / dream / 全局 memories / search），**不依赖真实后端**。
-- 测试覆盖：slug 稳定性与不同路径隔离、fixed 模式、默认人、按人隔离、v6 游标分页（persons / memories）、人级写入路径、分区 id 作为引用、检索主路径与 `GET memories?q=` 退化、`scope=session` 缺省会话 id、readOnly 拦截、错误归一、brief / context prompt、系统提示文案、设置热更新。
+- 测试覆盖：slug 稳定性与不同路径隔离、fixed 模式、默认人、按人隔离、v6 游标分页（persons / memories）、人级写入路径、占位符写入（正文只存 token / 映射透传 / 非法 key 报错）、分区 id 作为引用、检索主路径与 `GET memories?q=` 退化、`scope=session` 缺省会话 id、readOnly 拦截、错误归一、brief / context prompt、系统提示文案、设置热更新。
 
 ### 5.2 安装到 dsh profile
 
@@ -193,5 +223,7 @@ integrations/dsh-mnemos-personal/
 - 中文目录名的 basename 会被清洗成 `workspace` 兜底段（哈希仍唯一），slug 里看不到中文。
 - 工具不暴露「记忆更新 / 删除」（v6 的 PATCH / DELETE 留给后续版本）；`mnemos_person` 也暂不暴露 `update` 动作，
   但客户端已实现 `PATCH persons/:person`，后续加动作即可。
+- `mnemos_get` 暂不透出占位符 `reveal` 参数：需要解密真实值时走 `mnemos_brief` / `mnemos_context`
+  或 `GET /v1/partitions/:p/memories/:id?reveal=placeholders`。
 - v6 不再做事实抽取：`mnemos_add` 的 `infer` 参数已移除，记忆按原文入库（仍可用 `messages` 多轮内容）。
 - 系统提示段按会话工作区动态求值，会随工作区不同而不同；单会话内 `cd` 不会改变分区（用会话头 cwd）。

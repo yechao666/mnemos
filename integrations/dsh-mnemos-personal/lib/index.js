@@ -75,6 +75,7 @@ export function buildSystemPromptText(config, workspacePath) {
         '- 开始任务前先调 mnemos_context 取默认人的上下文（资料 + 简报 + 高相关记忆 + 分区共享知识），返回的 prompt 可直接阅读 / 注入，比逐条检索省 token。\n' +
         '- 想快速了解「关于这个人已知什么」用 mnemos_brief；需要具体旧事 / 约定 / 踩坑记录用 mnemos_search；读一条详情或用游标翻页列表用 mnemos_get（把响应里的 next_cursor 传给 cursor）。\n' +
         '- 得出了值得沉淀的结论、决策、约束、踩坑经验时用 mnemos_add（scope=partition 表示分区共享，同分区其他人也能检索；缺省沿用分区设置）。\n' +
+        '- 写记忆遇到隐私值（手机号 / 邮箱 / 身份证 / 银行卡等）时用 placeholders 抽离：真实值放映射，正文只写 {{key}} 占位符（key 为 [A-Za-z0-9_-]{3,64}），例如 text: "手机号是 {{phone_a1b2}}", placeholders: {"phone_a1b2":"18334423321"}；正文只落 token，mnemos_brief / mnemos_context 会由服务端自动还原。\n' +
         '- 换人读写时显式传 person_id（缺省 / self = 默认人）；人不是登录账号，human 是 App 用户 / 员工，agent 是智能体。\n' +
         '- 管理用 mnemos_person（list / get / upsert）；不确定分区或连接状态时用 mnemos_workspace / mnemos_status。\n' +
         '硬性限制：readOnly 模式（设置 → 插件 → dsh-mnemos-personal）会拦截记忆写入与人变更；orgApiKey 不要出现在回复里，也不要写进记忆内容。\n' +

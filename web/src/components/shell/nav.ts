@@ -12,7 +12,8 @@ export interface NavEntry {
 /** v6 信息架构：组织 → 分区 → 人 → 记忆。 */
 export const NAV_ENTRIES: NavEntry[] = [
   { to: '/partitions', label: '分区', icon: 'layers' },
-  { to: '/org', label: '组织设置', icon: 'settings' },
+  { to: '/org/privacy', label: '隐私规则', icon: 'shield', end: true },
+  { to: '/org', label: '组织设置', icon: 'settings', end: true },
 ];
 
 const TAB_LABELS: Record<string, string> = Object.fromEntries(
@@ -47,6 +48,9 @@ export function breadcrumbs(pathname: string, partitions: Partition[]): Crumb[] 
     return crumbs;
   }
 
+  if (pathname.startsWith('/org/privacy')) {
+    return [{ label: '组织设置', to: '/org' }, { label: '隐私规则' }];
+  }
   if (pathname.startsWith('/org')) return [{ label: '组织设置' }];
   if (pathname.startsWith('/login')) return [{ label: '登录' }];
   return [{ label: '页面不存在' }];

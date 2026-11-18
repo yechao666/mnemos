@@ -14,6 +14,7 @@ import { KeysPage } from '../pages/KeysPage.tsx';
 import { UsagePage } from '../pages/UsagePage.tsx';
 import { AuditPage } from '../pages/AuditPage.tsx';
 import { SettingsPage } from '../pages/SettingsPage.tsx';
+import { PrivacyRulesPage } from '../pages/PrivacyRulesPage.tsx';
 import { ApiDocsPage } from '../pages/ApiDocsPage.tsx';
 import { OrgSettingsPage } from '../pages/OrgSettingsPage.tsx';
 import { NotFoundPage } from '../pages/NotFoundPage.tsx';
@@ -63,9 +64,11 @@ export function AppRoutes() {
           <Route path="keys" element={<KeysPage />} />
           <Route path="usage" element={<UsagePage />} />
           <Route path="audit" element={<AuditPage />} />
+          <Route path="privacy" element={<PrivacyRulesPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="docs" element={<ApiDocsPage />} />
         </Route>
+        <Route path="/org/privacy" element={<PrivacyRulesPage />} />
         <Route path="/org" element={<OrgSettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>

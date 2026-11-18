@@ -151,6 +151,8 @@ describe('系统提示文案', () => {
     assert.match(text, new RegExp(`本工作区已绑定分区 ${slug}，记忆按人组织；默认人 dsh-agent`))
     assert.match(text, /mnemos_context/)
     assert.match(text, /mnemos_add/)
+    assert.match(text, /placeholders/)
+    assert.match(text, /\{\{key\}\}/)
     assert.match(text, /orgApiKey/)
   })
 

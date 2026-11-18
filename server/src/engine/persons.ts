@@ -467,6 +467,11 @@ export function deletePerson(
           AND memory_id IN (SELECT id FROM memories WHERE partition_id = ? AND person_id = ?)`,
     ).run(partitionId, partitionId, existing.id);
     db.prepare(
+      `DELETE FROM memory_placeholders
+        WHERE partition_id = ?
+          AND memory_id IN (SELECT id FROM memories WHERE partition_id = ? AND person_id = ?)`,
+    ).run(partitionId, partitionId, existing.id);
+    db.prepare(
       `DELETE FROM memory_feedback
         WHERE partition_id = ?
           AND (person_id = ? OR memory_id IN (SELECT id FROM memories WHERE partition_id = ? AND person_id = ?))`,

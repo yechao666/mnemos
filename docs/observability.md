@@ -112,7 +112,7 @@ const results = await withSpan(
 | 属性 | 取值 |
 | --- | --- |
 | `service.name` | `MNEMOS_OTEL_SERVICE_NAME`（默认 `mnemos`） |
-| `service.version` | `APP_VERSION`（当前 `6.1.0`） |
+| `service.version` | `APP_VERSION`（当前 `6.2.0`） |
 | `deployment.environment.name` / `deployment.environment` | `NODE_ENV`（如 `production`、`development`） |
 | `host.name` | `os.hostname()` |
 
