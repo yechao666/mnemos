@@ -89,20 +89,21 @@ function enablePromptRule(
 test('privacy 规则：内置种子 + 全局/分区合并（同 code 覆盖）+ 校验/删除限制', () => {
   const fx = setup();
   const globals = fx.svc.listPrivacyRules();
-  assert.equal(globals.length, 8);
+  assert.equal(globals.length, 85);
   assert.deepEqual(
-    globals.map((rule) => rule.code),
-    ['email', 'id_card', 'phone', 'bank_card', 'name', 'address', 'credential', 'medical'],
+    globals.filter((rule) => rule.enabled).map((rule) => rule.code).sort(),
+    ['bank_card', 'email', 'id_card', 'phone'],
   );
-  assert.equal(globals.filter((rule) => rule.kind === 'regex').every((rule) => rule.enabled), true);
+  assert.equal(globals.filter((rule) => rule.enabled).every((rule) => rule.kind === 'regex'), true);
   assert.equal(globals.filter((rule) => rule.kind === 'prompt').every((rule) => !rule.enabled), true);
   assert.equal(globals.every((rule) => rule.scope === 'global' && rule.builtin), true);
+  assert.equal(globals.every((rule) => typeof rule.groupKey === 'string' && rule.groupKey.length > 0), true);
 
   const employee = fx.svc.createPrivacyRule(
     'partition',
     fx.partitionId,
     {
-      code: 'employee_id',
+      code: 'custom_emp',
       name: '工号',
       kind: 'regex',
       pattern: String.raw`EMP-\d{6}`,
@@ -136,7 +137,7 @@ test('privacy 规则：内置种子 + 全局/分区合并（同 code 覆盖）+ 
   assert.equal(merged.filter((rule) => rule.code === 'phone').length, 1);
   assert.equal(merged.find((rule) => rule.code === 'phone')?.action, 'placeholder');
   assert.equal(merged.find((rule) => rule.code === 'phone')?.name, '分区手机号');
-  assert.equal(merged[0]?.code, 'employee_id');
+  assert.equal(merged[0]?.code, 'custom_emp');
 
   assert.throws(
     () =>
@@ -178,7 +179,7 @@ test('privacy 规则：内置种子 + 全局/分区合并（同 code 覆盖）+ 
   assert.equal(fx.svc.listPrivacyRules(fx.partitionId).find((rule) => rule.code === 'email')?.enabled, false);
 
   fx.svc.deletePrivacyRule(employee.id, fx.actor);
-  assert.equal(fx.svc.listPrivacyRules(fx.partitionId).some((rule) => rule.code === 'employee_id'), false);
+  assert.equal(fx.svc.listPrivacyRules(fx.partitionId).some((rule) => rule.code === 'custom_emp'), false);
   fx.db.close();
 });
 

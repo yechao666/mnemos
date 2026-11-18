@@ -1098,6 +1098,116 @@
   background: var(--surface-inset);
 }
 
+/* ==========================================================================
+   v6.3 — 规则库分组卡片 / 分组标题 / 列表筛选
+   ========================================================================== */
+
+.privacy-group-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.privacy-group-card {
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.privacy-group-card:hover {
+  border-color: rgba(139, 124, 255, 0.32);
+}
+
+.privacy-group-card.is-active {
+  border-color: rgba(139, 124, 255, 0.5);
+  background: rgba(139, 124, 255, 0.06);
+  box-shadow: 0 0 0 1px rgba(139, 124, 255, 0.18);
+}
+
+.privacy-group-card .privacy-group-desc {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 30px;
+}
+
+.privacy-group-counts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 7px 9px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+}
+
+.privacy-group-counts > div {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.privacy-group-counts .mono {
+  font-size: 14px;
+}
+
+.privacy-list-filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding-bottom: 2px;
+}
+
+.privacy-rule-sections {
+  margin-top: 12px;
+}
+
+.privacy-rule-section + .privacy-rule-section {
+  margin-top: 4px;
+}
+
+.privacy-rule-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 16px 8px;
+  border-top: 1px solid var(--border-faint);
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.privacy-rule-section:first-child .privacy-rule-section-head {
+  border-top: 0;
+}
+
+@media (max-width: 760px) {
+  .privacy-group-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .privacy-list-filters {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .privacy-list-filters .input-wrap {
+    min-width: 0;
+  }
+
+  .privacy-rule-section-head {
+    padding: 10px 12px 8px;
+  }
+
+  .privacy-group-counts {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 760px) {
   .privacy-hit-row {
     grid-template-columns: 76px minmax(0, 1.2fr) minmax(0, 1.4fr);

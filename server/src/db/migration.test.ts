@@ -86,10 +86,10 @@ function columnsOf(db: DatabaseSync, table: string): Set<string> {
   return new Set(rows.map((row) => row.name));
 }
 
-test('迁移 v6→v8：保留数据、补列、回填 hash/valid_from、建新表', () => {
+test('迁移 v6→v9：保留数据、补列、回填 hash/valid_from、建新表', () => {
   const db = makeV6Database();
   migrate(db);
-  assert.equal(getSchemaVersion(db), 8);
+  assert.equal(getSchemaVersion(db), 9);
 
   const memoryColumns = columnsOf(db, 'memories');
   for (const column of [
@@ -150,13 +150,19 @@ test('迁移 v6→v8：保留数据、补列、回填 hash/valid_from、建新�
     assert.ok(tables.has(table), `${table} 应已创建`);
     assert.equal(tableCount(db, table), 0, `${table} 应为空`);
   }
-  // v6.2：全局内置规则随迁移写入（4 regex + 4 prompt）
+  // v6.3：18 组 / 85 条内置规则随迁移写入（4 条默认启用）
+  assert.ok(tables.has('privacy_rule_groups'), 'privacy_rule_groups 应已创建');
+  assert.equal(tableCount(db, 'privacy_rule_groups'), 18);
   assert.ok(tables.has('privacy_rules'), 'privacy_rules 应已创建');
-  assert.equal(tableCount(db, 'privacy_rules'), 8);
+  assert.equal(tableCount(db, 'privacy_rules'), 85);
+  const enabledGlobal = db
+    .prepare("SELECT COUNT(*) AS c FROM privacy_rules WHERE scope = 'global' AND enabled = 1")
+    .get() as unknown as { c: number };
+  assert.equal(enabledGlobal.c, 4);
 
   // 幂等：重复迁移不重复回填、不改版本
   migrate(db);
-  assert.equal(getSchemaVersion(db), 8);
+  assert.equal(getSchemaVersion(db), 9);
   assert.equal(tableCount(db, 'memories'), 2);
   db.close();
 });

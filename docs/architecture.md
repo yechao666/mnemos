@@ -1,7 +1,7 @@
 # Mnemos v6.1 架构
 
 > 契约：[`v6-architecture.md`](v6-architecture.md) + [`roadmap-v6.1.md`](roadmap-v6.1.md)。
-> 本文描述 v6.2 的实现结构：分层、schema v8 表与索引、FTS 与触发器、计数维护、
+> 本文描述 v6.3 的实现结构：分层、schema v9 表与索引、FTS 与触发器、计数维护、
 > 混合检索与融合、写入/异步任务管线、画像与生命周期、图/附件/PII/加密、鉴权隔离、
 > 控制台与百万级列表的性能预算。
 >
@@ -37,12 +37,13 @@
 └───────────────┬──────────────────────────────────────────────────┘
                 │ node:sqlite（内置，无第三方驱动）
 ┌───────────────▼──────────────────────────────────────────────────┐
-│ SQLite（WAL，schema v8）                                          │
+│ SQLite（WAL，schema v9）                                          │
 │  partitions · persons(+fts) · memories(+fts) · sessions           │
 │  partition_stats（触发器维护） · memory_briefs · dream_runs      │
 │  memory_history · memory_feedback · memory_jobs                   │
 │  person_facts · person_profiles · memory_attachments              │
 │  entities · memory_entities · relations · idempotency_keys        │
+│  privacy_rules · privacy_rule_groups · memory_placeholders        │
 │  api_keys · audit_logs · usage_events · maintenance_runs          │
 │  orgs · users · user_sessions（仅控制台登录/权限）                │
 └──────────────────────────────────────────────────────────────────┘
@@ -80,7 +81,7 @@ Partition（App / 项目 / 租户 / DSH 工作区）
 
 | 表 | 用途 | 关键约束/字段 |
 | --- | --- | --- |
-| `meta` | schema 版本等元数据 | `schema_version = 7` |
+| `meta` | schema 版本等元数据 | `schema_version = 9` |
 | `orgs` | 组织 | `slug UNIQUE` |
 | `users` | 控制台账号（登录/角色） | `email UNIQUE`，`failed_login_attempts`、`locked_until` |
 | `user_sessions` | 控制台会话 | 只存 `sha256(token)`，`expires_at` |
@@ -107,6 +108,9 @@ Partition（App / 项目 / 租户 / DSH 工作区）
 | `entities` | 实体（图节点） | `UNIQUE(partition_id, normalized, type)`；`mention_count` |
 | `memory_entities` | 记忆↔实体 | `PRIMARY KEY(memory_id, entity_id)`；`salience` |
 | `relations` | 实体关系（图边） | `UNIQUE(partition_id, source, target, relation)`；`co_occurs` |
+| `privacy_rule_groups` | 隐私规则库分组（v6.3，18 组） | `key` 主键；`sort_order`；启动时按 catalog 幂等 upsert |
+| `privacy_rules` | 隐私规则（global + 分区覆盖） | `UNIQUE(scope, partition_id, code)`；v9 列 `group_key` / `validator` / `context_keywords` / `case_sensitive` / `region` / `severity` |
+| `memory_placeholders` | 记忆占位符映射（v6.2） | `UNIQUE(memory_id, placeholder)`；值 `value_cipher` + `encrypted`（AES-256-GCM，可选） |
 
 v6.1 **仍不创建**的旧表：`projects`、`agents`、`tasks`、`task_briefs`、`memory_terms`、
 `webhooks`、`webhook_deliveries`、`reports`、`records`、`retrospectives`、`project_members` 等。
@@ -141,7 +145,7 @@ idx_memories_recent   (partition_id, created_at DESC, id DESC)
 idx_memories_session  (partition_id, session_id)
 ```
 
-v6.1/v6.2 新增（schema v7/v8）索引与隐私表：
+v6.1/v6.2/v6.3 新增（schema v7/v8/v9）索引与隐私表：
 
 ```sql
 idx_memories_valid  (partition_id, person_id, valid_to, created_at DESC)  -- 默认列表 + 时序
@@ -158,6 +162,7 @@ idx_idempotency_expiry  (expires_at)
 idx_entities_partition  (partition_id, mention_count DESC)
 idx_memory_entities_entity (entity_id)
 idx_relations_partition (partition_id, weight DESC)
+idx_privacy_rules_group (scope, partition_id, group_key)   -- v9 按组过滤
 ```
 
 其余索引：`idx_partitions_org`、`idx_sessions_person`、`idx_dream_runs_partition/person`、
@@ -217,7 +222,7 @@ POST /api/partitions/:partition/reconcile        # 控制台 admin+
 2. 解析人：HTTP 人级路径要求人已存在（未知人 404）；引擎按 `person_external_id + person_type`
    写入且 `settings.personAutoCreate=true` 时才自动建档。
 3. `scope` 缺省取 `settings.defaultScope`；`scope=session` 必须提供 `session_id`。
-4. 内容取 `text` / `content` / `messages`（忽略 system），最长 20,000 字符；PII `basic` 时先脱敏。
+4. 内容取 `text` / `content` / `messages`（忽略 system），最长 20,000 字符；PII `basic` 时先按隐私规则库脱敏（见 4.8）。
 5. **归一化 + 去重/合并/取代**（同一事务）：
    - `normalized_hash = sha256(normalize(content))`；
    - 同人同分区 hash 完全相同 → `NOOP`（返回已有记忆，写 `memory_history(NOOP)`）；
@@ -329,12 +334,38 @@ GET /v1/partitions/:p/memories?cursor=...&limit=50&person_id=...&scope=...&categ
   检索的 `entity` 信号可读该命中（默认权重 0）。
 - **附件**：`memory_attachments` 只存 URL/元数据/caption；写入 ≤10、`url` ≤2000、`caption` ≤1000。
   详情/写入/导出返回附件数组，列表只批量统计 `attachmentCount`（避免 N+1）；caption 参与检索。
-- **PII**：`settings.piiRedaction='basic'` 时对正文做确定性正则脱敏（邮箱 / 身份证 / 手机号 /
-  银行卡，保留后四位），`metadata.piiRedacted=true`，写审计 `memory.pii_redacted`。
+- **PII**：`settings.piiRedaction='basic'` 时按隐私规则库执行脱敏（默认 4 条：邮箱 / 身份证 /
+  手机号 / 银行卡，保留后四位；其余规则按分组启用，见 4.8），`metadata.piiRedacted=true`，
+  写审计 `memory.pii_redacted`。
 - **字段加密**：配置 `MNEMOS_ENCRYPTION_KEY` 后，`memory_attachments.url` 落库前用
   AES-256-GCM 加密（`v1:<iv>:<tag>:<cipher>`，随机 IV）；读取时按前缀识别并解密。
   历史明文原样可读；密钥不匹配/密文损坏抛错而不是静默返回密文。只加密附件 URL，
   不加密 `memories.content`（避免破坏 FTS / embedding / 去重哈希）。
+
+### 4.8 隐私扫描（v6.3 规则库）
+
+- **规则来源**：`privacy_rule_groups`（18 组，启动时从 `server/src/db/privacy-catalog.ts`
+  幂等 upsert）+ `privacy_rules` 中 `scope='global', builtin=1` 的 85 条目录规则。
+  默认只启用 `email` / `id_card` / `phone` / `bank_card`；其余按分组启用。
+- **合并**：`listPrivacyRules(partitionId)` 取 global 规则，用同 `code` 的分区规则覆盖
+  （pattern / instruction / action / enabled / validator / context 等全部可覆盖），按
+  `priority ASC, code` 排序。
+- **分组覆盖语义**：`applyPrivacyGroup(partitionId, key, enabled)` 对组内每条 global 规则
+  upsert 分区覆盖并设置 `enabled`；停用只写 `enabled=0` 不删除行。组计数
+  `enabledCount` / `appliedCount` 由「合并后的生效规则」实时计算，不落缓存。
+- **单条扫描流水线**（对合并后每条规则）：
+  1. `enabled=true` 且 `kind` 满足（regex 有 pattern；prompt 需 `privacyLlmEnabled` + LLM）；
+  2. 正则匹配（`caseSensitive=false` 时补 `i`，与 `flags` 合并去重）；
+  3. `validator !== 'none'` → `validateValue(validator, hit)`；不通过 **跳过该命中**；
+  4. `contextKeywords`：命中值前后 32 字符窗口内需出现其一（大小写不敏感）；
+  5. 按 `priority` 升序替换；已替换片段（`*` / `{{token}}`）不会被后续规则重复命中；
+  6. `action=mask` 按 maskMode 打码；`action=placeholder` 生成/复用 `{{token}}` 并写
+     `memory_placeholders`。
+- **prompt 规则**：LLM 返回 `{entities:[{code,value}]}`，服务端校验 value 确实出现在原文中
+  （防幻觉）；失败静默回退，不影响写入。
+- **异步与重扫**：写/更新入队 `privacy` job（worker tick）；`dream` 对输入记忆同步扫描；
+  `memories.privacy_scanned_at` 防重复；规则/分组变更后 `POST .../privacy/rescan` 回扫历史。
+- `region` / `severity` 仅元数据（UI 排序/告警），不参与过滤；是否扫描只由 `enabled` 决定。
 
 ---
 
@@ -379,14 +410,18 @@ GET /v1/partitions/:p/memories?cursor=...&limit=50&person_id=...&scope=...&categ
 
 ## 7. 迁移与版本
 
-- 空库启动自动执行 `schema.sql`，写入 `meta.schema_version = 7`；`CREATE ... IF NOT EXISTS`
+- 空库启动自动执行 `schema.sql`，写入 `meta.schema_version = 9`；`CREATE ... IF NOT EXISTS`
   可重复执行，缺失的索引/触发器会补齐。
 - v6 库（`schema_version=6`）启动时**幂等升级到 v7**：`ensureColumns` 补 `memories` / `persons`
   新列，`backfillV7` 回填 `normalized_hash` 与 `valid_from`；新表由 `schema.sql` 的
   `IF NOT EXISTS` 建好。embedding 不在迁移里同步计算，由 worker / `pnpm backfill:embeddings` 补齐。
+- v8 库（`schema_version=8`）启动时**幂等升级到 v9**：`ensureColumns` 给 `privacy_rules` 补
+  `group_key` / `validator` / `context_keywords` / `case_sensitive` / `region` / `severity`，
+  `schema.sql` 建 `privacy_rule_groups` 与 `idx_privacy_rules_group`；旧内置 code
+  `name→person_name`、`medical→diagnosis`；`seedPrivacyRules()` 幂等同步 85 条目录规则。
 - 检测到 `schema_version > 0 && < 6` 时**拒绝启动**（v6 是重建，不迁移 v5 数据）。
 - v5 数据目录 `data/` 保留在 `v5` 分支；v6/v6.1 默认 `data-v6/`，演示数据由 `pnpm seed` 生成。
-- 升级小版本：备份 → 停服 → 部署 → 启动（自动幂等建表/补索引/迁移 v7）→ `/readyz` 验证；
+- 升级小版本：备份 → 停服 → 部署 → 启动（自动幂等建表/补索引/迁移到 v9）→ `/readyz` 验证；
   回滚代码前先恢复升级前备份（schema 可能已变化）。
 
 ---

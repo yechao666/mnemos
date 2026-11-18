@@ -622,11 +622,29 @@ CREATE TABLE IF NOT EXISTS privacy_rules (
   enabled         INTEGER NOT NULL DEFAULT 1,
   priority        INTEGER NOT NULL DEFAULT 100,
   builtin         INTEGER NOT NULL DEFAULT 0,
+  group_key       TEXT NOT NULL DEFAULT 'common',
+  validator       TEXT NOT NULL DEFAULT 'none',
+  context_keywords TEXT NOT NULL DEFAULT '[]',
+  case_sensitive  INTEGER NOT NULL DEFAULT 1,
+  region          TEXT NOT NULL DEFAULT 'global',
+  severity        TEXT NOT NULL DEFAULT 'medium',
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
   UNIQUE (scope, partition_id, code)
 );
 CREATE INDEX IF NOT EXISTS idx_privacy_rules_scope ON privacy_rules(scope, partition_id, enabled, priority);
+CREATE INDEX IF NOT EXISTS idx_privacy_rules_group ON privacy_rules(scope, partition_id, group_key);
+
+CREATE TABLE IF NOT EXISTS privacy_rule_groups (
+  key         TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  industry    TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  sort_order  INTEGER NOT NULL DEFAULT 100,
+  builtin     INTEGER NOT NULL DEFAULT 1,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS memory_placeholders (
   id            TEXT PRIMARY KEY,
@@ -641,4 +659,4 @@ CREATE TABLE IF NOT EXISTS memory_placeholders (
 );
 CREATE INDEX IF NOT EXISTS idx_placeholders_memory ON memory_placeholders(memory_id);
 
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '8');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '9');

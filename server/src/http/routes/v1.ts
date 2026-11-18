@@ -1,5 +1,13 @@
 import { z } from 'zod';
-import type { MemoryScope, PartitionInput, PartitionSettings, PersonType, PrivacyRule, PrivacyRuleInput } from '../../../../shared/src/types.ts';
+import type {
+  MemoryScope,
+  PartitionInput,
+  PartitionSettings,
+  PersonType,
+  PrivacyRule,
+  PrivacyRuleGroup,
+  PrivacyRuleInput,
+} from '../../../../shared/src/types.ts';
 import type { RequestContext } from '../context.ts';
 import { requireOrgKey } from '../middleware/auth.ts';
 import { errors } from '../respond.ts';
@@ -312,6 +320,11 @@ const entityListQueryV1Schema = z.object({
 });
 
 /* v6.2：隐私规则（v1 只写分区作用域；global 由控制台 owner 维护） */
+const privacyContextKeywordsV1Schema = z.union([
+  z.array(z.string().trim().max(40)).max(20),
+  z.string().trim().max(1000),
+]);
+
 const privacyRuleInputV1Schema = z.object({
   code: z.string().trim().max(40).optional(),
   name: z.string().trim().max(80).optional(),
@@ -330,7 +343,37 @@ const privacyRuleInputV1Schema = z.object({
   maskKeepFirst: z.coerce.number().int().min(0).max(64).optional(),
   enabled: z.boolean().optional(),
   priority: z.coerce.number().int().min(0).max(1_000_000).optional(),
+  /* v6.3 */
+  group_key: z.string().trim().max(40).optional(),
+  groupKey: z.string().trim().max(40).optional(),
+  validator: z.string().trim().max(40).optional(),
+  context_keywords: privacyContextKeywordsV1Schema.optional(),
+  contextKeywords: privacyContextKeywordsV1Schema.optional(),
+  case_sensitive: z.boolean().optional(),
+  caseSensitive: z.boolean().optional(),
+  region: z.string().trim().max(40).optional(),
+  severity: z.enum(['low', 'medium', 'high']).optional(),
 });
+
+const privacyRuleQueryV1Schema = z.object({
+  group_key: z.string().trim().max(40).optional(),
+  groupKey: z.string().trim().max(40).optional(),
+});
+
+const privacyGroupApplyV1Schema = z.object({
+  enabled: z.boolean().optional().default(true),
+  partition_id: z.string().trim().max(128).optional(),
+  partitionId: z.string().trim().max(128).optional(),
+});
+
+function contextKeywordsFromV1(value: string[] | string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (Array.isArray(value)) return value;
+  return value
+    .split(/[,，\n]/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
 
 const privacyRuleCreateV1Schema = privacyRuleInputV1Schema.extend({
   code: z.string().trim().min(2).max(40),
@@ -357,6 +400,26 @@ function privacyRuleInputFromV1(body: z.output<typeof privacyRuleInputV1Schema>)
     maskKeepFirst: body.mask_keep_first ?? body.maskKeepFirst,
     enabled: body.enabled,
     priority: body.priority,
+    groupKey: body.group_key ?? body.groupKey,
+    validator: body.validator,
+    contextKeywords: contextKeywordsFromV1(body.context_keywords ?? body.contextKeywords),
+    caseSensitive: body.case_sensitive ?? body.caseSensitive,
+    region: body.region,
+    severity: body.severity,
+  };
+}
+
+function privacyGroupV1From(group: PrivacyRuleGroup): Record<string, unknown> {
+  return {
+    key: group.key,
+    name: group.name,
+    industry: group.industry,
+    description: group.description,
+    sort_order: group.sortOrder,
+    builtin: group.builtin,
+    rule_count: group.ruleCount,
+    enabled_count: group.enabledCount,
+    applied_count: group.appliedCount,
   };
 }
 
@@ -379,6 +442,12 @@ function privacyRuleV1From(rule: PrivacyRule): Record<string, unknown> {
     enabled: rule.enabled,
     priority: rule.priority,
     builtin: rule.builtin,
+    group_key: rule.groupKey,
+    validator: rule.validator,
+    context_keywords: rule.contextKeywords,
+    case_sensitive: rule.caseSensitive,
+    region: rule.region,
+    severity: rule.severity,
     created_at: rule.createdAt,
     updated_at: rule.updatedAt,
   };
@@ -784,9 +853,47 @@ export function registerV1Routes(router: Router): void {
     scopes: ['memories:read'],
     handler: (rc: RequestContext) => {
       const partition = partitionOfPathForWrite(rc);
+      const query = rc.query(privacyRuleQueryV1Schema);
+      const groupKey = query.group_key ?? query.groupKey;
       const rules = rc.app.engine.listPrivacyRules(partition.id);
-      markUsage(rc, partition, 'privacy.rules.list', 'api', rules.length);
-      rc.json({ items: rules.map(privacyRuleV1From) });
+      const items = groupKey ? rules.filter((rule) => rule.groupKey === groupKey) : rules;
+      markUsage(rc, partition, 'privacy.rules.list', 'api', items.length);
+      rc.json({ items: items.map(privacyRuleV1From) });
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/v1/partitions/:partition/privacy/groups',
+    auth: 'apikey',
+    scopes: ['memories:read'],
+    handler: (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      const items = rc.app.engine.listPrivacyRuleGroups(partition.id);
+      markUsage(rc, partition, 'privacy.groups.list', 'api', items.length);
+      rc.json({ items: items.map(privacyGroupV1From) });
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/v1/partitions/:partition/privacy/groups/:key/apply',
+    auth: 'apikey',
+    scopes: ['admin'],
+    handler: async (rc: RequestContext) => {
+      const partition = partitionOfPathForWrite(rc);
+      assertWritable(partition);
+      const body = await rc.body(privacyGroupApplyV1Schema);
+      const groupKey = rc.params.key ?? '';
+      const items = rc.app.engine.applyPrivacyGroup(
+        partition.id,
+        groupKey,
+        body.enabled !== false,
+        actorOf(rc),
+      );
+      const group = rc.app.engine.listPrivacyRuleGroups(partition.id).find((item) => item.key === groupKey) ?? null;
+      markUsage(rc, partition, 'privacy.group.apply', 'api', items.length);
+      rc.json({ group: group ? privacyGroupV1From(group) : null, items: items.map(privacyRuleV1From) });
     },
   });
 

@@ -252,7 +252,7 @@ test('P2 PII：piiRedaction=basic 时脱敏手机号/邮箱/身份证/银行卡�
     partitionId: fx.partitionId,
     actor: fx.actor,
     personId: person.id,
-    content: '联系 alice@example.com 或 13812345678；身份证 110101199001011234；银行卡 6222021234567890123',
+    content: '联系 alice@example.com 或 13812345678；身份证 110101199001011237；银行卡 6222021234567890128',
     scope: 'partition',
   });
   assert.equal(result.piiRedacted, true);
@@ -261,9 +261,9 @@ test('P2 PII：piiRedaction=basic 时脱敏手机号/邮箱/身份证/银行卡�
   assert.ok(memory.content.includes('a***@example.com'));
   assert.ok(!memory.content.includes('13812345678'));
   assert.ok(memory.content.includes('138****5678'));
-  assert.ok(memory.content.includes('110101********1234'));
-  assert.ok(!memory.content.includes('6222021234567890123'));
-  assert.ok(memory.content.endsWith('0123'));
+  assert.ok(memory.content.includes('110101********1237'));
+  assert.ok(!memory.content.includes('6222021234567890128'));
+  assert.ok(memory.content.endsWith('0128'));
   assert.equal(memory.metadata.piiRedacted, true);
   assert.equal(auditCount(fx, 'memory.pii_redacted'), 1);
 

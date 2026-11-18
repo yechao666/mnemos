@@ -6,6 +6,7 @@ import type {
   PrivacyAction,
   PrivacyMaskMode,
   PrivacyRule,
+  PrivacyRuleGroup,
   PrivacyRuleInput,
   PrivacyRuleKind,
   PrivacyRuleScope,
@@ -17,6 +18,7 @@ import { tx } from '../db/index.ts';
 import { decryptField, encryptField, encryptionKeyFromEnv } from '../lib/crypto.ts';
 import { newId, nowIso } from '../lib/ids.ts';
 import { memoryContentHash } from '../lib/text.ts';
+import { validateValue } from '../lib/validators.ts';
 import { engineErrors } from './errors.ts';
 import { writeHistory } from './history.ts';
 import { llmText } from './llm.ts';
@@ -25,10 +27,14 @@ import { findPartitionById } from './partition.ts';
 import { parseSettings, type MemoryRow } from './rows.ts';
 
 /**
- * v6.2 隐私规则域（schema v8）。
+ * v6.2 / v6.3 隐私规则域（schema v8 → v9）。
  *
  * - 规则：global + partition 合并（同 code 分区覆盖全局），按 priority 升序执行；
+ * - 规则库：18 个行业/领域分组；整组启停 = 对组内每条全局规则 upsert 分区覆盖；
  * - 正则：确定性扫描/替换，支持 mask（email/keepFirstLast/keepLast/full）与 placeholder；
+ * - 校验器（validator）：结构/校验位不通过视为误报跳过（未知 validator fail-open）；
+ * - 上下文（contextKeywords）：命中值前后 32 字符窗口内需出现任一关键词；
+ * - caseSensitive=false：正则扫描追加 i 标志；
  * - 提示词：交给 LLM 抽取 JSON entities，服务端校验 value 确实出现在原文（防幻觉），失败回退正则；
  * - 占位符：正文只存 `{{key}}`，值加密落 memory_placeholders；读取时按 reveal 解密；
  * - 写/更新/做梦/重扫共用 `applyPrivacyToMemory`（幂等：重复扫描不会二次替换已打码/已占位片段）。
@@ -52,6 +58,12 @@ export interface PrivacyRuleRow {
   enabled: number;
   priority: number;
   builtin: number;
+  group_key: string;
+  validator: string;
+  context_keywords: string;
+  case_sensitive: number;
+  region: string;
+  severity: string;
   created_at: string;
   updated_at: string;
 }
@@ -82,6 +94,19 @@ const MAX_PLACEHOLDER_MAPPING_KEYS = 200;
 /* 规则 CRUD                                                           */
 /* ------------------------------------------------------------------ */
 
+const SEVERITIES = ['low', 'medium', 'high'] as const;
+
+function parseContextKeywords(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  } catch {
+    return [];
+  }
+}
+
 export function toPrivacyRule(row: PrivacyRuleRow): PrivacyRule {
   return {
     id: row.id,
@@ -101,6 +126,14 @@ export function toPrivacyRule(row: PrivacyRuleRow): PrivacyRule {
     enabled: row.enabled === 1,
     priority: row.priority,
     builtin: row.builtin === 1,
+    groupKey: row.group_key || 'common',
+    validator: row.validator || 'none',
+    contextKeywords: parseContextKeywords(row.context_keywords),
+    caseSensitive: row.case_sensitive !== 0,
+    region: row.region || 'global',
+    severity: (SEVERITIES as readonly string[]).includes(row.severity)
+      ? (row.severity as PrivacyRule['severity'])
+      : 'medium',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -127,6 +160,137 @@ export function listPrivacyRules(db: DatabaseSync, partitionId?: string): Privac
   return [...merged.values()]
     .map(toPrivacyRule)
     .sort((left, right) => left.priority - right.priority || left.code.localeCompare(right.code));
+}
+
+/* ------------------------------------------------------------------ */
+/* 规则分组（v6.3：规则库按行业/领域整组启停）                          */
+/* ------------------------------------------------------------------ */
+
+export interface PrivacyGroupRow {
+  key: string;
+  name: string;
+  industry: string;
+  description: string;
+  sort_order: number;
+  builtin: number;
+}
+
+/**
+ * 18 个内置规则分组 + 当前分区统计。
+ *
+ * - ruleCount：该组全局规则数；
+ * - enabledCount：该分区生效启用数（全局 enabled 未被分区覆盖 + 分区覆盖 enabled）；
+ * - appliedCount：该分区对该组全局规则的覆盖条数（有分区规则即计 1）。
+ * 不传 partitionId 时按全局统计（appliedCount=0）。
+ */
+export function listPrivacyRuleGroups(db: DatabaseSync, partitionId?: string): PrivacyRuleGroup[] {
+  const groups = db
+    .prepare('SELECT * FROM privacy_rule_groups ORDER BY sort_order ASC, key ASC')
+    .all() as unknown as PrivacyGroupRow[];
+  const globals = db
+    .prepare("SELECT * FROM privacy_rules WHERE scope = 'global'")
+    .all() as unknown as PrivacyRuleRow[];
+  const locals = partitionId
+    ? (db
+        .prepare("SELECT * FROM privacy_rules WHERE scope = 'partition' AND partition_id = ?")
+        .all(partitionId) as unknown as PrivacyRuleRow[])
+    : [];
+  const localByCode = new Map(locals.map((row) => [row.code, row]));
+  return groups.map((group) => {
+    const globalRules = globals.filter((row) => row.group_key === group.key);
+    const codes = new Set(globalRules.map((row) => row.code));
+    const overrides = locals.filter((row) => codes.has(row.code));
+    const enabledCount = globalRules.filter((row) => {
+      const override = localByCode.get(row.code);
+      return override ? override.enabled === 1 : row.enabled === 1;
+    }).length;
+    return {
+      key: group.key,
+      name: group.name,
+      industry: group.industry,
+      description: group.description,
+      sortOrder: group.sort_order,
+      builtin: group.builtin === 1,
+      ruleCount: globalRules.length,
+      enabledCount,
+      appliedCount: overrides.length,
+    };
+  });
+}
+
+export function findPrivacyRuleGroup(db: DatabaseSync, key: string): PrivacyRuleGroup | null {
+  return listPrivacyRuleGroups(db).find((group) => group.key === key) ?? null;
+}
+
+/**
+ * 整组启用/停用：对组内每条全局规则 upsert 分区覆盖。
+ *
+ * - 已有同 code 分区规则：只改 enabled（不覆盖自定义 pattern/instruction 等）；
+ * - 无分区规则：复制全局字段为分区规则（builtin=0，enabled=传入值）；
+ * - 返回该分区该组「生效规则」（global + partition 合并、按 priority 排序）。
+ */
+export function applyPrivacyGroup(
+  db: DatabaseSync,
+  partitionId: string,
+  groupKey: string,
+  enabled: boolean,
+): PrivacyRule[] {
+  const group = db.prepare('SELECT * FROM privacy_rule_groups WHERE key = ?').get(groupKey);
+  if (!group) throw engineErrors.notFound(`隐私规则分组不存在：${groupKey}`);
+  if (!findPartitionById(db, partitionId)) throw engineErrors.notFound('分区不存在');
+  const globals = db
+    .prepare("SELECT * FROM privacy_rules WHERE scope = 'global' AND group_key = ? ORDER BY priority ASC, code ASC")
+    .all(groupKey) as unknown as PrivacyRuleRow[];
+  if (globals.length === 0) return [];
+  const at = nowIso();
+  const update = db.prepare(
+    "UPDATE privacy_rules SET enabled = ?, updated_at = ? WHERE scope = 'partition' AND partition_id = ? AND code = ?",
+  );
+  const insert = db.prepare(
+    `INSERT INTO privacy_rules
+       (id, scope, partition_id, code, name, kind, pattern, flags, instruction, entity_type, action,
+        mask_mode, mask_keep_last, mask_keep_first, enabled, priority, builtin,
+        group_key, validator, context_keywords, case_sensitive, region, severity, created_at, updated_at)
+     VALUES (?, 'partition', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  tx(db, () => {
+    for (const globalRule of globals) {
+      const existing = db
+        .prepare("SELECT id FROM privacy_rules WHERE scope = 'partition' AND partition_id = ? AND code = ?")
+        .get(partitionId, globalRule.code) as unknown as { id: string } | undefined;
+      if (existing) {
+        update.run(enabled ? 1 : 0, at, partitionId, globalRule.code);
+        continue;
+      }
+      insert.run(
+        newId('prv'),
+        partitionId,
+        globalRule.code,
+        globalRule.name,
+        globalRule.kind,
+        globalRule.pattern,
+        globalRule.flags,
+        globalRule.instruction,
+        globalRule.entity_type,
+        globalRule.action,
+        globalRule.mask_mode,
+        globalRule.mask_keep_last,
+        globalRule.mask_keep_first,
+        enabled ? 1 : 0,
+        globalRule.priority,
+        globalRule.group_key,
+        globalRule.validator,
+        globalRule.context_keywords,
+        globalRule.case_sensitive,
+        globalRule.region,
+        globalRule.severity,
+        at,
+        at,
+      );
+    }
+  });
+  const codes = new Set(globals.map((row) => row.code));
+  return listPrivacyRules(db, partitionId).filter((rule) => codes.has(rule.code));
 }
 
 function normalizeKind(value: unknown): PrivacyRuleKind {
@@ -189,9 +353,81 @@ interface NormalizedRuleFields {
   maskKeepFirst: number;
   enabled: number;
   priority: number;
+  groupKey: string;
+  validator: string;
+  contextKeywords: string[];
+  caseSensitive: boolean;
+  region: string;
+  severity: PrivacyRule['severity'];
 }
 
-function normalizeRuleFields(input: PrivacyRuleInput, existing: PrivacyRuleRow | null): NormalizedRuleFields {
+const MAX_CONTEXT_KEYWORDS = 20;
+const MAX_CONTEXT_KEYWORD_CHARS = 40;
+
+function normalizeGroupKey(db: DatabaseSync, value: unknown, fallback: string): string {
+  const key = (value === undefined || value === null || String(value).trim() === '' ? fallback : String(value))
+    .trim()
+    .toLowerCase();
+  if (!/^[a-z0-9_]{2,40}$/.test(key)) throw engineErrors.validation('groupKey 仅支持小写字母、数字与下划线，长度 2–40');
+  const exists = db.prepare('SELECT 1 AS one FROM privacy_rule_groups WHERE key = ?').get(key);
+  if (!exists) throw engineErrors.validation(`未知的隐私规则分组：${key}`);
+  return key;
+}
+
+/**
+ * 未知 validator 允许入库：扫描时 `validateValue` fail-open（不拦截），
+ * 便于规则库前向兼容（新版本规则被旧服务读取时不会报错）。
+ */
+function normalizeValidator(value: unknown, fallback: string): string {
+  const name = (value === undefined || value === null || String(value).trim() === '' ? fallback : String(value))
+    .trim()
+    .toLowerCase();
+  if (!/^[a-z0-9_]{1,40}$/.test(name)) {
+    throw engineErrors.validation('validator 仅支持小写字母、数字与下划线，长度 1–40');
+  }
+  return name;
+}
+
+function normalizeContextKeywords(value: unknown, fallback: string[]): string[] {
+  if (value === undefined || value === null) return fallback;
+  const rawList = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[,，\n]/)
+      : (() => {
+          throw engineErrors.validation('contextKeywords 必须是字符串数组');
+        })();
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of rawList) {
+    if (typeof item !== 'string') continue;
+    const keyword = item.trim();
+    if (!keyword) continue;
+    if (keyword.length > MAX_CONTEXT_KEYWORD_CHARS) {
+      throw engineErrors.validation(`contextKeywords 单个关键词最长 ${MAX_CONTEXT_KEYWORD_CHARS} 字符`);
+    }
+    const normalized = keyword.toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(keyword);
+    if (result.length > MAX_CONTEXT_KEYWORDS) {
+      throw engineErrors.validation(`contextKeywords 最多 ${MAX_CONTEXT_KEYWORDS} 个`);
+    }
+  }
+  return result;
+}
+
+function normalizeSeverity(value: unknown, fallback: PrivacyRule['severity']): PrivacyRule['severity'] {
+  if (value === undefined || value === null || value === '') return fallback;
+  if ((SEVERITIES as readonly string[]).includes(String(value))) return value as PrivacyRule['severity'];
+  throw engineErrors.validation("severity 必须是 'low' / 'medium' / 'high'");
+}
+
+function normalizeRuleFields(
+  db: DatabaseSync,
+  input: PrivacyRuleInput,
+  existing: PrivacyRuleRow | null,
+): NormalizedRuleFields {
   const codeRaw = (input.code ?? existing?.code ?? '').trim();
   if (!CODE_REValid(codeRaw)) throw engineErrors.validation('code 仅支持小写字母、数字与下划线，长度 2–40');
   const name = (input.name ?? existing?.name ?? '').trim();
@@ -227,6 +463,16 @@ function normalizeRuleFields(input: PrivacyRuleInput, existing: PrivacyRuleRow |
   const enabled =
     input.enabled === undefined ? (existing ? existing.enabled : 1) : input.enabled === true ? 1 : 0;
   const priority = clampInt(input.priority, existing?.priority ?? 100, 0, 1_000_000);
+  const groupKey = normalizeGroupKey(db, input.groupKey, existing?.group_key ?? 'common');
+  const validator = normalizeValidator(input.validator, existing?.validator ?? 'none');
+  const contextKeywords = normalizeContextKeywords(
+    input.contextKeywords,
+    existing ? parseContextKeywords(existing.context_keywords) : [],
+  );
+  const caseSensitive =
+    input.caseSensitive === undefined ? (existing ? existing.case_sensitive !== 0 : true) : input.caseSensitive === true;
+  const region = (input.region ?? existing?.region ?? 'global').trim().slice(0, 40) || 'global';
+  const severity = normalizeSeverity(input.severity, existing ? normalizeSeverity(existing.severity, 'medium') : 'medium');
   return {
     code: codeRaw,
     name,
@@ -241,6 +487,12 @@ function normalizeRuleFields(input: PrivacyRuleInput, existing: PrivacyRuleRow |
     maskKeepFirst,
     enabled,
     priority,
+    groupKey,
+    validator,
+    contextKeywords,
+    caseSensitive,
+    region,
+    severity,
   };
 }
 
@@ -261,8 +513,9 @@ function insertRuleRow(
     db.prepare(
       `INSERT INTO privacy_rules
          (id, scope, partition_id, code, name, kind, pattern, flags, instruction, entity_type, action,
-          mask_mode, mask_keep_last, mask_keep_first, enabled, priority, builtin, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          mask_mode, mask_keep_last, mask_keep_first, enabled, priority, builtin,
+          group_key, validator, context_keywords, case_sensitive, region, severity, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       scope,
@@ -281,6 +534,12 @@ function insertRuleRow(
       fields.enabled,
       fields.priority,
       builtin ? 1 : 0,
+      fields.groupKey,
+      fields.validator,
+      JSON.stringify(fields.contextKeywords),
+      fields.caseSensitive ? 1 : 0,
+      fields.region,
+      fields.severity,
       at,
       at,
     );
@@ -305,19 +564,20 @@ export function createPrivacyRule(
   if (scope === 'partition' && !findPartitionById(db, partitionId as string)) {
     throw engineErrors.notFound('分区不存在');
   }
-  const fields = normalizeRuleFields(input, null);
+  const fields = normalizeRuleFields(db, input, null);
   return insertRuleRow(db, scope, partitionId ?? '', fields, false);
 }
 
 export function updatePrivacyRule(db: DatabaseSync, id: string, input: Partial<PrivacyRuleInput>): PrivacyRule {
   const row = db.prepare('SELECT * FROM privacy_rules WHERE id = ?').get(id) as unknown as PrivacyRuleRow | undefined;
   if (!row) throw engineErrors.notFound('隐私规则不存在');
-  const fields = normalizeRuleFields(input as PrivacyRuleInput, row);
+  const fields = normalizeRuleFields(db, input as PrivacyRuleInput, row);
   try {
     db.prepare(
       `UPDATE privacy_rules
           SET code = ?, name = ?, kind = ?, pattern = ?, flags = ?, instruction = ?, entity_type = ?,
               action = ?, mask_mode = ?, mask_keep_last = ?, mask_keep_first = ?, enabled = ?, priority = ?,
+              group_key = ?, validator = ?, context_keywords = ?, case_sensitive = ?, region = ?, severity = ?,
               updated_at = ?
         WHERE id = ?`,
     ).run(
@@ -334,6 +594,12 @@ export function updatePrivacyRule(db: DatabaseSync, id: string, input: Partial<P
       fields.maskKeepFirst,
       fields.enabled,
       fields.priority,
+      fields.groupKey,
+      fields.validator,
+      JSON.stringify(fields.contextKeywords),
+      fields.caseSensitive ? 1 : 0,
+      fields.region,
+      fields.severity,
       nowIso(),
       id,
     );
@@ -472,6 +738,27 @@ function tokenForValue(accumulator: ScanAccumulator, value: string): string {
   return token;
 }
 
+/** contextKeywords 的上下文窗口：命中值前后各 32 个字符。 */
+const CONTEXT_WINDOW_CHARS = 32;
+
+/** validator 校验（不通过即视为误报，跳过该命中；未知 validator fail-open）。 */
+function passesValidator(rule: PrivacyRule, value: string): boolean {
+  return validateValue(rule.validator, value);
+}
+
+/** contextKeywords：命中值前后 32 字符窗口内需出现任一关键词（大小写不敏感）。 */
+function matchesContext(rule: PrivacyRule, source: string, start: number, end: number): boolean {
+  const keywords = rule.contextKeywords;
+  if (!keywords || keywords.length === 0) return true;
+  const from = Math.max(0, start - CONTEXT_WINDOW_CHARS);
+  const to = Math.min(source.length, end + CONTEXT_WINDOW_CHARS);
+  const window = source.slice(from, to).toLowerCase();
+  return keywords.some((keyword) => {
+    const needle = keyword.trim().toLowerCase();
+    return needle.length > 0 && window.includes(needle);
+  });
+}
+
 function recordHit(
   accumulator: ScanAccumulator,
   rule: PrivacyRule,
@@ -480,6 +767,8 @@ function recordHit(
   end: number,
 ): void {
   if (value.length === 0 || overlaps(accumulator.claims, start, end)) return;
+  if (!passesValidator(rule, value)) return;
+  if (!matchesContext(rule, accumulator.source, start, end)) return;
   let replacement: string;
   if (rule.action === 'placeholder') {
     const token = tokenForValue(accumulator, value);
@@ -504,7 +793,9 @@ function recordHit(
 
 function applyRegexRule(accumulator: ScanAccumulator, rule: PrivacyRule): void {
   if (!rule.enabled || rule.kind !== 'regex' || !rule.pattern) return;
-  const flags = normalizeFlags(rule.flags || 'g');
+  let flags = normalizeFlags(rule.flags || 'g');
+  // caseSensitive=false：匹配时忽略大小写（db 里 flags 未必带 i）。
+  if (!rule.caseSensitive && !flags.includes('i')) flags += 'i';
   const regex = compileRuleRegex(rule.pattern, flags);
   for (const match of accumulator.source.matchAll(regex)) {
     const value = match[0];

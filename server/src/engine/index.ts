@@ -80,6 +80,7 @@ export { redactPii, applyPiiRedaction } from '../lib/pii.ts';
 export { decryptField, encryptField, encryptionKeyFromEnv, isEncryptedField } from '../lib/crypto.ts';
 /* --- v6.2 隐私规则域 --- */
 export {
+  applyPrivacyGroup,
   applyPrivacyToMemory,
   applyPrivacyToMemorySync,
   countMemoryPlaceholders,
@@ -88,7 +89,9 @@ export {
   deletePrivacyRule,
   extractPromptEntities,
   findPrivacyRule,
+  findPrivacyRuleGroup,
   listMemoryPlaceholders,
+  listPrivacyRuleGroups,
   listPrivacyRules,
   maskPrivacyValue,
   placeholderTokensOf,
@@ -104,5 +107,11 @@ export {
   withPlaceholderCounts,
   writeMemoryPlaceholders,
 } from './privacy.ts';
-export type { PrivacyApplyResult, PrivacyRuleRow, PrivacyScanOptions, PrivacyRescanResult } from './privacy.ts';
+export type {
+  PrivacyApplyResult,
+  PrivacyGroupRow,
+  PrivacyRuleRow,
+  PrivacyScanOptions,
+  PrivacyRescanResult,
+} from './privacy.ts';
 export type { LlmConfig };

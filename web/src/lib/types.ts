@@ -165,8 +165,35 @@ export interface PrivacyRule {
   /** 小者先执行，默认 100 */
   priority: number;
   builtin: boolean;
+  /** 规则库分组（行业/领域，18 组） */
+  groupKey: string;
+  /** 结构/校验位校验器（none/luhn/cn_id/...） */
+  validator: string;
+  /** 上下文关键词：命中值附近需出现其一（regex） */
+  contextKeywords: string[];
+  /** false 时 regex 自动加 i 标志 */
+  caseSensitive: boolean;
+  /** 适用地区（global / CN / US / EU…） */
+  region: string;
+  severity: 'low' | 'medium' | 'high';
   createdAt: string;
   updatedAt: string;
+}
+
+/** 规则库分组（v6.3）：带上当前分区的启用/覆盖统计。 */
+export interface PrivacyRuleGroup {
+  key: string;
+  name: string;
+  industry: string;
+  description: string;
+  sortOrder: number;
+  builtin: boolean;
+  /** 该组全局规则数 */
+  ruleCount: number;
+  /** 当前分区生效条数（含全局启用 + 分区覆盖） */
+  enabledCount: number;
+  /** 当前分区的覆盖条数 */
+  appliedCount: number;
 }
 
 export interface PrivacyRuleInput {
@@ -183,6 +210,12 @@ export interface PrivacyRuleInput {
   maskKeepFirst?: number;
   enabled?: boolean;
   priority?: number;
+  groupKey?: string;
+  validator?: string;
+  contextKeywords?: string[];
+  caseSensitive?: boolean;
+  region?: string;
+  severity?: 'low' | 'medium' | 'high';
 }
 
 export interface PrivacyScanHit {

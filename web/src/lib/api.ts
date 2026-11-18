@@ -58,6 +58,7 @@ import type {
   PrivacyAction,
   PrivacyMaskMode,
   PrivacyRule,
+  PrivacyRuleGroup,
   PrivacyRuleInput,
   PrivacyRuleKind,
   PrivacyRuleScope,
@@ -847,9 +848,70 @@ function adaptPrivacyRule(value: unknown): PrivacyRule {
     enabled: raw.enabled !== false,
     priority: num(raw.priority, 100),
     builtin: bool(raw.builtin),
+    groupKey: str(raw.groupKey ?? raw.group_key, 'common'),
+    validator: str(raw.validator, 'none'),
+    contextKeywords: adaptContextKeywords(raw.contextKeywords ?? raw.context_keywords),
+    caseSensitive: raw.caseSensitive === undefined && raw.case_sensitive === undefined
+      ? true
+      : bool(raw.caseSensitive ?? raw.case_sensitive),
+    region: str(raw.region, 'global'),
+    severity: adaptSeverity(raw.severity),
     createdAt: str(raw.createdAt ?? raw.created_at),
     updatedAt: str(raw.updatedAt ?? raw.updated_at),
   };
+}
+
+function adaptSeverity(value: unknown): 'low' | 'medium' | 'high' {
+  return value === 'low' || value === 'high' ? value : 'medium';
+}
+
+/** 上下文关键词兼容数组与 JSON 字符串（后端 SQLite 存 TEXT）。 */
+function adaptContextKeywords(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => str(item)).filter(Boolean);
+  }
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map((item) => str(item)).filter(Boolean);
+    } catch {
+      return value
+        .split(/[,，]/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function adaptPrivacyGroup(value: unknown): PrivacyRuleGroup {
+  const raw = asRecord(value);
+  return {
+    key: str(raw.key ?? raw.groupKey ?? raw.group_key),
+    name: str(raw.name, str(raw.key ?? raw.groupKey ?? raw.group_key)),
+    industry: str(raw.industry),
+    description: str(raw.description),
+    sortOrder: num(raw.sortOrder ?? raw.sort_order, 100),
+    builtin: raw.builtin === undefined ? true : bool(raw.builtin),
+    ruleCount: num(raw.ruleCount ?? raw.rule_count),
+    enabledCount: num(raw.enabledCount ?? raw.enabled_count),
+    appliedCount: num(raw.appliedCount ?? raw.applied_count),
+  };
+}
+
+/** 分组列表兼容裸数组、{items}、{groups} 与 {data}。 */
+function adaptPrivacyGroupList(value: unknown): PrivacyRuleGroup[] {
+  const outer = asRecord(value);
+  const list = Array.isArray(value)
+    ? value
+    : Array.isArray(outer.items)
+      ? outer.items
+      : Array.isArray(outer.groups)
+        ? outer.groups
+        : Array.isArray(outer.data)
+          ? outer.data
+          : [];
+  return list.map(adaptPrivacyGroup).filter((group) => Boolean(group.key));
 }
 
 /** 规则列表兼容裸数组、{items} 与 {rules}。 */
@@ -1068,6 +1130,16 @@ function privacyRuleBody(input: PrivacyRuleInput): Record<string, unknown> {
     mask_keep_first: input.maskKeepFirst,
     enabled: input.enabled,
     priority: input.priority,
+    // v6.3：规则库分组 / 校验器 / 上下文
+    groupKey: input.groupKey,
+    group_key: input.groupKey,
+    validator: input.validator,
+    contextKeywords: input.contextKeywords,
+    context_keywords: input.contextKeywords,
+    caseSensitive: input.caseSensitive,
+    case_sensitive: input.caseSensitive,
+    region: input.region,
+    severity: input.severity,
   };
 }
 
@@ -1537,6 +1609,34 @@ export const api = {
           partition_id: params.partitionId,
           partitionId: params.partitionId,
         })}`,
+      );
+      return adaptPrivacyRuleList(raw);
+    },
+    /** v6.3 规则库分组：GET /api/privacy/groups?partitionId=，带分区启用/覆盖统计。 */
+    groups: async (params: { partitionId?: string } = {}): Promise<PrivacyRuleGroup[]> => {
+      const raw = await request<unknown>(
+        `/api/privacy/groups${qs({
+          partitionId: params.partitionId,
+          partition_id: params.partitionId,
+        })}`,
+      );
+      return adaptPrivacyGroupList(raw);
+    },
+    /** v6.3 整组启用/停用：POST /api/privacy/groups/:key/apply，返回组内生效规则。 */
+    applyGroup: async (
+      groupKey: string,
+      input: { partitionId?: string; enabled: boolean },
+    ): Promise<PrivacyRule[]> => {
+      const raw = await request<unknown>(
+        `/api/privacy/groups/${encodeURIComponent(groupKey)}/apply`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            partitionId: input.partitionId,
+            partition_id: input.partitionId,
+            enabled: input.enabled,
+          }),
+        },
       );
       return adaptPrivacyRuleList(raw);
     },

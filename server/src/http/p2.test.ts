@@ -219,15 +219,15 @@ test('P2 PII：分区开关 off→basic 生效、metadata 标记 + 审计 memory
 
   const redacted = await request(fx.baseUrl, 'POST', '/v1/partitions/alpha/persons/alice/memories', {
     key: fx.partitionKey,
-    body: { text: '新联系人 bob@example.com / 13912345678 / 身份证 110101199001011234 / 卡号 6222021234567890123' },
+    body: { text: '新联系人 bob@example.com / 13912345678 / 身份证 110101199001011237 / 卡号 6222021234567890128' },
   });
   assert.equal(redacted.status, 201, JSON.stringify(redacted.json));
   const content = String(field(redacted.json, 'memory.content'));
   assert.ok(!content.includes('bob@example.com'));
   assert.ok(content.includes('b***@example.com'));
   assert.ok(content.includes('139****5678'));
-  assert.ok(content.includes('110101********1234'));
-  assert.ok(content.endsWith('0123'));
+  assert.ok(content.includes('110101********1237'));
+  assert.ok(content.endsWith('0128'));
   assert.equal(field(redacted.json, 'memory.metadata.piiRedacted'), true);
 
   const audit = await request(fx.baseUrl, 'GET', '/api/partitions/alpha/audit?limit=50', { session: token });

@@ -44,6 +44,8 @@ import {
   personProfileQuerySchema,
   personUpdateSchema,
   personUpsertSchema,
+  privacyGroupApplySchema,
+  privacyGroupQuerySchema,
   privacyPreviewSchema,
   privacyRescanSchema,
   privacyRuleCreateSchema,
@@ -115,6 +117,18 @@ function assertPrivacyRuleWrite(rc: RequestContext, row: PrivacyRuleScopeRow): v
   assertWritable(requireConsolePartition(rc, row.partition_id, 'admin'));
 }
 
+function contextKeywordsFromBody(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string');
+  if (typeof value === 'string') {
+    return value
+      .split(/[,，\n]/)
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  }
+  return undefined;
+}
+
 /** 控制台请求体 → PrivacyRuleInput（camelCase 为主，兼容 snake_case）。 */
 function privacyRuleInputFromBody(body: Record<string, unknown>): PrivacyRuleInput {
   return {
@@ -131,6 +145,12 @@ function privacyRuleInputFromBody(body: Record<string, unknown>): PrivacyRuleInp
     maskKeepFirst: (body.maskKeepFirst ?? body.mask_keep_first) as number | undefined,
     enabled: body.enabled as boolean | undefined,
     priority: body.priority as number | undefined,
+    groupKey: (body.groupKey ?? body.group_key) as string | undefined,
+    validator: body.validator as string | undefined,
+    contextKeywords: contextKeywordsFromBody(body.contextKeywords ?? body.context_keywords),
+    caseSensitive: (body.caseSensitive ?? body.case_sensitive) as boolean | undefined,
+    region: body.region as string | undefined,
+    severity: body.severity as PrivacyRuleInput['severity'] | undefined,
   } as PrivacyRuleInput;
 }
 
@@ -684,19 +704,59 @@ export function registerConsoleRoutes(router: Router): void {
     handler: (rc: RequestContext) => {
       requireConsoleAuth(rc);
       const query = rc.query(privacyRuleQuerySchema);
+      const groupKey = query.groupKey ?? query.group_key;
+      const byGroup = <T extends { groupKey: string }>(items: T[]): T[] =>
+        groupKey ? items.filter((item) => item.groupKey === groupKey) : items;
       const scope = query.scope as PrivacyRuleScope;
       if (scope === 'global') {
-        rc.json({ items: rc.app.engine.listPrivacyRules() });
+        rc.json({ items: byGroup(rc.app.engine.listPrivacyRules()) });
         return;
       }
       const ref = query.partition_id ?? query.partitionId;
       if (!ref) throw errors.badRequest('scope=partition 时必须提供 partition_id');
       const partition = requireConsolePartition(rc, ref, 'viewer');
       // scope=partition 只返回分区自有规则；生效规则（含全局覆盖）由 preview / 扫描路径合并。
-      const items = rc.app.engine
-        .listPrivacyRules(partition.id)
-        .filter((rule) => rule.scope === 'partition');
+      const items = byGroup(
+        rc.app.engine.listPrivacyRules(partition.id).filter((rule) => rule.scope === 'partition'),
+      );
       rc.json({ items });
+    },
+  });
+
+  /* --- v6.3：规则库分组（18 组 / 整组启停） --- */
+  router.add({
+    method: 'GET',
+    path: '/api/privacy/groups',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      requireConsoleAuth(rc);
+      const query = rc.query(privacyGroupQuerySchema);
+      const ref = query.partitionId ?? query.partition_id;
+      const partitionId = ref ? requireConsolePartition(rc, ref, 'viewer').id : undefined;
+      rc.json({ items: rc.app.engine.listPrivacyRuleGroups(partitionId) });
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/privacy/groups/:key/apply',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const auth = requireConsoleAuth(rc);
+      const body = await rc.body(privacyGroupApplySchema);
+      const ref = body.partitionId ?? body.partition_id;
+      if (!ref) throw errors.badRequest('必须提供 partitionId（整组启停只作用于分区）');
+      const partition = requireConsolePartition(rc, ref, 'admin');
+      assertWritable(partition);
+      const groupKey = rc.params.key ?? '';
+      const items = rc.app.engine.applyPrivacyGroup(
+        partition.id,
+        groupKey,
+        body.enabled !== false,
+        actorForUser(rc, auth.user),
+      );
+      const group = rc.app.engine.listPrivacyRuleGroups(partition.id).find((item) => item.key === groupKey) ?? null;
+      rc.json({ group, items });
     },
   });
 

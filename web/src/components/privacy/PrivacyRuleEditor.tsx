@@ -9,8 +9,12 @@ import type {
 } from '@lib/types.ts';
 import {
   PRIVACY_ACTION_OPTIONS,
+  PRIVACY_GROUPS,
   PRIVACY_MASK_MODES,
+  PRIVACY_REGION_OPTIONS,
   PRIVACY_RULE_KINDS,
+  PRIVACY_SEVERITIES,
+  PRIVACY_VALIDATORS,
 } from '@lib/constants.ts';
 import {
   Badge,
@@ -41,6 +45,14 @@ interface RuleDraft {
   maskKeepFirst: string;
   priority: string;
   enabled: boolean;
+  /* --- v6.3 规则库字段 --- */
+  groupKey: string;
+  validator: string;
+  /** 逗号分隔；提交时拆成数组 */
+  contextKeywords: string;
+  caseSensitive: boolean;
+  region: string;
+  severity: 'low' | 'medium' | 'high';
 }
 
 function draftFrom(rule: PrivacyRule | null): RuleDraft {
@@ -58,7 +70,23 @@ function draftFrom(rule: PrivacyRule | null): RuleDraft {
     maskKeepFirst: String(rule?.maskKeepFirst ?? 0),
     priority: String(rule?.priority ?? 100),
     enabled: rule?.enabled ?? true,
+    groupKey: rule?.groupKey || 'common',
+    validator: rule?.validator || 'none',
+    contextKeywords: (rule?.contextKeywords ?? []).join(', '),
+    caseSensitive: rule?.caseSensitive ?? true,
+    region: rule?.region || 'global',
+    severity: rule?.severity ?? 'medium',
   };
+}
+
+/** 逗号 / 中文逗号分隔的关键词 → 去重数组。 */
+function parseKeywords(text: string): string[] {
+  const seen = new Set<string>();
+  for (const part of text.split(/[,，]/)) {
+    const value = part.trim();
+    if (value) seen.add(value);
+  }
+  return [...seen];
 }
 
 /** 本地校验：与服务端约束保持一致的最小集合，避免明显无效的请求。 */
@@ -99,13 +127,33 @@ function validateDraft(draft: RuleDraft, editing: boolean): string | null {
       return '保留首尾位数之和不能超过 64。';
     }
   }
+  /* --- v6.3 规则库字段 --- */
+  if (!draft.groupKey.trim() || draft.groupKey.trim().length > 40) {
+    return '规则库分组不能为空（最多 40 字；可在 18 个内置组中选择）。';
+  }
+  if (draft.kind === 'regex') {
+    if (!PRIVACY_VALIDATORS.some((item) => item.value === draft.validator)) {
+      return '请选择有效的校验器（可先用 none）。';
+    }
+    const keywords = parseKeywords(draft.contextKeywords);
+    if (keywords.length > 20) return '上下文关键词最多 20 个。';
+    const tooLong = keywords.find((keyword) => keyword.length > 40);
+    if (tooLong) return `上下文关键词「${tooLong}」过长（最多 40 字）。`;
+  }
+  if (!draft.region.trim()) return '适用地区不能为空（如 global / CN / US）。';
+  if (draft.region.trim().length > 32) return '适用地区最多 32 字。';
+  if (!PRIVACY_SEVERITIES.some((item) => item.value === draft.severity)) {
+    return '请选择有效的严重级别。';
+  }
   return null;
 }
 
 /**
- * 隐私规则编辑器（v6.2）：
- *  - kind=regex：pattern + flags（本地做一次 RegExp 语法校验）；
+ * 隐私规则编辑器（v6.2 / v6.3）：
+ *  - kind=regex：pattern + flags（本地做一次 RegExp 语法校验）、validator（结构/校验位）、
+ *    contextKeywords（命中值附近需出现关键词）、caseSensitive（关闭时自动加 i）；
  *  - kind=prompt：instruction（需要 LLM + 分区 privacyLlmEnabled）；
+ *  - 所有规则：groupKey（18 个行业/领域组）、severity、region；
  *  - action=mask：maskMode + keepFirst/keepLast；action=placeholder：生成 {{pii_xxx}}。
  *
  * 全局规则仅 owner 可写；分区规则 admin+。服务端权限不足时展示错误。
@@ -140,6 +188,24 @@ export function PrivacyRuleEditor({
 
   const patch = (next: Partial<RuleDraft>) => setDraft((current) => ({ ...current, ...next }));
 
+  const validatorMeta = PRIVACY_VALIDATORS.find((item) => item.value === draft.validator);
+  const severityMeta = PRIVACY_SEVERITIES.find((item) => item.value === draft.severity);
+  const groupOptions = PRIVACY_GROUPS.some((group) => group.key === draft.groupKey)
+    ? PRIVACY_GROUPS.map((group) => ({
+        value: group.key,
+        label: `${group.name} · ${group.industry}`,
+      }))
+    : [
+        ...PRIVACY_GROUPS.map((group) => ({
+          value: group.key,
+          label: `${group.name} · ${group.industry}`,
+        })),
+        { value: draft.groupKey, label: `${draft.groupKey} · 自定义` },
+      ];
+  const regionOptions = PRIVACY_REGION_OPTIONS.some((item) => item.value === draft.region)
+    ? PRIVACY_REGION_OPTIONS
+    : [...PRIVACY_REGION_OPTIONS, { value: draft.region, label: `${draft.region} · 自定义` }];
+
   const submit = async () => {
     if (saving) return;
     const message = validateDraft(draft, editing);
@@ -148,12 +214,13 @@ export function PrivacyRuleEditor({
       return;
     }
     const action = draft.action;
+    const isRegex = draft.kind === 'regex';
     const input: PrivacyRuleInput = {
       name: draft.name.trim(),
       kind: draft.kind,
-      pattern: draft.kind === 'regex' ? draft.pattern : undefined,
-      flags: draft.kind === 'regex' ? draft.flags.trim() || 'g' : undefined,
-      instruction: draft.kind === 'prompt' ? draft.instruction.trim() : undefined,
+      pattern: isRegex ? draft.pattern : undefined,
+      flags: isRegex ? draft.flags.trim() || 'g' : undefined,
+      instruction: isRegex ? undefined : draft.instruction.trim(),
       entityType: draft.entityType.trim() || draft.code.trim(),
       action,
       maskMode: action === 'mask' ? draft.maskMode : 'email',
@@ -161,6 +228,13 @@ export function PrivacyRuleEditor({
       maskKeepFirst: action === 'mask' ? Number(draft.maskKeepFirst) : undefined,
       priority: Number(draft.priority),
       enabled: draft.enabled,
+      /* v6.3：自定义规则同样可选分组 / 校验器 / 上下文 */
+      groupKey: draft.groupKey,
+      validator: isRegex ? draft.validator : 'none',
+      contextKeywords: isRegex ? parseKeywords(draft.contextKeywords) : [],
+      caseSensitive: isRegex ? draft.caseSensitive : true,
+      region: draft.region.trim() || 'global',
+      severity: draft.severity,
     };
     if (!editing) input.code = draft.code.trim();
 
@@ -241,44 +315,150 @@ export function PrivacyRuleEditor({
           />
         </Field>
 
-        {draft.kind === 'regex' ? (
-          <div className="grid" style={{ gridTemplateColumns: 'minmax(0, 1fr) 120px', gap: 12 }}>
-            <Field label="正则 pattern" required htmlFor="privacy-rule-pattern" hint="只扫描命中片段；已替换的片段不会被后续规则重复命中。">
-              <Textarea
-                id="privacy-rule-pattern"
-                className="mono"
-                value={draft.pattern}
-                placeholder="EMP-\\d{6}"
-                style={{ minHeight: 76 }}
-                onChange={(event) => patch({ pattern: event.target.value })}
-              />
-            </Field>
-            <Field label="flags" htmlFor="privacy-rule-flags" hint="默认 g">
-              <Input
-                id="privacy-rule-flags"
-                className="mono"
-                value={draft.flags}
-                placeholder="g"
-                maxLength={8}
-                onChange={(event) => patch({ flags: event.target.value.replace(/[^gimsuy]/g, '') })}
-              />
-            </Field>
-          </div>
-        ) : (
+        <div className="grid grid-2" style={{ gap: 12 }}>
           <Field
-            label="抽取指令 instruction"
-            required
-            htmlFor="privacy-rule-instruction"
-            hint="告诉 LLM 抽取什么；仅在分区开启 privacyLlmEnabled 且 LLM 可用时执行，失败静默回退。"
+            label="规则库分组 groupKey"
+            htmlFor="privacy-rule-group"
+            hint="规则库按 18 个行业/领域分组，整组启用/停用会为分区写入覆盖。"
           >
-            <Textarea
-              id="privacy-rule-instruction"
-              value={draft.instruction}
-              placeholder="抽取文本中出现的人名（中文姓名），只返回原文中确实出现的值。"
-              style={{ minHeight: 88 }}
-              onChange={(event) => patch({ instruction: event.target.value })}
+            <Select
+              id="privacy-rule-group"
+              options={groupOptions}
+              value={draft.groupKey}
+              onChange={(event) => patch({ groupKey: event.target.value })}
             />
           </Field>
+          <Field label="严重级别 severity" htmlFor="privacy-rule-severity" hint={severityMeta?.desc}>
+            <Select
+              id="privacy-rule-severity"
+              options={PRIVACY_SEVERITIES.map((item) => ({
+                value: item.value,
+                label: `${item.label} · ${item.value}`,
+              }))}
+              value={draft.severity}
+              onChange={(event) => patch({ severity: event.target.value as RuleDraft['severity'] })}
+            />
+          </Field>
+        </div>
+
+        {draft.kind === 'regex' ? (
+          <>
+            <div className="grid" style={{ gridTemplateColumns: 'minmax(0, 1fr) 120px', gap: 12 }}>
+              <Field label="正则 pattern" required htmlFor="privacy-rule-pattern" hint="只扫描命中片段；已替换的片段不会被后续规则重复命中。">
+                <Textarea
+                  id="privacy-rule-pattern"
+                  className="mono"
+                  value={draft.pattern}
+                  placeholder="EMP-\\d{6}"
+                  style={{ minHeight: 76 }}
+                  onChange={(event) => patch({ pattern: event.target.value })}
+                />
+              </Field>
+              <Field label="flags" htmlFor="privacy-rule-flags" hint="默认 g">
+                <Input
+                  id="privacy-rule-flags"
+                  className="mono"
+                  value={draft.flags}
+                  placeholder="g"
+                  maxLength={8}
+                  onChange={(event) => patch({ flags: event.target.value.replace(/[^gimsuy]/g, '') })}
+                />
+              </Field>
+            </div>
+
+            <div className="grid grid-2" style={{ gap: 12 }}>
+              <Field
+                label="校验器 validator"
+                htmlFor="privacy-rule-validator"
+                hint={validatorMeta?.desc ?? '用于校验结构/校验位，降低正则误报。'}
+              >
+                <Select
+                  id="privacy-rule-validator"
+                  options={PRIVACY_VALIDATORS.map((item) => ({
+                    value: item.value,
+                    label: `${item.label} · ${item.value}`,
+                  }))}
+                  value={draft.validator}
+                  onChange={(event) => patch({ validator: event.target.value })}
+                />
+              </Field>
+              <Field
+                label="适用地区 region"
+                htmlFor="privacy-rule-region"
+                hint="用于展示与统计，如 global / CN / US / EU。"
+              >
+                <Select
+                  id="privacy-rule-region"
+                  options={regionOptions}
+                  value={draft.region}
+                  onChange={(event) => patch({ region: event.target.value })}
+                />
+              </Field>
+            </div>
+
+            <Field
+              label="上下文关键词 contextKeywords"
+              htmlFor="privacy-rule-context"
+              hint="逗号分隔；命中值前后 32 字符内需出现其一（不区分大小写），用于压缩误报。"
+            >
+              <Input
+                id="privacy-rule-context"
+                value={draft.contextKeywords}
+                placeholder="CVV, CVC, 安全码"
+                maxLength={400}
+                onChange={(event) => patch({ contextKeywords: event.target.value })}
+              />
+              {parseKeywords(draft.contextKeywords).length ? (
+                <div className="chip-row mt-6">
+                  {parseKeywords(draft.contextKeywords).map((keyword) => (
+                    <Badge key={keyword} tone="slate" size="sm">{keyword}</Badge>
+                  ))}
+                </div>
+              ) : null}
+            </Field>
+
+            <div className="between wrap gap-10">
+              <div>
+                <div className="small">区分大小写 caseSensitive</div>
+                <div className="tiny dim mt-4">
+                  关闭后正则编译时自动加 <span className="mono">i</span> 标志；适合邮箱、域名等大小写不敏感场景。
+                </div>
+              </div>
+              <Switch
+                checked={draft.caseSensitive}
+                onChange={(next) => patch({ caseSensitive: next })}
+              />
+            </div>
+          </>
+        ) : (
+          <>
+            <Field
+              label="抽取指令 instruction"
+              required
+              htmlFor="privacy-rule-instruction"
+              hint="告诉 LLM 抽取什么；仅在分区开启 privacyLlmEnabled 且 LLM 可用时执行，失败静默回退。"
+            >
+              <Textarea
+                id="privacy-rule-instruction"
+                value={draft.instruction}
+                placeholder="抽取文本中出现的人名（中文姓名），只返回原文中确实出现的值。"
+                style={{ minHeight: 88 }}
+                onChange={(event) => patch({ instruction: event.target.value })}
+              />
+            </Field>
+            <Field
+              label="适用地区 region"
+              htmlFor="privacy-rule-region-prompt"
+              hint="用于展示与统计；提示词规则不做 validator / contextKeywords 过滤。"
+            >
+              <Select
+                id="privacy-rule-region-prompt"
+                options={regionOptions}
+                value={draft.region}
+                onChange={(event) => patch({ region: event.target.value })}
+              />
+            </Field>
+          </>
         )}
 
         <div className="grid grid-2" style={{ gap: 12 }}>

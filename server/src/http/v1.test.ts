@@ -343,5 +343,5 @@ test('v1 旧的领域端点已移除（404）', async (t) => {
   const health = await request(fx.baseUrl, 'GET', '/health');
   assert.equal(health.status, 200);
   assert.equal(field(health.json, 'ok'), true);
-  assert.equal(field(health.json, 'schemaVersion'), 8);
+  assert.equal(field(health.json, 'schemaVersion'), 9);
 });

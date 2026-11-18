@@ -1,8 +1,10 @@
-# Mnemos v6.2 API 参考
+# Mnemos v6.3 API 参考
 
 > 契约：[`v6-architecture.md`](v6-architecture.md) + [`roadmap-v6.1.md`](roadmap-v6.1.md) +
-> [`privacy-rules.md`](privacy-rules.md)（v6.2 隐私规则域）。
-> 本文以 v6.2 契约为准；v6.2 新增「隐私规则域」（第 6 节）与写入占位符协议，其余端点沿用 v6.1。
+> [`privacy-rules.md`](privacy-rules.md)（隐私规则域 / schema v9）+
+> [`privacy-catalog.md`](privacy-catalog.md)（规则库目录：18 组 / 85 条）。
+> 本文以 v6.3 契约为准；v6.2 引入「隐私规则域」（第 6 节）与写入占位符协议，v6.3 增加
+> 规则库分组、整组启停与校验器/上下文/大小写字段，其余端点沿用 v6.1。
 >
 > 两套 JSON 命名约定，**不是两套能力**：
 >
@@ -854,7 +856,7 @@ curl -s -X POST "$BASE/v1/partitions/zhiwu-app/persons/user-123/memories" \
 - `SUPERSEDE`：显式 `supersedes_id` 或相同 `fact_key`；旧记忆被关闭，新记忆记录 `supersedes`。
 - PII / 隐私规则（v6.2）：`settings.pii_redaction=basic` 时写入执行规则域的正则规则（落库前脱敏）；
   `settings.privacy_llm_enabled=true` 时另外异步执行 `kind=prompt` 规则。主动抽离时传 `placeholders`，
-  正文只落 `{{key}}` token；详情需 `?reveal=placeholders` 才解密。详见[第 6 节](#6-隐私规则域v62)。
+  正文只落 `{{key}}` token；详情需 `?reveal=placeholders` 才解密。详见[第 6 节](#6-隐私规则域v63)。
 
 带附件与演化字段的写入示例：
 
@@ -924,13 +926,15 @@ curl -s "$BASE/v1/partitions/mnemos-dev/entities?q=SQLite&limit=20" -H "authoriz
 
 ---
 
-## 6. 隐私规则域（v6.2）
+## 6. 隐私规则域（v6.3）
 
-> 契约：[`privacy-rules.md`](privacy-rules.md)。把 PII 脱敏从写死的 `basic` 逻辑升级为可维护的规则域：
+> 契约：[`privacy-rules.md`](privacy-rules.md)；规则库目录见 [`privacy-catalog.md`](privacy-catalog.md)。
+> 把 PII 脱敏从写死的 `basic` 逻辑升级为可维护的规则域：
 > **全局规则 + 分区规则**，每类规则支持 **正则（直接扫描）** 与 **提示词（LLM 抽取）**；
 > 写入支持**占位符 + 映射表**的隐私抽离协议；记忆整理（dream）同时执行规则与 LLM 隐私抽取。
 >
-> 实现状态：schema v8 `privacy_rules` / `memory_placeholders` 已上线，HTTP 端点已实现（规则 CRUD、preview、rescan、reveal）。
+> 实现状态：schema v9 的 `privacy_rules` / `privacy_rule_groups` / `memory_placeholders` 已上线，
+> HTTP 端点已实现（规则 CRUD、分组列表 / 整组启停、preview、rescan、reveal）。
 > 请求 / 响应形状以 `privacy-rules.md` 与 `shared/src/types.ts` 为准，联调后如有调整会同步本文。
 
 ### 6.1 PrivacyRule 字段
@@ -943,7 +947,7 @@ curl -s "$BASE/v1/partitions/mnemos-dev/entities?q=SQLite&limit=20" -H "authoriz
 | `id` | string | 规则 id |
 | `scope` | `global` / `partition` | 全局规则 / 分区规则 |
 | `partitionId` | string? | `scope=partition` 时必填；`global` 为空 |
-| `code` | string | 规则编码：`email` / `phone` / `id_card` / `bank_card` / `name` / `address` / `credential` / `medical` / 自定义 |
+| `code` | string | 规则编码：`email` / `phone` / `id_card` / `bank_card` / `person_name` / `address` / `credential` / `diagnosis` / 自定义（v6.3 起 `name→person_name`、`medical→diagnosis`） |
 | `name` | string | 展示名 |
 | `kind` | `regex` / `prompt` | 正则扫描 / 提示词 LLM 抽取 |
 | `pattern` | string? | `kind=regex` 的正则源码 |
@@ -956,14 +960,67 @@ curl -s "$BASE/v1/partitions/mnemos-dev/entities?q=SQLite&limit=20" -H "authoriz
 | `enabled` | boolean | 是否启用 |
 | `priority` | number | 执行顺序，小者先（默认 100） |
 | `builtin` | boolean | 全局内置规则（不可删除，可覆盖 / 禁用） |
+| `groupKey` / `group_key` | string | **v6.3** 所属规则库分组（默认 `common`），见 6.1.1 |
+| `validator` | string | **v6.3** 结构/校验位校验器，默认 `none`（枚举见 6.2） |
+| `contextKeywords` / `context_keywords` | string[] | **v6.3** 上下文关键词：命中值前后 32 字符内需出现其一（大小写不敏感） |
+| `caseSensitive` / `case_sensitive` | boolean | **v6.3** 默认 `true`；`false` 时正则补 `i` 标志 |
+| `region`（两套同名） | string | **v6.3** 业务区域标注（`global` / `US` / `EU`…），不参与扫描 |
+| `severity`（两套同名） | `low` / `medium` / `high` | **v6.3** 元数据（UI 排序/告警），不改变扫描行为 |
 | `createdAt` / `updatedAt` | ISO | 时间 |
 
 - 生效规则 = `global` 规则 + 该分区 `partition` 规则；同 `code` 时分区规则覆盖全局规则；
   按 `priority` 升序执行，同 code 只保留一条。
-- 全局内置 regex：`email / id_card / phone / bank_card`（默认启用）；
-  全局内置 prompt：`name / address / credential / medical`（默认禁用，分区按需开启并需配置 LLM）。
+- 全局内置规则库（v6.3）：[`privacy-catalog.md`](privacy-catalog.md) 的 **18 组 / 85 条**
+  （68 regex + 17 prompt）；**默认只启用** `email` / `id_card` / `phone` / `bank_card` 4 条，
+  其余默认关闭、按组启用（见 6.1.1）。
 - 写入 / 更新入参（`PrivacyRuleInput`）：`code?`、`name`、`kind`、`pattern?`、`flags?`、
-  `instruction?`、`entityType?`、`action?`、`maskMode?`、`maskKeepLast?`、`maskKeepFirst?`、`enabled?`、`priority?`。
+  `instruction?`、`entityType?`、`action?`、`maskMode?`、`maskKeepLast?`、`maskKeepFirst?`、
+  `enabled?`、`priority?`，v6.3 增加 `groupKey?`、`validator?`、`contextKeywords?`、
+  `caseSensitive?`、`region?`、`severity?`。
+
+### 6.1.1 规则库与分组（v6.3）
+
+| 分组 key | 名称 | 行业 | 规则数 |
+| --- | --- | --- | --- |
+| `common` | 通用个人信息 | 通用 | 4 |
+| `contact` | 联系方式 | 通用 | 5 |
+| `identity_cn` | 中国证件 | 政务 / 实名 | 11 |
+| `identity_intl` | 国际证件 | 跨境 / 合规 | 5 |
+| `finance` | 金融支付 | 金融 | 11 |
+| `healthcare` | 医疗健康 | 医疗 | 8 |
+| `hr` | 人力资源 | HR | 3 |
+| `ecommerce` | 电商零售 | 电商 | 3 |
+| `internet` | 网络与设备 | 互联网 | 5 |
+| `credentials` | 账号凭据 | 安全 | 7 |
+| `education` | 教育 | 教育 | 3 |
+| `legal` | 法律政务 | 法律 / 政务 | 5 |
+| `automotive` | 汽车交通 | 汽车 | 3 |
+| `location` | 位置信息 | LBS | 2 |
+| `biometric` | 生物特征 | 安全 / 医疗 | 1 |
+| `crypto` | 区块链 | Web3 | 4 |
+| `telecom` | 通信 | 运营商 | 3 |
+| `realestate` | 房产 | 地产 | 2 |
+
+`PrivacyRuleGroup`（`/api` camelCase，`/v1` snake_case）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `key` | string | 分组 key（主键） |
+| `name` / `industry` / `description` | string | 展示名 / 行业 / 说明 |
+| `sortOrder` / `sort_order` | number | 排序 |
+| `builtin` | boolean | 内置目录分组 |
+| `ruleCount` / `rule_count` | number | 该组全局规则数（固定） |
+| `enabledCount` / `enabled_count` | number | 该分区生效启用数（全局 enabled 且未被覆盖 + 分区覆盖 enabled；只统计与全局同 code 的规则） |
+| `appliedCount` / `applied_count` | number | 该分区对该组全局规则的分区覆盖条数（存在覆盖即计 1，不论 enabled） |
+
+- **整组启用** = 对该组每条全局规则在当前分区 upsert `scope=partition` 覆盖并设 `enabled=true`；
+  **整组停用** = 同样 upsert 覆盖并设 `enabled=false`（不删除）。只影响当前分区，不改全局目录；
+  幂等；已存在自定义规则（非目录 code）不受影响。
+- 组内单条规则仍可单独 `PATCH`；之后整组启停会统一覆盖该组。
+- 未传分区时 `GET /api/privacy/groups` 按全局统计（`appliedCount=0`）。
+- prompt 组额外需要 `privacyLlmEnabled=true` + LLM 才会实际抽取；否则只启用不扫描。
+- 控制台隐私规则页的「规则库/分组」视图展示 18 组卡片与「启用本组 / 停用本组」。
+- 审计：整组启停写 `privacy.group.apply`（detail `{group, enabled, count}`）。
 
 ### 6.2 开关与扫描
 
@@ -977,6 +1034,14 @@ curl -s "$BASE/v1/partitions/mnemos-dev/entities?q=SQLite&limit=20" -H "authoriz
   `memories.privacy_scanned_at` 防重复扫描；规则变更后可调 rescan 重扫。
 - regex 规则按 `priority` 执行，已替换片段（`*` 或 `{{token}}`）不会被后续规则重复命中；
   prompt 规则由 LLM 返回 `{entities:[{code,value}]}`，服务端校验 value 确实出现在原文中（防幻觉）。
+- **v6.3 扫描过滤**（对每条合并后的规则）：
+  1. 正则命中后若 `validator !== 'none'`，调用校验器；不通过则跳过该命中（不降级）；
+  2. 配置了 `contextKeywords` 时，命中值前后 **32 字符**窗口内需出现其一（关键词比较大小写不敏感）；
+  3. `caseSensitive=false` 时补 `i` 标志（与 `flags` 合并去重）。
+  `validator` 枚举：`none` / `luhn` / `cn_id` / `us_ssn` / `us_itin` / `iban` / `vin` / `ipv4` /
+  `ipv6` / `mac` / `jwt` / `uscc` / `eth` / `btc` / `coordinates` / `uuid`；语义见
+  [`privacy-rules.md`](privacy-rules.md#33-校验器与语义)。
+- `region` / `severity` 只作展示/排序/告警，不参与扫描；是否处理只由合并后的 `enabled` 决定。
 
 ### 6.3 占位符协议（写入抽离）
 
@@ -1009,9 +1074,11 @@ curl -s "$BASE/v1/partitions/mnemos-dev/entities?q=SQLite&limit=20" -H "authoriz
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| `GET` | `/api/privacy/rules?scope=global\|partition&partition_id=` | viewer+ | 读规则；global 需 org 成员，partition 需分区可见 |
-| `POST` | `/api/privacy/rules` | global=owner / partition=admin | 新建规则 |
-| `PATCH` | `/api/privacy/rules/:id` | 同上 | 部分更新（`pattern` / `instruction` / `action` / `enabled` / `priority` …） |
+| `GET` | `/api/privacy/groups?partitionId=` | 登录；带分区时 viewer+ | 规则库分组列表 + 计数；省略 `partitionId` 返回全局统计（`appliedCount=0`） |
+| `POST` | `/api/privacy/groups/:key/apply` | 分区 admin | 整组启停：`{partitionId, enabled?（默认 true）}` → `{group, items}` |
+| `GET` | `/api/privacy/rules?scope=global\|partition&partition_id=&group_key=` | viewer+ | 读规则；`group_key` / `groupKey` 可按组过滤；global 需 org 成员 |
+| `POST` | `/api/privacy/rules` | global=owner / partition=admin | 新建规则（含 v6.3 新字段） |
+| `PATCH` | `/api/privacy/rules/:id` | 同上 | 部分更新（`pattern` / `instruction` / `action` / `enabled` / `priority` / v6.3 字段 …） |
 | `DELETE` | `/api/privacy/rules/:id` | 同上 | 删除；`builtin` 不可删（可禁用 / 覆盖） |
 | `POST` | `/api/privacy/preview` | 分区 viewer+ | 试跑规则，不落库：`{partitionId, text}` → `PrivacyScanResult` |
 | `POST` | `/api/partitions/:p/privacy/rescan` | 分区 admin | 重扫已有记忆：`{personId?, limit?}` |
@@ -1020,10 +1087,84 @@ curl -s "$BASE/v1/partitions/mnemos-dev/entities?q=SQLite&limit=20" -H "authoriz
 
 | 方法 | 路径 | 作用域 | 说明 |
 | --- | --- | --- | --- |
-| `GET` | `/v1/partitions/:p/privacy/rules` | `memories:read` | 读该分区生效规则（global + 分区合并结果） |
+| `GET` | `/v1/partitions/:p/privacy/groups` | `memories:read` | 分组列表 + 计数（`{items}`，snake_case） |
+| `POST` | `/v1/partitions/:p/privacy/groups/:key/apply` | `admin` | 整组启停：`{enabled?}` → `{group, items}` |
+| `GET` | `/v1/partitions/:p/privacy/rules` | `memories:read` | 读该分区生效规则（global + 分区合并结果；支持 `group_key` 过滤） |
 | `GET` | `/v1/partitions/:p/memories/:id?reveal=placeholders` | `memories:read` | 记忆详情 + 解密后的占位符值 |
 
-新建一条分区 regex 规则（控制台）：
+读取规则库分组（`GET /api/privacy/groups?partitionId=…`；省略 `partitionId` 时按全局统计）：
+
+```bash
+curl -s "$BASE/api/privacy/groups?partitionId=ptn_2c3dcb0f511c4c81" \
+  -H "authorization: Bearer $SESSION"
+```
+
+```json
+{
+  "items": [
+    {
+      "key": "contact",
+      "name": "联系方式",
+      "industry": "通用",
+      "description": "邮箱、手机号、座机、国际号码、微信号。",
+      "sortOrder": 20,
+      "builtin": true,
+      "ruleCount": 5,
+      "enabledCount": 2,
+      "appliedCount": 0
+    }
+  ]
+}
+```
+
+整组启停（`POST /api/privacy/groups/:key/apply`；`enabled` 缺省 `true`；重复调用幂等）：
+
+```bash
+curl -s -X POST "$BASE/api/privacy/groups/identity_cn/apply" \
+  -H "authorization: Bearer $SESSION" -H 'content-type: application/json' \
+  -d '{"partitionId":"ptn_2c3dcb0f511c4c81","enabled":true}'
+```
+
+响应 `{ group, items }`（节选，`items` 仅展示 1 条）：`group` 是应用后的组计数（同 GET 单组形状），
+`items` 是该分区该组应用后的生效规则（global + partition 合并、按 priority 排序，含 `enabled=false` 的规则）：
+
+```json
+{
+  "group": {
+    "key": "identity_cn",
+    "name": "中国证件",
+    "industry": "政务 / 实名",
+    "description": "身份证、护照、港澳台通行证、驾驶证、社保/医保等。",
+    "sortOrder": 30,
+    "builtin": true,
+    "ruleCount": 11,
+    "enabledCount": 11,
+    "appliedCount": 11
+  },
+  "items": [
+    {
+      "code": "id_card",
+      "name": "身份证号",
+      "kind": "regex",
+      "groupKey": "identity_cn",
+      "validator": "cn_id",
+      "contextKeywords": [],
+      "caseSensitive": true,
+      "region": "global",
+      "severity": "high",
+      "enabled": true,
+      "priority": 20,
+      "scope": "partition"
+    }
+  ]
+}
+```
+
+`/v1` 同路径返回 `{ group, items }`，字段为 snake_case（`rule_count` / `enabled_count` /
+`applied_count` / `group_key` / `context_keywords` / `case_sensitive`）；未知 group key 404，
+缺分区 400；审计 `privacy.group.apply`。
+
+新建一条分区 regex 规则（控制台，含 v6.3 新字段）：
 
 ```bash
 curl -s -X POST "$BASE/api/privacy/rules" \
@@ -1040,7 +1181,13 @@ curl -s -X POST "$BASE/api/privacy/rules" \
     "maskMode": "keepLast",
     "maskKeepLast": 4,
     "enabled": true,
-    "priority": 50
+    "priority": 50,
+    "groupKey": "hr",
+    "validator": "none",
+    "contextKeywords": ["工号", "员工号"],
+    "caseSensitive": false,
+    "region": "global",
+    "severity": "medium"
   }'
 ```
 
@@ -1064,6 +1211,12 @@ curl -s -X POST "$BASE/api/privacy/rules" \
   "enabled": true,
   "priority": 50,
   "builtin": false,
+  "groupKey": "hr",
+  "validator": "none",
+  "contextKeywords": ["工号", "员工号"],
+  "caseSensitive": false,
+  "region": "global",
+  "severity": "medium",
   "createdAt": "2026-11-18T10:00:00.000Z",
   "updatedAt": "2026-11-18T10:00:00.000Z"
 }
@@ -1131,7 +1284,14 @@ curl -s -X POST "$BASE/api/partitions/ptn_2c3dcb0f511c4c81/privacy/rescan" \
 - **异步扫描有延迟**：写入后由 worker tick 执行；刚写入的记忆可能尚未脱敏，规则变更后需 rescan 覆盖历史。
 - **规则隔离**：global 规则跨分区生效但仅 owner 可写；分区规则只影响本分区，不能读取其它分区。
 - **明文永不进列表 / 搜索**：`reveal` 需 `memories:read`；列表 / 搜索 / 导出只返回 token 或计数。
-- **与旧 `basic` 兼容**：`pii_redaction=basic` 继续生效，规则域可覆盖 / 禁用内置规则。
+- **与旧 `basic` 兼容**：`pii_redaction=basic` 继续生效，规则域可覆盖 / 禁用内置规则；4 条默认启用规则
+  保留旧 `basic` 语义。
+- **validator / context 只影响命中**：校验器不通过或上下文关键词不在 32 字符窗口内时，该条命中被跳过；
+  `region` / `severity` 不参与扫描。
+- **整组启停是分区覆盖**：只改当前分区的规则 `enabled`，不删除覆盖行、不改全局目录；
+  组内单条规则仍可单独调整。
+- **v8 → v9 迁移**：旧 `privacy_rules` 自动补 6 个新列并建 `privacy_rule_groups`；旧内置 code
+  `name→person_name`、`medical→diagnosis`；既有分区覆盖与自定义规则保留（新字段取默认值）。
 
 ---
 
@@ -1195,7 +1355,7 @@ owner 管理组织与组织级 Key。
 | `DELETE` | `/api/partitions/:partition/memories/:id` | developer | 204 |
 
 `GET /api/partitions/:partition` **带 `stats`**（v1 的同一路径不带），这是两套入口唯一的形状差异之一。
-隐私规则读写、`preview`、`rescan` 见 [6.4](#64-端点)。
+隐私规则 / 分组读写、`preview`、`rescan` 见 [6.4](#64-端点)。
 
 ### 7.3 人级简报 / 上下文 / 做梦（控制台）
 

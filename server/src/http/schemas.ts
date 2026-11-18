@@ -298,6 +298,14 @@ export const privacyRuleKindSchema = z.enum(['regex', 'prompt']);
 export const privacyActionSchema = z.enum(['mask', 'placeholder']);
 export const privacyMaskModeSchema = z.enum(['email', 'keepFirstLast', 'keepLast', 'full']);
 
+export const privacySeveritySchema = z.enum(['low', 'medium', 'high']);
+
+/** contextKeywords 接受数组，也兼容逗号分隔字符串（前端编辑器两种都常见）。 */
+const privacyContextKeywordsSchema = z.union([
+  z.array(z.string().trim().max(40)).max(20),
+  z.string().trim().max(1000),
+]);
+
 export const privacyRuleInputSchema = z.object({
   code: z.string().trim().max(40).optional(),
   name: z.string().trim().min(1).max(80).optional(),
@@ -316,6 +324,16 @@ export const privacyRuleInputSchema = z.object({
   mask_keep_first: z.coerce.number().int().min(0).max(64).optional(),
   enabled: z.boolean().optional(),
   priority: z.coerce.number().int().min(0).max(1_000_000).optional(),
+  /* v6.3：规则库分组 / 校验器 / 上下文关键词 / 大小写 / 区域 / 严重级别 */
+  groupKey: z.string().trim().max(40).optional(),
+  group_key: z.string().trim().max(40).optional(),
+  validator: z.string().trim().max(40).optional(),
+  contextKeywords: privacyContextKeywordsSchema.optional(),
+  context_keywords: privacyContextKeywordsSchema.optional(),
+  caseSensitive: z.boolean().optional(),
+  case_sensitive: z.boolean().optional(),
+  region: z.string().trim().max(40).optional(),
+  severity: privacySeveritySchema.optional(),
 });
 
 export const privacyRuleCreateSchema = privacyRuleInputSchema.extend({
@@ -334,6 +352,19 @@ export const privacyRuleQuerySchema = z.object({
   scope: privacyRuleScopeSchema.default('global'),
   partition_id: z.string().trim().max(128).optional(),
   partitionId: z.string().trim().max(128).optional(),
+  groupKey: z.string().trim().max(40).optional(),
+  group_key: z.string().trim().max(40).optional(),
+});
+
+export const privacyGroupQuerySchema = z.object({
+  partitionId: z.string().trim().max(128).optional(),
+  partition_id: z.string().trim().max(128).optional(),
+});
+
+export const privacyGroupApplySchema = z.object({
+  partitionId: z.string().trim().max(128).optional(),
+  partition_id: z.string().trim().max(128).optional(),
+  enabled: z.boolean().optional().default(true),
 });
 
 export const privacyPreviewSchema = z.object({

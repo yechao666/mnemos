@@ -31,6 +31,7 @@ import type {
   PersonMergeResult,
   PersonProfile,
   PrivacyRule,
+  PrivacyRuleGroup,
   PrivacyRuleInput,
   PrivacyRuleScope,
   PrivacyScanResult,
@@ -54,9 +55,11 @@ import {
 } from './memories.ts';
 import { buildEntityGraph, listEntities as listEntityRecords } from './graph.ts';
 import {
+  applyPrivacyGroup as applyPrivacyGroupRecord,
   createPrivacyRule as createPrivacyRuleRecord,
   deletePrivacyRule as deletePrivacyRuleRecord,
   listMemoryPlaceholders,
+  listPrivacyRuleGroups as listPrivacyRuleGroupsRecord,
   listPrivacyRules as listPrivacyRulesRecord,
   rescanPrivacy as rescanPrivacyRecord,
   scanText,
@@ -402,6 +405,22 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
     /* --- v6.2：隐私规则域 --- */
     listPrivacyRules(partitionId?: string): PrivacyRule[] {
       return listPrivacyRulesRecord(db, partitionId);
+    },
+    listPrivacyRuleGroups(partitionId?: string): PrivacyRuleGroup[] {
+      return listPrivacyRuleGroupsRecord(db, partitionId);
+    },
+    applyPrivacyGroup(partitionId: string, groupKey: string, enabled: boolean, actor: Actor): PrivacyRule[] {
+      const rules = applyPrivacyGroupRecord(db, partitionId, groupKey, enabled);
+      audit(db, {
+        orgId: orgOfPartition(db, partitionId),
+        partitionId,
+        actor,
+        action: 'privacy.group.apply',
+        resourceType: 'privacy_group',
+        resourceId: groupKey,
+        detail: { group: groupKey, enabled, count: rules.length },
+      });
+      return rules;
     },
     createPrivacyRule(
       scope: PrivacyRuleScope,

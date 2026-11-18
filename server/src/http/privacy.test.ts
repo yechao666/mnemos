@@ -31,7 +31,7 @@ test('privacy HTTP：规则读取/写入权限、内置规则不可删、审计'
   const globalList = await request(fx.baseUrl, 'GET', '/api/privacy/rules?scope=global', { session: viewer });
   assert.equal(globalList.status, 200, JSON.stringify(globalList.json));
   const globalItems = field(globalList.json, 'items') as Array<Record<string, unknown>>;
-  assert.equal(globalItems.length, 8);
+  assert.equal(globalItems.length, 85);
   assert.equal(globalItems[0]?.scope, 'global');
   assert.equal(typeof globalItems[0]?.maskMode, 'string');
   assert.equal(typeof globalItems[0]?.entityType, 'string');

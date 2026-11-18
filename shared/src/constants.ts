@@ -14,7 +14,7 @@ import type {
 
 export const APP_NAME = 'Mnemos';
 export const APP_TAGLINE = '企业级 AI 记忆基础设施';
-export const APP_VERSION = '6.2.0';
+export const APP_VERSION = '6.3.0';
 export const DEFAULT_SERVER_PORT = 4380;
 
 /** 游标分页：默认 50，最大 200。 */

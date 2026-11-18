@@ -437,8 +437,32 @@ export interface PrivacyRule {
   enabled: boolean;
   priority: number;
   builtin: boolean;
+  /** 规则库分组（行业/领域） */
+  groupKey: string;
+  /** 结构/校验位校验器 */
+  validator: string;
+  /** 上下文关键词：命中值附近需出现其一 */
+  contextKeywords: string[];
+  caseSensitive: boolean;
+  region: string;
+  severity: 'low' | 'medium' | 'high';
   createdAt: string;
   updatedAt: string;
+}
+
+export interface PrivacyRuleGroup {
+  key: string;
+  name: string;
+  industry: string;
+  description: string;
+  sortOrder: number;
+  builtin: boolean;
+  /** 该组全局规则数 */
+  ruleCount: number;
+  /** 当前分区生效条数（含全局启用 + 分区覆盖） */
+  enabledCount: number;
+  /** 当前分区的覆盖条数 */
+  appliedCount: number;
 }
 
 export interface PrivacyRuleInput {
@@ -455,6 +479,12 @@ export interface PrivacyRuleInput {
   maskKeepFirst?: number;
   enabled?: boolean;
   priority?: number;
+  groupKey?: string;
+  validator?: string;
+  contextKeywords?: string[];
+  caseSensitive?: boolean;
+  region?: string;
+  severity?: 'low' | 'medium' | 'high';
 }
 
 export interface PrivacyScanHit {
@@ -1046,6 +1076,8 @@ export interface MemoryService {
 
   /* --- v6.2：隐私规则 --- */
   listPrivacyRules(partitionId?: string): PrivacyRule[];
+  listPrivacyRuleGroups(partitionId?: string): PrivacyRuleGroup[];
+  applyPrivacyGroup(partitionId: string, groupKey: string, enabled: boolean, actor: Actor): PrivacyRule[];
   createPrivacyRule(
     scope: PrivacyRuleScope,
     partitionId: string | null,
