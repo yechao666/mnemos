@@ -462,3 +462,5 @@ POST   /api/ops/jobs/tick                                      # 已有
 ![规则试跑预览](screenshots/v6.2-02-privacy-preview.png)
 
 ![规则库分组](screenshots/v6.3-01-privacy-library.png)
+
+![左侧行业导航 + 右侧规则表格](screenshots/v6.5-01-privacy-industry-nav.png)

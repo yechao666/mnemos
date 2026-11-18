@@ -55,7 +55,7 @@ interface RuleDraft {
   severity: 'low' | 'medium' | 'high';
 }
 
-function draftFrom(rule: PrivacyRule | null): RuleDraft {
+function draftFrom(rule: PrivacyRule | null, defaultGroupKey?: string): RuleDraft {
   return {
     code: rule?.code ?? '',
     name: rule?.name ?? '',
@@ -70,7 +70,7 @@ function draftFrom(rule: PrivacyRule | null): RuleDraft {
     maskKeepFirst: String(rule?.maskKeepFirst ?? 0),
     priority: String(rule?.priority ?? 100),
     enabled: rule?.enabled ?? true,
-    groupKey: rule?.groupKey || 'common',
+    groupKey: rule?.groupKey || defaultGroupKey || 'common',
     validator: rule?.validator || 'none',
     contextKeywords: (rule?.contextKeywords ?? []).join(', '),
     caseSensitive: rule?.caseSensitive ?? true,
@@ -163,6 +163,8 @@ export function PrivacyRuleEditor({
   scope,
   partitionId,
   rule,
+  seed,
+  defaultGroupKey,
   onClose,
   onSaved,
 }: {
@@ -170,21 +172,26 @@ export function PrivacyRuleEditor({
   scope: PrivacyRuleScope;
   partitionId?: string;
   rule: PrivacyRule | null;
+  /** 新建分区覆盖时用全局规则预填（code 锁定，创建同 code 覆盖）。 */
+  seed?: PrivacyRule | null;
+  /** 未选中任何规则时的默认分组（来自左栏当前行业）。 */
+  defaultGroupKey?: string;
   onClose: () => void;
   onSaved: (rule: PrivacyRule) => void;
 }) {
   const toast = useToast();
   const editing = Boolean(rule);
-  const [draft, setDraft] = useState<RuleDraft>(() => draftFrom(rule));
+  const codeLocked = editing || Boolean(seed);
+  const [draft, setDraft] = useState<RuleDraft>(() => draftFrom(rule ?? seed ?? null, defaultGroupKey));
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
-    setDraft(draftFrom(rule));
+    setDraft(draftFrom(rule ?? seed ?? null, defaultGroupKey));
     setError(null);
     setSaving(false);
-  }, [open, rule]);
+  }, [open, rule, seed, defaultGroupKey]);
 
   const patch = (next: Partial<RuleDraft>) => setDraft((current) => ({ ...current, ...next }));
 
@@ -263,17 +270,19 @@ export function PrivacyRuleEditor({
       open={open}
       onClose={onClose}
       size="lg"
-      title={editing ? '编辑隐私规则' : '新建隐私规则'}
+      title={editing ? '编辑隐私规则' : seed ? '创建分区覆盖规则' : '新建隐私规则'}
       description={
-        scope === 'global'
-          ? '全局规则是组织默认值；分区可用同 code 的规则覆盖 pattern / instruction / action / enabled。'
-          : '当前分区规则：同 code 时覆盖全局规则，priority 小者先执行。'
+        seed
+          ? '基于选中的全局规则创建同 code 分区覆盖：code 不可修改；保存后该分区使用这里的字段，其他分区不受影响。'
+          : scope === 'global'
+            ? '全局规则是组织默认值；分区可用同 code 的规则覆盖 pattern / instruction / action / enabled。'
+            : '当前分区规则：同 code 时覆盖全局规则，priority 小者先执行。'
       }
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>取消</Button>
           <Button variant="primary" icon="check" loading={saving} onClick={() => void submit()}>
-            {editing ? '保存规则' : '创建规则'}
+            {editing ? '保存规则' : seed ? '创建覆盖' : '创建规则'}
           </Button>
         </>
       }
@@ -284,13 +293,13 @@ export function PrivacyRuleEditor({
             label="规则 code"
             required={!editing}
             htmlFor="privacy-rule-code"
-            hint={editing ? 'code 是覆盖键，创建后不可修改。' : '如 email / phone / id_card / name。'}
+            hint={codeLocked ? 'code 是覆盖键，创建后不可修改。' : '如 email / phone / id_card / name。'}
           >
             <Input
               id="privacy-rule-code"
               className="mono"
               value={draft.code}
-              readOnly={editing}
+              readOnly={codeLocked}
               placeholder="employee_id"
               maxLength={64}
               onChange={(event) => patch({ code: event.target.value })}
@@ -540,6 +549,15 @@ export function PrivacyRuleEditor({
           </div>
           <Switch checked={draft.enabled} onChange={(next) => patch({ enabled: next })} />
         </div>
+
+        {seed ? (
+          <div className="hstack gap-8 wrap">
+            <Badge tone="cyan" size="sm" dot>创建分区覆盖</Badge>
+            <span className="tiny dim">
+              覆盖 code <span className="mono">{seed.code}</span>；保存后该分区使用本规则，删除覆盖会回退到全局。
+            </span>
+          </div>
+        ) : null}
 
         {rule?.builtin ? (
           <div className="hstack gap-8 wrap">
