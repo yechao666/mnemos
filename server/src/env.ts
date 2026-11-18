@@ -25,6 +25,11 @@ export interface Env {
   dbPath: string;
   webDist: string;
   authDisabled: boolean;
+  /**
+   * v6.5：本地免密模式（MNEMOS_DEV_NO_API_KEY=1）。v1 API 跳过 API Key 校验，
+   * 以第一个 owner 的身份合成 org key。仅本地开发；生产环境启动会拒绝。
+   */
+  devNoApiKey: boolean;
   demoMode: boolean;
   /** 企业微信 Mock 登录：默认跟随 demoMode，可用 MNEMOS_WECOM_MOCK=0/1 覆盖 */
   wecomMock: boolean;
@@ -106,6 +111,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     dbPath: process.env.MNEMOS_DB_PATH ?? join(dataDir, 'mnemos.db'),
     webDist: process.env.MNEMOS_WEB_DIST ?? join(APP_ROOT, 'web', 'dist'),
     authDisabled: process.env.MNEMOS_AUTH_DISABLED === '1',
+    devNoApiKey: process.env.MNEMOS_DEV_NO_API_KEY === '1',
     demoMode: process.env.MNEMOS_DEMO !== '0',
     wecomMock:
       process.env.MNEMOS_WECOM_MOCK === undefined
@@ -194,6 +200,7 @@ export function validateEnv(env: Env): string[] {
 
   const production = env.nodeEnv === 'production';
   if (production && env.authDisabled) problems.push('生产环境禁止 MNEMOS_AUTH_DISABLED=1');
+  if (production && env.devNoApiKey) problems.push('生产环境禁止 MNEMOS_DEV_NO_API_KEY=1');
   if (production && env.demoMode) {
     problems.push('生产环境建议设置 MNEMOS_DEMO=0，避免空库自动写入演示数据');
   }

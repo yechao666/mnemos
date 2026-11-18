@@ -28,7 +28,7 @@ export type PersonType = 'human' | 'agent' | 'service';
 export interface MnemosConfig {
     /** Mnemos 服务地址（不带尾斜杠，不带 /v1）。 */
     baseUrl: string;
-    /** 组织级 API Key（`mnemos_live_*` 的 org key）：可访问/创建本组织任意分区。 */
+    /** 组织级 API Key（`mnemos_live_*` 的 org key）：可访问/创建本组织任意分区；留空 = 本地免密（请求不带 Authorization）。 */
     orgApiKey: string;
     /** 默认人（记忆主体）的 external_id；工具可显式传 person_id 读写其他人。 */
     personId: string;

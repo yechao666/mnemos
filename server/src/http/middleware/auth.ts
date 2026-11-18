@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { ROLE_RANK } from '../../../../shared/src/constants.ts';
-import type { ApiScope, Org, Partition, Role, User } from '../../../../shared/src/types.ts';
+import type { ApiKey, ApiScope, Org, Partition, Role, User } from '../../../../shared/src/types.ts';
 import type { AppContext } from '../../contracts.ts';
 import { findPartitionRow, loadStatsRow } from '../../engine/partition.ts';
 import { sha256, nowIso } from '../../lib/ids.ts';
@@ -260,8 +260,41 @@ export function authenticateApiKey(rc: RequestContext): ApiKeyAuth {
   return withAuthFailureCounter(rc, () => authenticateApiKeyInner(rc));
 }
 
+/**
+ * v6.5 本地免密（MNEMOS_DEV_NO_API_KEY=1）：跳过 API Key 校验，以第一个 owner 的身份
+ * 合成一个不落库的 org 级 key（admin 作用域），便于本地 DSH 插件免 orgApiKey 调试。
+ * 生产环境由 validateEnv 拒绝；未开启该开关时本函数不参与任何路径。
+ */
+function devNoApiKeyAuth(app: AppContext, rc: RequestContext): ApiKeyAuth {
+  const owner = firstOwnerUser(app.db);
+  if (!owner) throw errors.unavailable('已开启 MNEMOS_DEV_NO_API_KEY，但数据库中还没有任何用户');
+  const org = loadOrg(app.db, owner.org_id);
+  if (!org) throw errors.unavailable('已开启 MNEMOS_DEV_NO_API_KEY，但该用户所属组织不存在');
+
+  const key: ApiKey = {
+    id: 'key_dev_no_auth',
+    orgId: org.id,
+    kind: 'org',
+    name: 'dev-no-api-key (MNEMOS_DEV_NO_API_KEY)',
+    prefix: 'mnemos_dev',
+    scopes: ['memories:read', 'memories:write', 'admin'],
+    createdBy: owner.id,
+    createdAt: nowIso(),
+    allowedIps: [],
+    rateLimitPerMin: 100_000,
+  };
+
+  consumeRateLimit(rc, key.id, key.rateLimitPerMin);
+  return { kind: 'api_key', key, org, partition: undefined };
+}
+
 function authenticateApiKeyInner(rc: RequestContext): ApiKeyAuth {
   const { app } = rc;
+
+  if (app.env.devNoApiKey) {
+    return devNoApiKeyAuth(app, rc);
+  }
+
   const token = getBearerToken(rc.req);
 
   if (!token) {

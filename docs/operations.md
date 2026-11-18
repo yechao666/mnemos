@@ -132,6 +132,7 @@ pnpm start
 | `MNEMOS_BACKUP_DIR` | `$DATA_DIR/backups` | 备份目录（需可写） |
 | `MNEMOS_DEMO` | `1` | **生产设 0**，禁止空库写入演示数据 |
 | `MNEMOS_AUTH_DISABLED` | `0` | 仅本机调试；生产启动直接拒绝 |
+| `MNEMOS_DEV_NO_API_KEY` | `0` | v6.5 本地免密：`/v1` 无需 API Key（以第一个 owner 合成 org key）；仅本地开发，生产启动直接拒绝 |
 | `MNEMOS_SESSION_TTL_HOURS` | `72` | 控制台会话有效期 |
 | `MNEMOS_LOGIN_MAX_ATTEMPTS/LOCK_MINUTES` | `5` / `15` | 登录锁定 |
 | `MNEMOS_LOG_LEVEL/FORMAT` | `info` / 生产 `json` | 日志 |
@@ -152,7 +153,12 @@ pnpm start
 | `MNEMOS_STORAGE` | `sqlite` | postgres 未实现，启动会拒绝 |
 
 启动时 `assertEnv` 校验：数据/备份目录可写、端口/超时/维护间隔/日志级别合法、
-生产禁止 `AUTH_DISABLED`；失败直接退出。
+生产禁止 `AUTH_DISABLED` 与 `DEV_NO_API_KEY`；失败直接退出。
+
+> **本地免密（v6.5，仅开发）**：`MNEMOS_DEV_NO_API_KEY=1` 时 `/v1` 跳过 API Key 校验，
+> 以库中第一个 `owner` 身份合成一把 org 级 Key（`admin` 作用域、不落库）；DSH 插件
+> `orgApiKey` 可留空。仅限本机开发，`NODE_ENV=production` 时启动校验会直接拒绝。
+> 公开探针（`/health` 等）不受影响，控制台 `/api` 鉴权也不受影响。
 
 ## 4. 数据与备份
 

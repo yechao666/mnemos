@@ -1,5 +1,5 @@
 /**
- * Agent 工具集合（8 个 `mnemos_*`，Mnemos v6）。
+ * Agent 工具集合（12 个 `mnemos_*`，Mnemos v6）。
  *
  * 设计约束（与旧插件 dsh-mnemos 保持一致，原因见 `src/dsh-types.d.ts`）：
  * - 参数与输出都是**手写原始 JSON Schema**，不在运行时 import `@deepseek-ai/dsh-tools`；
@@ -19,10 +19,14 @@
  * - 写记忆走人级端点 `POST /v1/partitions/:p/persons/:person/memories`；
  * - 分区统计读 `GET /v1/partitions/:p/stats`（partition_stats），人的计数读 persons 行上的
  *   `memory_count / shared_memory_count / session_count`，不做 COUNT(*)。
+ * - v6.5 补齐：人物画像（profile）、记忆历史（history）、反馈（feedback）、更新（update）。
+ *
+ * 鉴权：配置了 orgApiKey 就带 Bearer；留空 = 本地免密模式（请求不带 Authorization，
+ * 服务端以 `MNEMOS_DEV_NO_API_KEY=1` 启动）。status 工具照常探测，不用 key 也能自检。
  */
 import type { ToolDefinition } from './dsh-types.js';
 import type { MnemosConfig } from './config.js';
-import { MnemosClient, type MnemosMemory } from './mnemos-client.js';
+import { MnemosClient, type MnemosMemory, type MnemosMemoryHistoryEntry, type MnemosPersonFact } from './mnemos-client.js';
 import { type WorkspacePathResolver } from './workspace.js';
 /** 读取活配置的回调（每次工具调用都重新解析，设置改动即时生效）。 */
 type ConfigSource = () => MnemosConfig;
@@ -169,6 +173,73 @@ interface PersonResult {
 }
 /** 人管理：list（游标列表）/ get（详情）/ upsert（建档或更新资料）。 */
 export declare function mnemosPersonTool(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): ToolDefinition<PersonArgs, PersonResult>;
+interface ProfileArgs {
+    person_id?: string;
+    force?: boolean;
+}
+interface ProfileResult {
+    ok: boolean;
+    error?: string;
+    action?: string;
+    warning?: string;
+    person_id?: string;
+    person?: Record<string, unknown>;
+    facts?: MnemosPersonFact[];
+    fact_count?: number;
+    summary?: string;
+    generated_at?: string;
+    cached?: boolean;
+}
+/** 人的画像：v6.1 结构化 facts + 服务端摘要（force=true 强制重新生成）。 */
+export declare function mnemosProfileTool(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): ToolDefinition<ProfileArgs, ProfileResult>;
+interface HistoryArgs {
+    id: string;
+}
+interface HistoryResult {
+    ok: boolean;
+    error?: string;
+    action?: string;
+    warning?: string;
+    id?: string;
+    count?: number;
+    items?: MnemosMemoryHistoryEntry[];
+}
+/** 记忆变更历史：ADD / UPDATE / MERGE / SUPERSEDE / FEEDBACK … 的事件时间线。 */
+export declare function mnemosHistoryTool(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): ToolDefinition<HistoryArgs, HistoryResult>;
+interface FeedbackArgs {
+    id: string;
+    helpful: boolean;
+    query?: string;
+}
+interface FeedbackResult {
+    ok: boolean;
+    error?: string;
+    action?: string;
+    warning?: string;
+    id?: string;
+    confidence?: number;
+    feedback_up?: number;
+    feedback_down?: number;
+    status?: string;
+}
+/** 记忆反馈：标记某条检索结果有用 / 没用（服务端升降 confidence 并计数）。 */
+export declare function mnemosFeedbackTool(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): ToolDefinition<FeedbackArgs, FeedbackResult>;
+interface UpdateArgs {
+    id: string;
+    content?: string;
+    importance?: number;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+}
+interface UpdateResult {
+    ok: boolean;
+    error?: string;
+    action?: string;
+    warning?: string;
+    memory?: Record<string, unknown>;
+}
+/** 更新一条记忆：正文 / 重要度 / 标签 / 元数据（PATCH；readOnly 拦截）。 */
+export declare function mnemosUpdateTool(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): ToolDefinition<UpdateArgs, UpdateResult>;
 interface StatusResult {
     ok: boolean;
     error?: string;
@@ -177,16 +248,24 @@ interface StatusResult {
     reachable: boolean;
     baseUrl: string;
     apiKeyConfigured: boolean;
+    /** 鉴权模式：orgKey=已配置 orgApiKey；none=本地免密（请求不带 Authorization）。 */
+    authMode: 'orgKey' | 'none';
     partitionSlug?: string;
     partitionExists?: boolean;
     personId?: string;
     personType?: string;
     personExists?: boolean;
 }
-/** 连接自检：服务可达性、分区是否可达、默认人是否存在、org key 是否配置（不打印密钥）。 */
+/**
+ * 连接自检：服务可达性、鉴权模式、分区是否可达、默认人是否存在（不打印密钥）。
+ *
+ * 免密模式（orgApiKey 为空）不再提前返回：照常 GET 分区 / 人，
+ * 服务端以 `MNEMOS_DEV_NO_API_KEY=1` 启动时能通过；仍返回 401 / 403 时
+ * `reachable=false` 并给出「配置 orgApiKey，或本地以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos」。
+ */
 export declare function mnemosStatusTool(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): ToolDefinition<Record<string, never>, StatusResult>;
 /** 本插件的全部工具（顺序即注册顺序，也是 Agent 看到的大致顺序）。 */
 export declare function createMnemosTools(client: MnemosClient, config: ConfigSource, resolveWorkspacePath: WorkspacePathResolver): Array<ToolDefinition<any, any>>;
 /** 工具名清单（装配测试 / 文档用）。 */
-export declare const MNEMOS_TOOL_NAMES: readonly ["mnemos_workspace", "mnemos_add", "mnemos_search", "mnemos_get", "mnemos_brief", "mnemos_context", "mnemos_person", "mnemos_status"];
+export declare const MNEMOS_TOOL_NAMES: readonly ["mnemos_workspace", "mnemos_add", "mnemos_search", "mnemos_get", "mnemos_brief", "mnemos_context", "mnemos_person", "mnemos_profile", "mnemos_history", "mnemos_feedback", "mnemos_update", "mnemos_status"];
 export {};

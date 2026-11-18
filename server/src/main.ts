@@ -20,6 +20,12 @@ try {
   process.exit(1);
 }
 
+if (env.devNoApiKey) {
+  console.warn(
+    '[mnemos] 警告：MNEMOS_DEV_NO_API_KEY=1 —— v1 API 已跳过 API Key 鉴权（以第一个 owner 身份），仅限本地开发，生产禁止',
+  );
+}
+
 ensureDir(env.dataDir);
 ensureDir(env.backupDir);
 

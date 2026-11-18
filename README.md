@@ -277,6 +277,9 @@ pnpm dev        # 启动 http://127.0.0.1:4380（node --watch）
   （Vite 4381，代理 `/api`、`/v1` 到 4380）。
 - 数据目录默认 `data-v6/`（已 gitignore）；环境变量示例见 [`.env.example`](.env.example)。
   服务端**不会自动加载 `.env`**：需要时用 `node --env-file=.env server/src/main.ts`。
+- **本地免密（v6.5，仅开发）**：`MNEMOS_DEV_NO_API_KEY=1 pnpm dev` 后 `/v1` 无需 API Key
+  （服务端以库中第一个 owner 身份合成 org 级 key，可直接建分区/读写记忆），DSH 插件
+  `orgApiKey` 可留空。默认关闭；`NODE_ENV=production` 开启会被启动校验直接拒绝。
 - **启用大模型（可选）**：启动前设 `MNEMOS_LLM_BASE_URL` + `MNEMOS_LLM_API_KEY`
   （+ `MNEMOS_LLM_MODEL`，默认 `gpt-4o-mini`）即启用环境变量回退；或登录控制台 →
   组织设置 → **模型设置**，新建供应商并给 `brief/dream/profile/privacy` 分配模型（推荐，
@@ -483,7 +486,8 @@ DeepSeek Harness（dsh）：
   dsh plugin --profile desktop add link:$PWD
   ```
 
-  然后在「设置 → 插件 → dsh-mnemos-personal」填 `baseUrl` 与 `orgApiKey`。
+  然后在「设置 → 插件 → dsh-mnemos-personal」填 `baseUrl` 与 `orgApiKey`
+  （本地开发若服务端开了 `MNEMOS_DEV_NO_API_KEY=1`，`orgApiKey` 可留空）。
 
 ---
 

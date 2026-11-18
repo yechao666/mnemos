@@ -58,7 +58,7 @@ function addRequestOf(fake) {
 }
 
 describe('工具清单', () => {
-  it('注册 8 个 mnemos_* 工具，名称与文档一致', async () => {
+  it('注册 12 个 mnemos_* 工具，名称与文档一致', async () => {
     const fake = await createMnemosFake()
     try {
       const harness = makeHarness(fake)
@@ -66,7 +66,10 @@ describe('工具清单', () => {
         harness.tools.map((tool) => tool.name),
         [...MNEMOS_TOOL_NAMES],
       )
-      assert.equal(harness.tools.length, 8)
+      assert.equal(harness.tools.length, 12)
+      for (const toolName of ['mnemos_profile', 'mnemos_history', 'mnemos_feedback', 'mnemos_update']) {
+        assert.ok(MNEMOS_TOOL_NAMES.includes(toolName), `缺少工具 ${toolName}`)
+      }
     } finally {
       await fake.close()
     }
@@ -464,6 +467,210 @@ describe('mnemos_brief / mnemos_context', () => {
   })
 })
 
+describe('mnemos_profile：画像 facts + 摘要', () => {
+  it('返回 facts / summary；force=true 请求 ?force=1 并重算', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const slug = workspaceSlug('/work/demo')
+      fake.seedPartition(slug, 'demo')
+      fake.seedFact(slug, 'dsh-agent', { key: 'city', value: '上海', confidence: 0.95 })
+      fake.seedFact(slug, 'dsh-agent', { key: 'role', value: '后端工程师', confidence: 0.8 })
+      const { byName, exec } = makeHarness(fake)
+      const tool = byName.get('mnemos_profile')
+
+      assert.equal(tool.parameters.properties.person_id.type, 'string')
+      assert.equal(tool.parameters.properties.force.type, 'boolean')
+      assert.equal(tool.output.schema.properties.facts.type, 'array')
+
+      const result = await tool.execute({}, exec())
+      assert.equal(result.ok, true, result.error)
+      assert.equal(result.person_id, 'dsh-agent')
+      assert.equal(result.fact_count, 2)
+      assert.equal(result.facts[0].key, 'city')
+      assert.match(result.summary, /上海/)
+      const rendered = renderOf(tool, {}, result)
+      assert.match(rendered, /Mnemos 画像/)
+      assert.match(rendered, /city: 上海/)
+      assert.match(rendered, /摘要：/)
+
+      const forced = await tool.execute({ person_id: 'dsh-agent', force: true }, exec())
+      assert.equal(forced.ok, true, forced.error)
+      assert.equal(forced.cached, false)
+      const profileRequests = fake.requests.filter((request) => request.pathname.endsWith('/profile'))
+      assert.equal(profileRequests.at(-1).query.force, '1')
+    } finally {
+      await fake.close()
+    }
+  })
+})
+
+describe('mnemos_history：事件时间线', () => {
+  it('渲染 ADD → UPDATE → FEEDBACK（event / actor / old→new，新→旧）', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const { byName, exec } = makeHarness(fake)
+      const add = await byName.get('mnemos_add').execute({ text: '旧版本', scope: 'person' }, exec())
+      assert.equal(add.ok, true, add.error)
+      const id = add.results[0].id
+      const update = await byName.get('mnemos_update').execute({ id, content: '新版本' }, exec())
+      assert.equal(update.ok, true, update.error)
+      const feedback = await byName.get('mnemos_feedback').execute({ id, helpful: true }, exec())
+      assert.equal(feedback.ok, true, feedback.error)
+
+      const tool = byName.get('mnemos_history')
+      assert.equal(tool.parameters.required.includes('id'), true)
+      const result = await tool.execute({ id }, exec())
+      assert.equal(result.ok, true, result.error)
+      assert.equal(result.id, id)
+      assert.equal(result.count, 3)
+      assert.deepEqual(
+        result.items.map((item) => item.event),
+        ['FEEDBACK', 'UPDATE', 'ADD'],
+      )
+      const rendered = renderOf(tool, { id }, result)
+      assert.match(rendered, /Mnemos 记忆历史/)
+      assert.match(rendered, /FEEDBACK · 2026-11-17T00:00:00.000Z · actor=api_key:test/)
+      assert.match(rendered, /旧：旧版本 → 新：新版本/)
+      assert.match(rendered, /新：旧版本/)
+
+      const missingId = await tool.execute({ id: '  ' }, exec())
+      assert.equal(missingId.ok, false)
+      assert.match(missingId.action, /mem_/)
+
+      const notFound = await tool.execute({ id: 'mem_999' }, exec())
+      assert.equal(notFound.ok, false)
+      assert.match(notFound.error, /404/)
+      assert.equal(renderOf(tool, { id: 'mem_999' }, notFound).startsWith('mnemos_history 失败：'), true)
+    } finally {
+      await fake.close()
+    }
+  })
+})
+
+describe('mnemos_feedback：有用 / 没用', () => {
+  it('helpful=true 升 confidence、记 feedback_up；请求体为 {helpful, query}', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const { byName, exec } = makeHarness(fake)
+      const add = await byName.get('mnemos_add').execute({ text: '可反馈记忆', scope: 'person' }, exec())
+      const id = add.results[0].id
+      const tool = byName.get('mnemos_feedback')
+      assert.equal(tool.parameters.required.includes('helpful'), true)
+      assert.equal(tool.parameters.required.includes('id'), true)
+
+      const result = await tool.execute({ id, helpful: true, query: '部署' }, exec())
+      assert.equal(result.ok, true, result.error)
+      assert.equal(result.id, id)
+      assert.equal(result.confidence, 0.85)
+      assert.equal(result.feedback_up, 1)
+      assert.equal(result.feedback_down, 0)
+      const request = fake.requests.find((item) => item.pathname.endsWith('/feedback'))
+      assert.deepEqual(request.body, { helpful: true, query: '部署' })
+
+      const rendered = renderOf(tool, { id, helpful: true }, result)
+      assert.match(rendered, /反馈已记录/)
+      assert.match(rendered, /信心 0.85/)
+      assert.match(rendered, /有用 1/)
+
+      const down = await tool.execute({ id, helpful: false }, exec())
+      assert.equal(down.ok, true, down.error)
+      assert.equal(down.feedback_up, 1)
+      assert.equal(down.feedback_down, 1)
+    } finally {
+      await fake.close()
+    }
+  })
+
+  it('缺 id / helpful 非布尔 → 可操作错误，不发请求', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const { byName, exec } = makeHarness(fake)
+      const tool = byName.get('mnemos_feedback')
+      const missing = await tool.execute({ helpful: true }, exec())
+      assert.equal(missing.ok, false)
+      assert.match(missing.action, /mem_/)
+
+      const bad = await tool.execute({ id: 'mem_1', helpful: 'yes' }, exec())
+      assert.equal(bad.ok, false)
+      assert.match(bad.action, /helpful=true/)
+      assert.equal(fake.requests.filter((item) => item.pathname.endsWith('/feedback')).length, 0)
+    } finally {
+      await fake.close()
+    }
+  })
+})
+
+describe('mnemos_update：PATCH 记忆', () => {
+  it('只发显式字段，返回更新后摘要，并进历史', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const { byName, exec } = makeHarness(fake)
+      const add = await byName.get('mnemos_add').execute({ text: '待更新', scope: 'person' }, exec())
+      const id = add.results[0].id
+      const tool = byName.get('mnemos_update')
+      assert.equal(tool.parameters.required.includes('id'), true)
+      for (const key of ['content', 'importance', 'tags', 'metadata']) {
+        assert.ok(tool.parameters.properties[key], `缺少参数 ${key}`)
+      }
+
+      const result = await tool.execute(
+        { id, content: '新正文', importance: 0.7, tags: ['x'], metadata: { k: 1 } },
+        exec(),
+      )
+      assert.equal(result.ok, true, result.error)
+      assert.equal(result.memory.id, id)
+      assert.equal(result.memory.content, '新正文')
+      assert.equal(result.memory.importance, 0.7)
+      assert.deepEqual(result.memory.tags, ['x'])
+      assert.deepEqual(result.memory.metadata, { k: 1 })
+
+      const patch = fake.requests.find((request) => request.method === 'PATCH')
+      assert.deepEqual(patch.body, { content: '新正文', importance: 0.7, tags: ['x'], metadata: { k: 1 } })
+      assert.equal(patch.pathname, `/v1/partitions/${workspaceSlug('/work/demo')}/memories/${id}`)
+
+      const rendered = renderOf(tool, { id }, result)
+      assert.match(rendered, /已更新 Mnemos 记忆/)
+      assert.match(rendered, /新正文/)
+      assert.match(rendered, /重要度 0.7/)
+      assert.match(rendered, /标签：x/)
+
+      const history = await byName.get('mnemos_history').execute({ id }, exec())
+      assert.equal(history.count, 2)
+      assert.equal(history.items[0].event, 'UPDATE')
+    } finally {
+      await fake.close()
+    }
+  })
+
+  it('缺 id / 无可更新字段 / importance 越界 → 可操作错误，不发 PATCH', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const { byName, exec } = makeHarness(fake)
+      const tool = byName.get('mnemos_update')
+
+      const missingId = await tool.execute({ content: 'x' }, exec())
+      assert.equal(missingId.ok, false)
+      assert.match(missingId.action, /mem_/)
+
+      const empty = await tool.execute({ id: 'mem_1' }, exec())
+      assert.equal(empty.ok, false)
+      assert.match(empty.error, /至少/)
+
+      const badImportance = await tool.execute({ id: 'mem_1', importance: 2 }, exec())
+      assert.equal(badImportance.ok, false)
+      assert.match(badImportance.action, /0 到 1/)
+
+      const badTags = await tool.execute({ id: 'mem_1', tags: [1] }, exec())
+      assert.equal(badTags.ok, false)
+      assert.match(badTags.error, /字符串数组/)
+
+      assert.equal(fake.requests.filter((request) => request.method === 'PATCH').length, 0)
+    } finally {
+      await fake.close()
+    }
+  })
+})
+
 describe('mnemos_person：list / get / upsert', () => {
   it('upsert 建档后可 list / get；拒绝内部 id 做 upsert', async () => {
     const fake = await createMnemosFake()
@@ -547,10 +754,16 @@ describe('readOnly 模式', () => {
       assert.equal(upsert.ok, false)
       assert.match(upsert.error, /readOnly/)
 
+      const update = await byName.get('mnemos_update').execute({ id: 'mem_1', content: 'x' }, exec())
+      assert.equal(update.ok, false)
+      assert.match(update.error, /readOnly/)
+      assert.match(update.action, /readOnly/)
+
       const writes = fake.requests.filter(
         (request) => request.method === 'POST' && request.pathname.includes('/memories'),
       )
       assert.equal(writes.length, 0)
+      assert.equal(fake.requests.filter((request) => request.method === 'PATCH').length, 0)
       assert.equal(
         fake.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/persons/')).length,
         0,
@@ -578,6 +791,7 @@ describe('mnemos_status：连接自检', () => {
       assert.equal(result.ok, true, result.error)
       assert.equal(result.reachable, true)
       assert.equal(result.apiKeyConfigured, true)
+      assert.equal(result.authMode, 'orgKey')
       assert.equal(result.partitionExists, true)
       assert.equal(result.personExists, true)
       assert.equal(result.partitionSlug, workspaceSlug('/work/demo'))
@@ -593,15 +807,46 @@ describe('mnemos_status：连接自检', () => {
     }
   })
 
-  it('orgApiKey 缺失时不发请求，直接报配置缺失', async () => {
+  it('orgApiKey 缺失时照常探测；服务端 401 → reachable=false + 免密 / key 提示', async () => {
     const fake = await createMnemosFake()
     try {
+      fake.seedPartition(workspaceSlug('/work/demo'), 'demo')
       const { byName, exec } = makeHarness(fake, { orgApiKey: '' })
       const result = await byName.get('mnemos_status').execute({}, exec())
       assert.equal(result.ok, false)
       assert.equal(result.apiKeyConfigured, false)
+      assert.equal(result.authMode, 'none')
+      assert.equal(result.reachable, false)
+      assert.match(result.error, /401|INVALID_API_KEY/)
       assert.match(result.action, /orgApiKey/)
-      assert.equal(fake.requests.length, 0)
+      assert.match(result.action, /MNEMOS_DEV_NO_API_KEY=1/)
+      assert.ok(
+        fake.requests.some(
+          (request) => request.method === 'GET' && request.pathname === `/v1/partitions/${workspaceSlug('/work/demo')}`,
+        ),
+        '免密模式也要真的探测分区（不再提前返回）',
+      )
+    } finally {
+      await fake.close()
+    }
+  })
+
+  it('orgApiKey 缺失 + 服务端免密（MNEMOS_DEV_NO_API_KEY=1）时自检通过，authMode=none', async () => {
+    const fake = await createMnemosFake({ noAuth: true })
+    try {
+      fake.seedPartition(workspaceSlug('/work/demo'), 'demo')
+      fake.seedPerson(workspaceSlug('/work/demo'), 'dsh-agent', { type: 'agent' })
+      const { byName, exec } = makeHarness(fake, { orgApiKey: '' })
+      const result = await byName.get('mnemos_status').execute({}, exec())
+      assert.equal(result.ok, true, result.error)
+      assert.equal(result.reachable, true)
+      assert.equal(result.authMode, 'none')
+      assert.equal(result.apiKeyConfigured, false)
+      assert.equal(result.partitionExists, true)
+      assert.equal(result.personExists, true)
+      const rendered = renderOf(byName.get('mnemos_status'), {}, result)
+      assert.match(rendered, /免密模式/)
+      assert.equal(fake.requests.every((request) => request.authorization === undefined), true)
     } finally {
       await fake.close()
     }

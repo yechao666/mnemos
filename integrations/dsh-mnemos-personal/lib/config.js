@@ -25,7 +25,14 @@ export const Config = z.object({
     // `.volatile()`：字段可热更新，且只有它会被投影到设置表单。
     baseUrl: z.string().default('http://127.0.0.1:4380').volatile(),
     // `role('secret')`：走脱敏通道，密钥字面量不下发浏览器、不进日志。
-    orgApiKey: z.string().role('secret').default('').volatile(),
+    // 可留空：本地免密模式（请求不带 Authorization，服务端以 MNEMOS_DEV_NO_API_KEY=1 启动）。
+    orgApiKey: z
+        .string()
+        .role('secret')
+        .default('')
+        .description('可留空（本地免密）：留空时请求不带 Authorization，需本地以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos；' +
+        '填写时用控制台「密钥」创建的 kind=org Key（自动建分区需要 admin）。')
+        .volatile(),
     personId: z.string().default('dsh-agent').volatile(),
     personType: z
         .union([z.const('human'), z.const('agent'), z.const('service')])

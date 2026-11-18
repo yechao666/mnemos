@@ -3,6 +3,9 @@
  *
  * 契约来源：本仓库 `docs/v6-architecture.md` 第 3 节「API（v6，干净面）」：
  * - 鉴权：`Authorization: Bearer mnemos_live_*`；org key 可访问/创建本组织任意分区。
+ *   本地免密：`orgApiKey` 留空时请求**不带 Authorization**，服务端以 `MNEMOS_DEV_NO_API_KEY=1`
+ *   启动时跳过 key 校验；服务端仍返回 401 / 403 时，错误 `action` 会提示
+ *   「配置 orgApiKey，或本地以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos」。
  * - 端点默认挂在 `/v1/partitions/:partition/...`，`:partition` 支持分区 id 或 slug。
  * - JSON 一律 snake_case。
  * - 人 / 记忆列表统一**游标分页**：响应 `{ items, next_cursor, partition_stats }`，
@@ -88,6 +91,18 @@ function actionFor(status, code) {
         return 'Mnemos 服务暂时不可用：确认服务已启动后重试。';
     }
     return '检查 baseUrl / orgApiKey 与 Mnemos 服务日志后重试。';
+}
+/**
+ * 未配置 orgApiKey（免密模式）时服务端仍要求鉴权的提示。
+ *
+ * 本地开发：以 `MNEMOS_DEV_NO_API_KEY=1` 启动 Mnemos 即可不校验 key；
+ * 否则在设置页填 orgApiKey。这段文案同时被 status 工具复用。
+ */
+export const NO_API_KEY_ACTION = '配置 orgApiKey，或本地以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos 后重试。';
+/** 免密模式下 401 / 403 的错误 action（带「为什么不带 Authorization」的说明）。 */
+function noApiKeyAuthAction(status) {
+    const suffix = status === 403 ? '（服务端也可能要求 key 的 admin / 分区作用域）' : '';
+    return `请求未携带 Authorization（orgApiKey 未配置）：${NO_API_KEY_ACTION}${suffix}`;
 }
 /** 网络层异常（fetch 直接 reject）统一归一。 */
 function isTimeoutError(error) {
@@ -230,6 +245,54 @@ function normalizeSearch(payload) {
     return result;
 }
 /**
+ * 画像响应归一：容忍 `{ profile }` 包装 / 裸对象；facts 容忍 `items` 包装或裸数组。
+ * 服务端 v6.1 的响应是 `{ person, facts, summary, generated_at, cached }`。
+ */
+export function extractPersonProfile(payload) {
+    const root = asRecord(payload);
+    const node = asRecord(root?.profile) ?? root ?? {};
+    const profile = { raw: payload };
+    const person = asRecord(node.person);
+    if (person !== undefined)
+        profile.person = person;
+    const factsRaw = Array.isArray(node.facts)
+        ? node.facts
+        : Array.isArray(asRecord(node.facts)?.items)
+            ? asRecord(node.facts)?.items
+            : [];
+    profile.facts = factsRaw.filter(isRecord);
+    const summary = node.summary;
+    if (typeof summary === 'string')
+        profile.summary = summary;
+    const generatedAt = stringField(node, 'generated_at', 'generatedAt');
+    if (generatedAt !== undefined)
+        profile.generated_at = generatedAt;
+    const cached = node.cached;
+    if (typeof cached === 'boolean')
+        profile.cached = cached;
+    return profile;
+}
+/** 历史响应归一：`{ items }` / `{ history }` / 裸数组。 */
+export function extractMemoryHistory(payload) {
+    const record = asRecord(payload);
+    if (record !== undefined) {
+        for (const key of ['items', 'history', 'events']) {
+            const value = record[key];
+            if (Array.isArray(value))
+                return value.filter(isRecord);
+        }
+    }
+    if (Array.isArray(payload))
+        return payload.filter(isRecord);
+    return [];
+}
+/** 单条记忆变更响应归一：`{ memory }` / 裸记忆对象。 */
+export function extractMemoryMutation(payload) {
+    const record = asRecord(payload);
+    const memory = (asRecord(record?.memory) ?? asRecord(record?.result) ?? record);
+    return { memory, raw: payload };
+}
+/**
  * 读取活配置的 Mnemos 客户端：每次请求都重新解析配置，
  * 因此设置页改动（baseUrl / orgApiKey / personId …）无需重建客户端或重挂工具。
  */
@@ -253,6 +316,14 @@ export class MnemosClient {
     /** 当前是否配置了 org API Key（只报布尔，绝不返回密钥）。 */
     isApiKeyConfigured() {
         return Boolean((this.config().orgApiKey ?? '').trim());
+    }
+    /**
+     * 当前鉴权模式：
+     * - `orgKey`：配置了 orgApiKey，请求带 `Authorization: Bearer …`；
+     * - `none`：留空（本地免密，请求不带 Authorization）。
+     */
+    authMode() {
+        return this.isApiKeyConfigured() ? 'orgKey' : 'none';
     }
     /** 生效超时（毫秒）。 */
     getTimeoutMs() {
@@ -293,17 +364,13 @@ export class MnemosClient {
                     url.searchParams.set(key, String(value));
             }
         }
+        // 鉴权：配置了 orgApiKey 就带 Bearer；留空则为「免密模式」，**不发 Authorization**
+        //（服务端以 MNEMOS_DEV_NO_API_KEY=1 启动时不校验 key）。不再本地短路：
+        // 让请求真正到达服务端，由服务端的 401 / 403 报出可操作的下一步。
         const apiKey = (this.config().orgApiKey ?? '').trim();
-        if (!apiKey) {
-            throw new MnemosApiError({
-                message: '未配置 Mnemos org API Key：orgApiKey 为空。',
-                code: 'missing_api_key',
-                action: '在「设置 → 插件 → dsh-mnemos-personal」填写 orgApiKey（控制台「密钥」创建 kind=org 的 Key，建议带 admin）。',
-                method,
-                path,
-            });
-        }
-        const headers = { Accept: 'application/json', Authorization: `Bearer ${apiKey}` };
+        const headers = { Accept: 'application/json' };
+        if (apiKey !== '')
+            headers.Authorization = `Bearer ${apiKey}`;
         if (options.body !== undefined)
             headers['Content-Type'] = 'application/json';
         let response;
@@ -341,7 +408,10 @@ export class MnemosClient {
             const code = stringField(error, 'code') ?? `http_${response.status}`;
             const detail = stringField(error, 'message') ?? (typeof payload === 'string' ? payload.slice(0, 500) : response.statusText);
             const requestId = stringField(error, 'requestId', 'request_id') ?? response.headers.get('x-request-id') ?? undefined;
-            const action = actionFor(response.status, code);
+            // 免密模式下的 401 / 403 用专用提示；其余情况沿用按状态码归一的 action。
+            const action = apiKey === '' && (response.status === 401 || response.status === 403)
+                ? noApiKeyAuthAction(response.status)
+                : actionFor(response.status, code);
             throw new MnemosApiError({
                 message: `Mnemos ${method} ${path} -> ${response.status} ${code}: ${detail}（${action}）`,
                 status: response.status,
@@ -494,6 +564,11 @@ export class MnemosClient {
             body,
         });
     }
+    /** `GET /v1/partitions/:p/persons/:person/profile` —— 人的画像（facts + summary；force=1 强制刷新）。 */
+    async getPersonProfile(partitionRef, personRef, options = {}) {
+        const payload = await this.request('GET', this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}/profile`), { query: { force: options.force === true ? '1' : undefined } });
+        return extractPersonProfile(payload);
+    }
     /** `GET /v1/partitions/:p/persons/:person/dream` —— 人级做梦状态。 */
     getPersonDream(partitionRef, personRef) {
         return this.request('GET', this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}/dream`));
@@ -605,5 +680,20 @@ export class MnemosClient {
     /** `GET /v1/partitions/:p/memories/:id` —— 记忆详情。 */
     getMemory(partitionRef, id) {
         return this.request('GET', this.partitionPath(partitionRef, `/memories/${encodeURIComponent(id)}`));
+    }
+    /** `GET /v1/partitions/:p/memories/:id/history` —— 该记忆的变更历史（新→旧）。 */
+    async getMemoryHistory(partitionRef, id) {
+        const payload = await this.request('GET', this.partitionPath(partitionRef, `/memories/${encodeURIComponent(id)}/history`));
+        return extractMemoryHistory(payload);
+    }
+    /** `POST /v1/partitions/:p/memories/:id/feedback` —— 记一次有用 / 没用（升降 confidence）。 */
+    async feedbackMemory(partitionRef, id, body) {
+        const payload = await this.request('POST', this.partitionPath(partitionRef, `/memories/${encodeURIComponent(id)}/feedback`), { body });
+        return extractMemoryMutation(payload);
+    }
+    /** `PATCH /v1/partitions/:p/memories/:id` —— 更新记忆（content / importance / tags / metadata …）。 */
+    async updateMemory(partitionRef, id, body) {
+        const payload = await this.request('PATCH', this.partitionPath(partitionRef, `/memories/${encodeURIComponent(id)}`), { body });
+        return extractMemoryMutation(payload);
     }
 }

@@ -346,6 +346,87 @@ describe('MnemosClient 人 / 记忆读写', () => {
   })
 })
 
+describe('MnemosClient v6.1 画像 / 历史 / 反馈 / 更新', () => {
+  it('getPersonProfile 走 /profile，渲染数据来自 facts + summary；force=1 不命中缓存', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const partition = fake.seedPartition('ws-demo-1234abcd', 'demo')
+      fake.seedFact(partition.slug, 'dsh-agent', { key: 'city', value: '上海', confidence: 0.95 })
+      const client = makeClient(fake.url)
+
+      const cached = await client.getPersonProfile(partition.slug, 'dsh-agent')
+      assert.equal(cached.facts.length, 1)
+      assert.equal(cached.facts[0].key, 'city')
+      assert.equal(cached.facts[0].value, '上海')
+      assert.match(cached.summary, /上海/)
+      assert.equal(cached.cached, true)
+      assert.equal(fake.requests.find((item) => item.pathname.endsWith('/profile')).query.force, undefined)
+
+      const forced = await client.getPersonProfile(partition.slug, 'dsh-agent', { force: true })
+      assert.equal(forced.cached, false)
+      const profileRequests = fake.requests.filter((item) => item.pathname.endsWith('/profile'))
+      assert.equal(profileRequests.at(-1).query.force, '1')
+    } finally {
+      await fake.close()
+    }
+  })
+
+  it('getMemoryHistory / feedbackMemory / updateMemory 走对应端点并归一 memory', async () => {
+    const fake = await createMnemosFake()
+    try {
+      const partition = fake.seedPartition('ws-demo-1234abcd', 'demo')
+      fake.seedPerson(partition.slug, 'dsh-agent', { type: 'agent' })
+      const client = makeClient(fake.url)
+
+      const written = await client.addMemory(partition.slug, 'dsh-agent', { text: '旧内容', scope: 'person' })
+      const id = written.memories[0].id
+      assert.ok(id)
+
+      const history = await client.getMemoryHistory(partition.slug, id)
+      assert.equal(history.length, 1)
+      assert.equal(history[0].event, 'ADD')
+      assert.equal(history[0].new_content, '旧内容')
+      assert.equal(history[0].actor, 'api_key:test')
+
+      const feedback = await client.feedbackMemory(partition.slug, id, { helpful: true, query: '怎么部署' })
+      assert.equal(feedback.memory.confidence, 0.85)
+      assert.equal(feedback.memory.feedback_up, 1)
+      assert.equal(feedback.memory.feedback_down, 0)
+      const feedbackRequest = fake.requests.find((item) => item.pathname.endsWith('/feedback'))
+      assert.deepEqual(feedbackRequest.body, { helpful: true, query: '怎么部署' })
+
+      const updated = await client.updateMemory(partition.slug, id, {
+        content: '新内容',
+        importance: 0.9,
+        tags: ['a'],
+        metadata: { k: 'v' },
+      })
+      assert.equal(updated.memory.content, '新内容')
+      assert.equal(updated.memory.importance, 0.9)
+      assert.deepEqual(updated.memory.tags, ['a'])
+      assert.deepEqual(updated.memory.metadata, { k: 'v' })
+      const patchRequest = fake.requests.find((item) => item.method === 'PATCH')
+      assert.deepEqual(patchRequest.body, {
+        content: '新内容',
+        importance: 0.9,
+        tags: ['a'],
+        metadata: { k: 'v' },
+      })
+
+      const after = await client.getMemoryHistory(partition.slug, id)
+      assert.deepEqual(
+        after.map((entry) => entry.event),
+        ['UPDATE', 'FEEDBACK', 'ADD'],
+        '历史按新→旧返回',
+      )
+      assert.equal(after[0].old_content, '旧内容')
+      assert.equal(after[0].new_content, '新内容')
+    } finally {
+      await fake.close()
+    }
+  })
+})
+
 describe('MnemosClient 错误归一', () => {
   it('401 → code/action 指明检查 orgApiKey，消息含状态码', async () => {
     const { server, url } = await startMock(({ res }) => {
@@ -381,15 +462,55 @@ describe('MnemosClient 错误归一', () => {
     }
   })
 
-  it('未配置 orgApiKey 时本地短路，不发请求', async () => {
-    const { server, url, requests } = await startMock(({ res }) => sendMemory(res))
+  it('未配置 orgApiKey 时照常发请求，但不带 Authorization（本地免密）', async () => {
+    const seen = {}
+    const { server, url, requests } = await startMock(({ req, res }) => {
+      seen.method = req.method
+      seen.path = new URL(req.url, 'http://x').pathname
+      seen.authorization = req.headers.authorization
+      sendMemory(res)
+    })
     try {
-      await assert.rejects(makeClient(url, { orgApiKey: '' }).getPartition('x'), (error) => {
-        assert.equal(error.code, 'missing_api_key')
+      const payload = await makeClient(url, { orgApiKey: '  ' }).getPartition('ws-demo-1234abcd')
+      assert.equal(payload.memory.id, 'mem_1')
+      assert.equal(requests.length, 1, '免密模式也必须真的发请求（不再本地短路）')
+      assert.equal(seen.authorization, undefined, '免密模式请求不得带 Authorization')
+      assert.equal(seen.path, '/v1/partitions/ws-demo-1234abcd')
+      assert.equal(makeClient(url, { orgApiKey: '' }).authMode(), 'none')
+      assert.equal(makeClient(url).authMode(), 'orgKey')
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it('免密模式下服务端 401 → code/action 提示配置 key 或 MNEMOS_DEV_NO_API_KEY=1', async () => {
+    const fake = await createMnemosFake()
+    try {
+      fake.seedPartition('ws-demo-1234abcd', 'demo')
+      await assert.rejects(makeClient(fake.url, { orgApiKey: '' }).getPartition('ws-demo-1234abcd'), (error) => {
+        assert.ok(error instanceof MnemosApiError)
+        assert.equal(error.status, 401)
         assert.match(error.action, /orgApiKey/)
+        assert.match(error.action, /MNEMOS_DEV_NO_API_KEY=1/)
+        assert.doesNotMatch(error.action, /orgApiKey 无效或已失效/)
         return true
       })
-      assert.equal(requests.length, 0)
+    } finally {
+      await fake.close()
+    }
+  })
+
+  it('免密模式下服务端 403 → action 同样提示补齐 key / 本地免密', async () => {
+    const { server, url } = await startMock(({ res }) => {
+      res.writeHead(403, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 'FORBIDDEN', message: 'no scope' } }))
+    })
+    try {
+      await assert.rejects(makeClient(url, { orgApiKey: '' }).getPartition('x'), (error) => {
+        assert.equal(error.status, 403)
+        assert.match(error.action, /MNEMOS_DEV_NO_API_KEY=1/)
+        return true
+      })
     } finally {
       await closeServer(server)
     }

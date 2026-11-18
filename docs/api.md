@@ -72,6 +72,11 @@
   `X-RateLimit-Reset`（epoch 秒）；超限 `429 RATE_LIMITED` + `Retry-After`。
 - 分区 key 访问别的分区统一 `404 NOT_FOUND`（不泄露存在性）；用分区 key 调
   `POST /v1/partitions` 或需要 `admin` 的接口返回 `403 FORBIDDEN`。
+- **本地免密（v6.5，仅开发）**：服务端设 `MNEMOS_DEV_NO_API_KEY=1` 时，`/v1` **不再要求**
+  `Authorization`；请求以库中第一个 `owner` 身份合成一把 org 级 Key（`id=key_dev_no_auth`、
+  `admin` 作用域、`100000` 次/分钟，不落库），可直接建分区 / 读写记忆。默认（`0`）保持上述
+  API Key 规则；`NODE_ENV=production` 开启会在启动校验时被拒绝。公开探针（`/health`、
+  `/healthz` 等）与控制台 `/api` 鉴权不受影响；DSH 插件在该模式下 `orgApiKey` 可留空。
 
 ### 2.2 创建组织级 API Key（控制台，仅组织 owner）
 

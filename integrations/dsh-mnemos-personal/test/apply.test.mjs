@@ -118,6 +118,14 @@ describe('插件元信息与配置 schema', () => {
     }
   })
 
+  it('orgApiKey 的描述说明可留空（本地免密）', () => {
+    const description = Config.dict.orgApiKey.meta.description
+    assert.equal(typeof description, 'string')
+    assert.match(description, /可留空/)
+    assert.match(description, /MNEMOS_DEV_NO_API_KEY/)
+    assert.equal(Config.dict.orgApiKey.meta.role, 'secret')
+  })
+
   it('Config 拒绝非法 partitionMode / personType', () => {
     assert.throws(() => Config({ partitionMode: 'world' }))
     assert.throws(() => Config({ personType: 'robot' }))
@@ -151,9 +159,15 @@ describe('系统提示文案', () => {
     assert.match(text, new RegExp(`本工作区已绑定分区 ${slug}，记忆按人组织；默认人 dsh-agent`))
     assert.match(text, /mnemos_context/)
     assert.match(text, /mnemos_add/)
+    assert.match(text, /mnemos_profile/)
+    assert.match(text, /mnemos_history/)
+    assert.match(text, /mnemos_feedback/)
+    assert.match(text, /mnemos_update/)
     assert.match(text, /placeholders/)
     assert.match(text, /\{\{key\}\}/)
     assert.match(text, /orgApiKey/)
+    assert.match(text, /MNEMOS_DEV_NO_API_KEY=1/)
+    assert.match(text, /免密/)
   })
 
   it('fixed 模式用 fixedPartition 作为绑定分区', () => {
@@ -183,7 +197,7 @@ describe('apply 装配', () => {
     // 直接传 Config({}) 的产物：这正是 dsh 运行时交给 apply 的形状（字段是 Volatile 引用）。
     apply(ctx, Config({}))
 
-    assert.equal(state.tools.size, 8)
+    assert.equal(state.tools.size, 12)
     for (const toolName of [
       'mnemos_workspace',
       'mnemos_add',
@@ -192,6 +206,10 @@ describe('apply 装配', () => {
       'mnemos_brief',
       'mnemos_context',
       'mnemos_person',
+      'mnemos_profile',
+      'mnemos_history',
+      'mnemos_feedback',
+      'mnemos_update',
       'mnemos_status',
     ]) {
       assert.ok(state.tools.has(toolName), `缺少工具 ${toolName}`)
@@ -220,7 +238,7 @@ describe('apply 装配', () => {
   it('systemPrompt=false 时不注册提示段，工具照常注册', () => {
     const { ctx, state } = createContext()
     apply(ctx, Config({ systemPrompt: false }))
-    assert.equal(state.tools.size, 8)
+    assert.equal(state.tools.size, 12)
     assert.equal(state.sections.size, 0)
   })
 
@@ -237,18 +255,18 @@ describe('apply 装配', () => {
     const { ctx, state, fire } = createContext({ settings })
     const { values, raw } = volatileConfig()
     apply(ctx, raw)
-    assert.equal(state.tools.size, 8)
+    assert.equal(state.tools.size, 12)
     assert.equal(state.sections.size, 1)
 
     // 别的插件保存配置：不受影响
     fire('dsh-mnemos')
-    assert.equal(state.tools.size, 8)
+    assert.equal(state.tools.size, 12)
     assert.equal(state.sections.size, 1)
 
     // 自己的命名空间：关掉提示段，工具保持
     values.systemPrompt = false
     fire(MNEMOS_SETTINGS_NAMESPACE)
-    assert.equal(state.tools.size, 8)
+    assert.equal(state.tools.size, 12)
     assert.equal(state.sections.size, 0)
 
     // 再打开：提示段回来
@@ -280,17 +298,37 @@ describe('apply 装配', () => {
     }
   })
 
+  it('orgApiKey 留空 + 服务端免密（MNEMOS_DEV_NO_API_KEY=1）时 e2e 可用，且请求不带 Authorization', async () => {
+    const fake = await createMnemosFake({ noAuth: true })
+    try {
+      const { ctx, state } = createContext()
+      apply(ctx, Config({ baseUrl: fake.url, orgApiKey: '' }))
+      const exec = { agent: { session: { id: 'sess_nokey', header: { cwd: '/work/nokey' } } } }
+
+      const workspace = await state.tools.get('mnemos_workspace').execute({}, exec)
+      assert.equal(workspace.ok, true, workspace.error)
+      const add = await state.tools.get('mnemos_add').execute({ text: '免密写入', scope: 'person' }, exec)
+      assert.equal(add.ok, true, add.error)
+      const search = await state.tools.get('mnemos_search').execute({ query: '免密' }, exec)
+      assert.equal(search.ok, true, search.error)
+      assert.equal(search.count, 1)
+      assert.equal(fake.requests.every((request) => request.authorization === undefined), true)
+    } finally {
+      await fake.close()
+    }
+  })
+
   it('没有 settings 服务（headless / CLI 挂载）时不抛异常，工具照常注册', () => {
     const { ctx, state } = createContext()
     assert.doesNotThrow(() => apply(ctx, Config({})))
-    assert.equal(state.tools.size, 8)
+    assert.equal(state.tools.size, 12)
     assert.equal(state.sections.size, 1)
   })
 
   it('settings 服务缺少 configure 方法时也能装配', () => {
     const { ctx, state } = createContext({ settings: {} })
     assert.doesNotThrow(() => apply(ctx, Config({})))
-    assert.equal(state.tools.size, 8)
+    assert.equal(state.tools.size, 12)
   })
 
 })

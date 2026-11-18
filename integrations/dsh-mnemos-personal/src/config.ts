@@ -33,7 +33,7 @@ export type PersonType = 'human' | 'agent' | 'service'
 export interface MnemosConfig {
   /** Mnemos 服务地址（不带尾斜杠，不带 /v1）。 */
   baseUrl: string
-  /** 组织级 API Key（`mnemos_live_*` 的 org key）：可访问/创建本组织任意分区。 */
+  /** 组织级 API Key（`mnemos_live_*` 的 org key）：可访问/创建本组织任意分区；留空 = 本地免密（请求不带 Authorization）。 */
   orgApiKey: string
   /** 默认人（记忆主体）的 external_id；工具可显式传 person_id 读写其他人。 */
   personId: string
@@ -60,7 +60,16 @@ export const Config = z.object({
   // `.volatile()`：字段可热更新，且只有它会被投影到设置表单。
   baseUrl: z.string().default('http://127.0.0.1:4380').volatile(),
   // `role('secret')`：走脱敏通道，密钥字面量不下发浏览器、不进日志。
-  orgApiKey: z.string().role('secret').default('').volatile(),
+  // 可留空：本地免密模式（请求不带 Authorization，服务端以 MNEMOS_DEV_NO_API_KEY=1 启动）。
+  orgApiKey: z
+    .string()
+    .role('secret')
+    .default('')
+    .description(
+      '可留空（本地免密）：留空时请求不带 Authorization，需本地以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos；' +
+        '填写时用控制台「密钥」创建的 kind=org Key（自动建分区需要 admin）。',
+    )
+    .volatile(),
   personId: z.string().default('dsh-agent').volatile(),
   personType: z
     .union([z.const('human'), z.const('agent'), z.const('service')])

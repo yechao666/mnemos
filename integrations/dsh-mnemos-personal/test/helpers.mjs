@@ -5,10 +5,13 @@
  * - POST /v1/partitions（按 slug 幂等 upsert）、GET /v1/partitions/:p、GET /v1/partitions/:p/stats
  * - GET /v1/partitions/:p/persons（**游标分页** cursor/limit/q/type/status/sort）
  * - PUT/GET/PATCH /v1/partitions/:p/persons/:person（person=内部 id 或 external）
+ * - GET /v1/partitions/:p/persons/:person/profile（画像：facts + summary，支持 force=1）
  * - GET/POST /v1/partitions/:p/persons/:person/memories（该人记忆，游标分页）、
  *   GET .../brief、POST .../context、GET .../dream、POST .../dream/run
  * - GET /v1/partitions/:p/memories（全局列表，游标分页）、POST .../memories/search（检索；可用
  *   `searchEndpoint:false` 关掉以测「退化为列表 q 搜索」）、GET .../memories/:id
+ * - GET .../memories/:id/history（事件时间线）、POST .../memories/:id/feedback（反馈计数）、
+ *   PATCH .../memories/:id（更新记忆）
  *
  * 分页协议：响应 `{ items, next_cursor, partition_stats }`；游标是不透明字符串（base64url 的
  * 最后一条 id），第二页从游标项之后开始 —— 形状与真实 v6 一致，内部实现保持简单。
@@ -113,6 +116,40 @@ function personView(person) {
   }
 }
 
+/** 一条人物事实的读视图（v6.1 画像）。 */
+function factView(fact) {
+  return {
+    id: fact.id,
+    partition_id: fact.partition_id,
+    person_id: fact.person_id,
+    key: fact.key,
+    value: fact.value,
+    confidence: fact.confidence,
+    valid_from: fact.valid_from,
+    valid_to: fact.valid_to ?? null,
+    source_memory_id: fact.source_memory_id ?? null,
+    created_at: fact.created_at,
+    updated_at: fact.updated_at,
+  }
+}
+
+/** 记忆历史事件的读视图（v6.1）。 */
+function historyView(entry) {
+  return {
+    id: entry.id,
+    partition_id: entry.partition_id,
+    memory_id: entry.memory_id,
+    person_id: entry.person_id ?? null,
+    event: entry.event,
+    old_content: entry.old_content ?? null,
+    new_content: entry.new_content ?? null,
+    actor: entry.actor ?? null,
+    reason: entry.reason ?? null,
+    meta: entry.meta ?? {},
+    created_at: entry.created_at,
+  }
+}
+
 /** 分区统计（v6：直接读 partition_stats，不 COUNT(*)）。 */
 function statsView(state, partition) {
   const people = [...state.persons.values()].filter((person) => person.partition_slug === partition.slug)
@@ -135,6 +172,7 @@ function statsView(state, partition) {
  *
  * @param {object} [options]
  * @param {string} [options.apiKey] 期望的 Bearer key（默认 test_org_key）。
+ * @param {boolean} [options.noAuth] 本地免密模式：不校验 Authorization（模拟 MNEMOS_DEV_NO_API_KEY=1）。
  * @param {boolean} [options.conflictOnExisting] 重复 POST /v1/partitions 时返回 409（默认 200 幂等）。
  * @param {boolean} [options.missingAdmin] POST /v1/partitions 返回 403（模拟没有 admin 的 org key）。
  * @param {boolean} [options.searchEndpoint] 是否实现 POST .../memories/search（默认 true；
@@ -148,8 +186,10 @@ export async function createMnemosFake(options = {}) {
     partitions: new Map(), // slug -> { id, slug, name, description, status, settings }
     persons: new Map(), // `${partitionSlug}/${externalId}` -> person
     memories: [], // 记忆对象（含 partition_slug / person_external_id）
+    facts: [], // 人物事实（画像用）
+    history: [], // 记忆变更历史
     dreams: new Map(), // `${partitionSlug}/${externalId}` -> dream 状态
-    next: { partition: 1, person: 1, memory: 1, dream: 1 },
+    next: { partition: 1, person: 1, memory: 1, dream: 1, fact: 1, history: 1 },
   }
 
   function findPartition(ref) {
@@ -173,6 +213,10 @@ export async function createMnemosFake(options = {}) {
 
   function memoriesIn(partition) {
     return state.memories.filter((memory) => memory.partition_slug === partition.slug)
+  }
+
+  function findMemory(partition, id) {
+    return state.memories.find((memory) => memory.partition_slug === partition.slug && memory.id === id)
   }
 
   /** 重算某个人的反规范化计数（v6：写入时维护，不逐行 COUNT）。 */
@@ -221,6 +265,34 @@ export async function createMnemosFake(options = {}) {
     return person
   }
 
+  /** 追加一条记忆历史（v6.1：ADD / UPDATE / FEEDBACK …）。 */
+  function pushHistory(partition, memory, event, input = {}) {
+    const entry = {
+      id: `hist_${state.next.history++}`,
+      partition_id: partition.id,
+      partition_slug: partition.slug,
+      memory_id: memory.id,
+      person_id: memory.person_id ?? null,
+      event,
+      old_content: input.old_content ?? null,
+      new_content: input.new_content ?? null,
+      actor: input.actor ?? 'api_key:test',
+      reason: input.reason ?? null,
+      meta: input.meta ?? {},
+      created_at: input.created_at ?? NOW,
+    }
+    state.history.push(entry)
+    return entry
+  }
+
+  /** 某条记忆的历史（新→旧，与服务端 ORDER BY created_at DESC 一致）。 */
+  function historyFor(partition, memoryId) {
+    return state.history
+      .filter((entry) => entry.partition_slug === partition.slug && entry.memory_id === memoryId)
+      .slice()
+      .reverse()
+  }
+
   function createMemory(partition, person, input = {}) {
     const messageText = Array.isArray(input.messages)
       ? input.messages
@@ -241,6 +313,8 @@ export async function createMnemosFake(options = {}) {
       category: input.category ?? 'fact',
       importance: input.importance ?? 0.5,
       confidence: input.confidence ?? 0.8,
+      feedback_up: input.feedback_up ?? 0,
+      feedback_down: input.feedback_down ?? 0,
       source: 'api',
       status: 'active',
       tags: input.tags ?? [],
@@ -253,6 +327,7 @@ export async function createMnemosFake(options = {}) {
     state.memories.push(memory)
     person.last_seen_at = NOW
     refreshPerson(person)
+    pushHistory(partition, memory, 'ADD', { new_content: content })
     return memory
   }
 
@@ -294,6 +369,29 @@ export async function createMnemosFake(options = {}) {
     }
   }
 
+  /** 某人的结构化事实（画像用）。 */
+  function factsFor(partition, person) {
+    return state.facts.filter(
+      (fact) => fact.partition_slug === partition.slug && fact.person_external_id === person.external_id,
+    )
+  }
+
+  /** 画像视图（v6.1：person + facts + summary + cached；force=1 时不命中缓存）。 */
+  function profileFor(partition, person, force) {
+    const facts = factsFor(partition, person)
+    const summary =
+      facts.length === 0
+        ? ''
+        : `# 画像（person=${person.external_id}）\n${facts.map((fact) => `- ${fact.key}: ${fact.value}`).join('\n')}`
+    return {
+      person: personView(person),
+      facts: facts.map(factView),
+      summary,
+      generated_at: NOW,
+      cached: force !== true,
+    }
+  }
+
   const { server, url, requests } = await startMock(async ({ req, res, body, url: requestUrl }) => {
     const pathname = requestUrl.pathname
 
@@ -306,7 +404,7 @@ export async function createMnemosFake(options = {}) {
       })
     }
 
-    if (req.headers.authorization !== `Bearer ${apiKey}`) {
+    if (options.noAuth !== true && req.headers.authorization !== `Bearer ${apiKey}`) {
       return sendJson(res, 401, { error: { code: 'INVALID_API_KEY', message: 'invalid api key' } })
     }
 
@@ -431,6 +529,16 @@ export async function createMnemosFake(options = {}) {
           return sendJson(res, 200, personView(person))
         }
         return sendJson(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'use GET / PUT / PATCH' } })
+      }
+
+      // /persons/:person/profile（v6.1 画像；force=1 强制重新生成）
+      if (rest.length === 3 && rest[2] === 'profile' && req.method === 'GET') {
+        const person = findPerson(partition, personPath)
+        if (person === undefined) {
+          return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `person not found: ${personPath}` } })
+        }
+        const force = requestUrl.searchParams.get('force') === '1' || requestUrl.searchParams.get('force') === 'true'
+        return sendJson(res, 200, profileFor(partition, person, force))
       }
 
       // /persons/:person/memories
@@ -628,14 +736,65 @@ export async function createMnemosFake(options = {}) {
       }
 
       if (rest.length === 2 && req.method === 'GET') {
-        const memory = state.memories.find(
-          (item) => item.partition_slug === partition.slug && item.id === rest[1],
-        )
+        const memory = findMemory(partition, rest[1])
         if (memory === undefined) {
           return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `memory not found: ${rest[1]}` } })
         }
         const owner = findPerson(partition, memory.person_external_id)
         return sendJson(res, 200, { memory: memoryView(memory), person: owner ? personView(owner) : null })
+      }
+
+      // /memories/:id/history（v6.1 事件时间线，新→旧）
+      if (rest.length === 3 && rest[2] === 'history' && req.method === 'GET') {
+        const memory = findMemory(partition, rest[1])
+        if (memory === undefined) {
+          return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `memory not found: ${rest[1]}` } })
+        }
+        return sendJson(res, 200, { items: historyFor(partition, rest[1]).map(historyView) })
+      }
+
+      // /memories/:id/feedback（v6.1：helpful 升降 confidence 并计数）
+      if (rest.length === 3 && rest[2] === 'feedback' && req.method === 'POST') {
+        const memory = findMemory(partition, rest[1])
+        if (memory === undefined) {
+          return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `memory not found: ${rest[1]}` } })
+        }
+        const helpful = (body ?? {}).helpful === true
+        const before = memory.confidence ?? 0.8
+        const after = Math.round(Math.min(1, Math.max(0.05, before + (helpful ? 0.05 : -0.05))) * 10_000) / 10_000
+        memory.confidence = after
+        if (helpful) memory.feedback_up = (memory.feedback_up ?? 0) + 1
+        else memory.feedback_down = (memory.feedback_down ?? 0) + 1
+        memory.updated_at = NOW
+        pushHistory(partition, memory, 'FEEDBACK', {
+          old_content: memory.content,
+          new_content: memory.content,
+          reason: helpful ? 'helpful' : 'not-helpful',
+          meta: { helpful, query: body?.query ?? null, confidenceBefore: before, confidenceAfter: after },
+        })
+        return sendJson(res, 200, { memory: memoryView(memory) })
+      }
+
+      // PATCH /memories/:id（v6.1：content / importance / tags / metadata …）
+      if (rest.length === 2 && req.method === 'PATCH') {
+        const memory = findMemory(partition, rest[1])
+        if (memory === undefined) {
+          return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `memory not found: ${rest[1]}` } })
+        }
+        const normalized = body ?? {}
+        const before = memory.content
+        for (const key of ['content', 'category', 'importance', 'confidence', 'status', 'tags', 'metadata', 'expires_at']) {
+          if (normalized[key] !== undefined) memory[key] = normalized[key]
+        }
+        memory.updated_at = NOW
+        if (normalized.content !== undefined && normalized.content !== before) {
+          pushHistory(partition, memory, 'UPDATE', {
+            old_content: before,
+            new_content: memory.content,
+            reason: 'patch',
+          })
+        }
+        return sendJson(res, 200, { memory: memoryView(memory) })
       }
 
       return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `unknown memories path ${rest.join('/')}` } })
@@ -669,6 +828,29 @@ export async function createMnemosFake(options = {}) {
       if (partition === undefined) throw new Error(`seedMemory: partition not found: ${partitionRef}`)
       const person = createPerson(partition, personExternalId, { type: input.type })
       return createMemory(partition, person, { ...input, text: content })
+    },
+    /** 预置一条人物事实（画像用；返回事实对象）。 */
+    seedFact(partitionRef, personExternalId, input = {}) {
+      const partition = findPartition(partitionRef)
+      if (partition === undefined) throw new Error(`seedFact: partition not found: ${partitionRef}`)
+      const person = createPerson(partition, personExternalId, {})
+      const fact = {
+        id: `fact_${state.next.fact++}`,
+        partition_id: partition.id,
+        partition_slug: partition.slug,
+        person_id: person.id,
+        person_external_id: person.external_id,
+        key: input.key ?? 'fact',
+        value: input.value ?? '',
+        confidence: input.confidence ?? 0.9,
+        valid_from: NOW,
+        valid_to: null,
+        source_memory_id: input.source_memory_id ?? null,
+        created_at: NOW,
+        updated_at: NOW,
+      }
+      state.facts.push(fact)
+      return fact
     },
     /** 按请求方法 + 路径统计次数（断言幂等 / 缓存用）。 */
     countRequests(method, pathname) {

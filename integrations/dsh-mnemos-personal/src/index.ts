@@ -2,8 +2,8 @@
  * dsh-mnemos-personal：把 Mnemos v6（中立记忆服务）接入 dsh 的宿主侧 cordis 插件。
  *
  * 做四件事：
- * 1. 注册 8 个 `mnemos_*` Agent 工具（分区 = 工作区、记忆按人组织，写 `/v1/partitions/:p/...`，
- *    人 / 记忆列表用 v6 游标分页）；
+ * 1. 注册 12 个 `mnemos_*` Agent 工具（分区 = 工作区、记忆按人组织，写 `/v1/partitions/:p/...`，
+ *    人 / 记忆列表用 v6 游标分页；含画像 / 历史 / 反馈 / 更新）；
  * 2. 在系统提示里插一段说明，告诉 Agent「本工作区已绑定分区 <slug>，记忆按人组织；默认人 <personId>」；
  * 3. 把配置页挂进 dsh 设置（导出 `Config` + `.volatile()` 字段，dsh 自动生成表单）；
  * 4. 每次调用现读活配置 / 现算工作区，设置与会话变化即时生效。
@@ -91,11 +91,14 @@ export function buildSystemPromptText(config: MnemosConfig, workspacePath: strin
     '使用时机：\n' +
     '- 开始任务前先调 mnemos_context 取默认人的上下文（资料 + 简报 + 高相关记忆 + 分区共享知识），返回的 prompt 可直接阅读 / 注入，比逐条检索省 token。\n' +
     '- 想快速了解「关于这个人已知什么」用 mnemos_brief；需要具体旧事 / 约定 / 踩坑记录用 mnemos_search；读一条详情或用游标翻页列表用 mnemos_get（把响应里的 next_cursor 传给 cursor）。\n' +
+    '- 想了解「这个人的资料被结构化成了哪些事实」用 mnemos_profile（facts + 摘要，force 可强制重算）；看一条记忆的变更时间线用 mnemos_history（event/actor/old→new）。\n' +
+    '- 检索结果有用 / 没用时用 mnemos_feedback 记一次（服务端据此升降 confidence）；需要修正记忆正文 / 重要度 / 标签 / 元数据用 mnemos_update（readOnly 会拦）。\n' +
     '- 得出了值得沉淀的结论、决策、约束、踩坑经验时用 mnemos_add（scope=partition 表示分区共享，同分区其他人也能检索；缺省沿用分区设置）。\n' +
     '- 写记忆遇到隐私值（手机号 / 邮箱 / 身份证 / 银行卡等）时用 placeholders 抽离：真实值放映射，正文只写 {{key}} 占位符（key 为 [A-Za-z0-9_-]{3,64}），例如 text: "手机号是 {{phone_a1b2}}", placeholders: {"phone_a1b2":"18334423321"}；正文只落 token，mnemos_brief / mnemos_context 会由服务端自动还原。\n' +
     '- 换人读写时显式传 person_id（缺省 / self = 默认人）；人不是登录账号，human 是 App 用户 / 员工，agent 是智能体。\n' +
     '- 管理用 mnemos_person（list / get / upsert）；不确定分区或连接状态时用 mnemos_workspace / mnemos_status。\n' +
     '硬性限制：readOnly 模式（设置 → 插件 → dsh-mnemos-personal）会拦截记忆写入与人变更；orgApiKey 不要出现在回复里，也不要写进记忆内容。\n' +
+    '鉴权与免密：orgApiKey 留空时是本地免密模式——请求不带 Authorization；此时 Mnemos 需以 MNEMOS_DEV_NO_API_KEY=1 启动，否则返回 401（调 mnemos_status 自检，action 会提示配置 orgApiKey 或开启本地免密）。\n' +
     '用户说「记忆 / 记住 / 搜索记忆 / 人物上下文 / 沉淀经验」时，指的就是本插件，请据此协作。'
   )
 }

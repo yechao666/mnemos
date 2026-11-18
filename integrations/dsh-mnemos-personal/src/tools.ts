@@ -1,5 +1,5 @@
 /**
- * Agent 工具集合（8 个 `mnemos_*`，Mnemos v6）。
+ * Agent 工具集合（12 个 `mnemos_*`，Mnemos v6）。
  *
  * 设计约束（与旧插件 dsh-mnemos 保持一致，原因见 `src/dsh-types.d.ts`）：
  * - 参数与输出都是**手写原始 JSON Schema**，不在运行时 import `@deepseek-ai/dsh-tools`；
@@ -19,6 +19,10 @@
  * - 写记忆走人级端点 `POST /v1/partitions/:p/persons/:person/memories`；
  * - 分区统计读 `GET /v1/partitions/:p/stats`（partition_stats），人的计数读 persons 行上的
  *   `memory_count / shared_memory_count / session_count`，不做 COUNT(*)。
+ * - v6.5 补齐：人物画像（profile）、记忆历史（history）、反馈（feedback）、更新（update）。
+ *
+ * 鉴权：配置了 orgApiKey 就带 Bearer；留空 = 本地免密模式（请求不带 Authorization，
+ * 服务端以 `MNEMOS_DEV_NO_API_KEY=1` 启动）。status 工具照常探测，不用 key 也能自检。
  */
 
 import type { ContentBlock, ToolDefinition, ToolRunContextLike } from './dsh-types.js'
@@ -32,7 +36,9 @@ import {
   MnemosClient,
   type MnemosBrief,
   type MnemosMemory,
+  type MnemosMemoryHistoryEntry,
   type MnemosPersonContext,
+  type MnemosPersonFact,
   type PartitionInfo,
 } from './mnemos-client.js'
 import {
@@ -150,6 +156,41 @@ function renderMemory(memory: MnemosMemory | undefined, index: number): string {
 /** 记忆列表渲染。 */
 function renderMemoryList(memories: MnemosMemory[]): string {
   return memories.map((memory, index) => renderMemory(memory, index)).join('\n')
+}
+
+/** 文本截断：超过 max 字符时保留前 max-1 个字符 + `…`（工具输出里避免刷屏）。 */
+function truncateText(value: string, max: number): string {
+  if (value.length <= max) return value
+  return `${value.slice(0, Math.max(1, max - 1))}…`
+}
+
+/** 渲染时把「空 / null / undefined」统一显示成 `-`。 */
+function displayText(value: unknown): string {
+  if (value === undefined || value === null || value === '') return '-'
+  return String(value)
+}
+
+/**
+ * 单条记忆的摘要（更新 / 反馈结果用）：只留模型判断需要的字段，正文截断。
+ * 返回的对象直接进工具输出，字段用 snake_case 与服务端一致。
+ */
+function summarizeMemory(memory: MnemosMemory | undefined, contentLimit = 500): Record<string, unknown> {
+  if (memory === undefined) return {}
+  const summary: Record<string, unknown> = {
+    id: memory.id ?? null,
+    content: truncateText(memoryContent(memory), contentLimit),
+    scope: memory.scope ?? null,
+    category: memory.category ?? null,
+    person: memoryPerson(memory),
+    importance: memory.importance ?? null,
+    confidence: memory.confidence ?? null,
+    status: memory.status ?? null,
+    tags: Array.isArray(memory.tags) ? memory.tags : [],
+    updated_at: memory.updated_at ?? memory.updatedAt ?? null,
+  }
+  const metadata = asRecord(memory.metadata)
+  if (metadata !== undefined) summary.metadata = metadata
+  return summary
 }
 
 /** 分区摘要（喂给工具结果 / 渲染）。 */
@@ -1289,7 +1330,467 @@ function renderPerson(value: PersonResult): string {
 }
 
 /* ------------------------------------------------------------------ */
-/* 8. mnemos_status                                                    */
+/* 8. mnemos_profile                                                   */
+/* ------------------------------------------------------------------ */
+
+interface ProfileArgs {
+  person_id?: string
+  force?: boolean
+}
+
+interface ProfileResult {
+  ok: boolean
+  error?: string
+  action?: string
+  warning?: string
+  person_id?: string
+  person?: Record<string, unknown>
+  facts?: MnemosPersonFact[]
+  fact_count?: number
+  summary?: string
+  generated_at?: string
+  cached?: boolean
+}
+
+/** 人的画像：v6.1 结构化 facts + 服务端摘要（force=true 强制重新生成）。 */
+export function mnemosProfileTool(
+  client: MnemosClient,
+  config: ConfigSource,
+  resolveWorkspacePath: WorkspacePathResolver,
+): ToolDefinition<ProfileArgs, ProfileResult> {
+  return {
+    name: 'mnemos_profile',
+    description:
+      '读取某个人的 Mnemos 画像（v6.1：结构化 facts + 服务端摘要）。person_id 缺省为默认人（self）。' +
+      'force=true 时请求 ?force=1 强制重新生成；默认用缓存（省 LLM 调用）。' +
+      '想了解「这个人的资料被结构化成了哪些事实」时用它；最近记忆摘要用 mnemos_brief。',
+    parameters: {
+      type: 'object',
+      properties: {
+        person_id: { type: 'string', description: '人的 external_id（或 self / 省略 = 默认人）。' },
+        force: { type: 'boolean', description: 'true = 强制重新生成画像（?force=1）；默认用缓存。' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          ...BASE_PROPERTIES,
+          person_id: { type: 'string' },
+          person: OBJECT_SCHEMA,
+          facts: OBJECT_ARRAY_SCHEMA,
+          fact_count: { type: 'integer' },
+          summary: { type: 'string' },
+          generated_at: { type: 'string' },
+          cached: { type: 'boolean' },
+        },
+        required: ['ok'],
+      },
+      render: (_args, value) => text(value.ok ? renderProfile(value) : renderFailure('mnemos_profile', value)),
+    },
+    async execute(args, exec) {
+      try {
+        const settings = config()
+        const ensured = await ensurePartition(client, settings, resolveWorkspacePath, exec)
+        const personId = resolvePersonId(args.person_id, settings)
+        const profile = await client.getPersonProfile(ensured.info.slug, personId, { force: args.force === true })
+        const facts = profile.facts ?? []
+        const result: ProfileResult = { ok: true, person_id: personId, facts, fact_count: facts.length }
+        const person = summarizePerson(profile.person)
+        if (Object.keys(person).length > 0) result.person = person
+        if (typeof profile.summary === 'string') result.summary = profile.summary
+        if (typeof profile.generated_at === 'string') result.generated_at = profile.generated_at
+        if (typeof profile.cached === 'boolean') result.cached = profile.cached
+        if (ensured.warning !== undefined) result.warning = ensured.warning
+        return result
+      } catch (error) {
+        return { ...failResult(error), fact_count: 0, facts: [] }
+      }
+    },
+  }
+}
+
+function renderProfile(value: ProfileResult): string {
+  const facts = value.facts ?? []
+  const meta = [
+    typeof value.fact_count === 'number' ? `${value.fact_count} 条事实` : '',
+    value.cached === true ? '命中缓存' : value.cached === false ? '已重新生成' : '',
+    value.generated_at !== undefined ? `生成于 ${value.generated_at}` : '',
+  ].filter(Boolean)
+  const lines = [`Mnemos 画像（person=${value.person_id ?? '默认人'}${meta.length > 0 ? `，${meta.join(' · ')}` : ''}）`]
+  if (facts.length === 0) {
+    lines.push('（暂无结构化事实：先用 mnemos_add 写入记忆，或 force=true 重新生成画像）')
+  } else {
+    facts.forEach((fact, index) => {
+      const confidence = typeof fact.confidence === 'number' ? `（confidence ${fact.confidence}）` : ''
+      lines.push(`${index + 1}. ${displayText(fact.key)}: ${truncateText(displayText(fact.value), 200)}${confidence}`)
+    })
+  }
+  const summary = (value.summary ?? '').trim()
+  lines.push(`摘要：${summary === '' ? '（暂无摘要）' : truncateText(summary, 500)}`)
+  if (value.warning !== undefined) lines.push(`注意：${value.warning}`)
+  return lines.join('\n')
+}
+
+/* ------------------------------------------------------------------ */
+/* 9. mnemos_history                                                   */
+/* ------------------------------------------------------------------ */
+
+interface HistoryArgs {
+  id: string
+}
+
+interface HistoryResult {
+  ok: boolean
+  error?: string
+  action?: string
+  warning?: string
+  id?: string
+  count?: number
+  items?: MnemosMemoryHistoryEntry[]
+}
+
+/** 记忆变更历史：ADD / UPDATE / MERGE / SUPERSEDE / FEEDBACK … 的事件时间线。 */
+export function mnemosHistoryTool(
+  client: MnemosClient,
+  config: ConfigSource,
+  resolveWorkspacePath: WorkspacePathResolver,
+): ToolDefinition<HistoryArgs, HistoryResult> {
+  return {
+    name: 'mnemos_history',
+    description:
+      '读取一条 Mnemos 记忆的变更历史（v6.1 事件时间线：ADD / UPDATE / MERGE / SUPERSEDE / FEEDBACK / PRIVACY 等，新→旧），' +
+      '每条含 event / actor / created_at / old→new 摘要。需要 id（mnemos_get / mnemos_search 结果里的 mem_*）。' +
+      '想确认「这条记忆为什么变成现在这样 / 被谁改过」时用它。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '记忆 id（mem_*）。' },
+      },
+      required: ['id'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          ...BASE_PROPERTIES,
+          id: { type: 'string' },
+          count: { type: 'integer' },
+          items: OBJECT_ARRAY_SCHEMA,
+        },
+        required: ['ok'],
+      },
+      render: (_args, value) => text(value.ok ? renderHistory(value) : renderFailure('mnemos_history', value)),
+    },
+    async execute(args, exec) {
+      try {
+        const settings = config()
+        if (typeof args.id !== 'string' || args.id.trim() === '') {
+          return {
+            ok: false,
+            error: 'mnemos_history 需要记忆 id。',
+            action: '先 mnemos_search / mnemos_get 拿到 mem_* 开头的记忆 id，再传 id。',
+          }
+        }
+        const id = args.id.trim()
+        const ensured = await ensurePartition(client, settings, resolveWorkspacePath, exec)
+        const items = await client.getMemoryHistory(ensured.info.slug, id)
+        const result: HistoryResult = { ok: true, id, count: items.length, items }
+        if (ensured.warning !== undefined) result.warning = ensured.warning
+        return result
+      } catch (error) {
+        return { ...failResult(error), count: 0, items: [] }
+      }
+    },
+  }
+}
+
+function renderHistory(value: HistoryResult): string {
+  const items = value.items ?? []
+  const head = `Mnemos 记忆历史：${value.id ?? '(未知 id)'}（${value.count ?? items.length} 个事件，新→旧）`
+  if (items.length === 0) {
+    return `${head}\n（没有历史记录：确认记忆 id 是否属于当前分区，或服务端尚未记录该记忆的变更）`
+  }
+  const lines = [head]
+  items.forEach((item, index) => {
+    const event = displayText(item.event)
+    const actor = displayText(item.actor)
+    const at = displayText(item.created_at)
+    const before = item.old_content
+    const after = item.new_content
+    let change: string
+    if (before == null && after == null) change = '内容未变'
+    else if (before == null) change = `新：${truncateText(String(after ?? ''), 160)}`
+    else if (after == null) change = `旧：${truncateText(String(before), 160)}`
+    else if (before === after) change = `内容未变：${truncateText(String(after), 160)}`
+    else change = `旧：${truncateText(String(before), 160)} → 新：${truncateText(String(after), 160)}`
+    const reason = typeof item.reason === 'string' && item.reason !== '' ? ` · ${truncateText(item.reason, 80)}` : ''
+    lines.push(`${index + 1}. ${event} · ${at} · actor=${actor}${reason}`)
+    lines.push(`   ${change}`)
+  })
+  if (value.warning !== undefined) lines.push(`注意：${value.warning}`)
+  return lines.join('\n')
+}
+
+/* ------------------------------------------------------------------ */
+/* 10. mnemos_feedback                                                 */
+/* ------------------------------------------------------------------ */
+
+interface FeedbackArgs {
+  id: string
+  helpful: boolean
+  query?: string
+}
+
+interface FeedbackResult {
+  ok: boolean
+  error?: string
+  action?: string
+  warning?: string
+  id?: string
+  confidence?: number
+  feedback_up?: number
+  feedback_down?: number
+  status?: string
+}
+
+/** 记忆反馈：标记某条检索结果有用 / 没用（服务端升降 confidence 并计数）。 */
+export function mnemosFeedbackTool(
+  client: MnemosClient,
+  config: ConfigSource,
+  resolveWorkspacePath: WorkspacePathResolver,
+): ToolDefinition<FeedbackArgs, FeedbackResult> {
+  return {
+    name: 'mnemos_feedback',
+    description:
+      '对一条 Mnemos 记忆记反馈（v6.1：helpful=true 有用 / false 没用），服务端据此升降 confidence 并累计 feedback_up / feedback_down。' +
+      'id 必填，query 可选（触发本次检索的原问题，便于归因）。通常用在 mnemos_search 之后。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '记忆 id（mem_*）。' },
+        helpful: { type: 'boolean', description: 'true = 有用；false = 没用。' },
+        query: { type: 'string', description: '可选：本次检索的原问题（最长 2000 字）。' },
+      },
+      required: ['id', 'helpful'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          ...BASE_PROPERTIES,
+          id: { type: 'string' },
+          confidence: { type: 'number' },
+          feedback_up: { type: 'integer' },
+          feedback_down: { type: 'integer' },
+          status: { type: 'string' },
+        },
+        required: ['ok'],
+      },
+      render: (_args, value) => text(value.ok ? renderFeedback(value) : renderFailure('mnemos_feedback', value)),
+    },
+    async execute(args, exec) {
+      try {
+        const settings = config()
+        if (typeof args.id !== 'string' || args.id.trim() === '') {
+          return {
+            ok: false,
+            error: 'mnemos_feedback 需要记忆 id。',
+            action: '先 mnemos_search 拿到命中的 mem_* 记忆 id，再传 id 与 helpful。',
+          }
+        }
+        if (typeof args.helpful !== 'boolean') {
+          return {
+            ok: false,
+            error: `mnemos_feedback 的 helpful 必须是布尔值（true / false），收到 ${String(args.helpful)}。`,
+            action: '有用传 helpful=true，没用传 helpful=false。',
+          }
+        }
+        const id = args.id.trim()
+        const ensured = await ensurePartition(client, settings, resolveWorkspacePath, exec)
+        const body: Parameters<MnemosClient['feedbackMemory']>[2] = { helpful: args.helpful }
+        if (typeof args.query === 'string' && args.query.trim() !== '') body.query = args.query.trim().slice(0, 2000)
+        const mutation = await client.feedbackMemory(ensured.info.slug, id, body)
+        const memory = mutation.memory
+        const result: FeedbackResult = { ok: true, id }
+        if (typeof memory?.confidence === 'number') result.confidence = memory.confidence
+        if (typeof memory?.feedback_up === 'number') result.feedback_up = memory.feedback_up
+        if (typeof memory?.feedback_down === 'number') result.feedback_down = memory.feedback_down
+        if (typeof memory?.status === 'string') result.status = memory.status
+        if (ensured.warning !== undefined) result.warning = ensured.warning
+        return result
+      } catch (error) {
+        return failResult(error)
+      }
+    },
+  }
+}
+
+function renderFeedback(value: FeedbackResult): string {
+  const lines = [`Mnemos 记忆反馈已记录：${value.id ?? '(未知 id)'}`]
+  const parts = [
+    typeof value.confidence === 'number' ? `信心 ${value.confidence}` : '',
+    typeof value.feedback_up === 'number' ? `有用 ${value.feedback_up}` : '',
+    typeof value.feedback_down === 'number' ? `无用 ${value.feedback_down}` : '',
+    value.status !== undefined ? `状态 ${value.status}` : '',
+  ].filter(Boolean)
+  if (parts.length > 0) lines.push(parts.join(' · '))
+  if (value.warning !== undefined) lines.push(`注意：${value.warning}`)
+  return lines.join('\n')
+}
+
+/* ------------------------------------------------------------------ */
+/* 11. mnemos_update                                                   */
+/* ------------------------------------------------------------------ */
+
+interface UpdateArgs {
+  id: string
+  content?: string
+  importance?: number
+  tags?: string[]
+  metadata?: Record<string, unknown>
+}
+
+interface UpdateResult {
+  ok: boolean
+  error?: string
+  action?: string
+  warning?: string
+  memory?: Record<string, unknown>
+}
+
+/** 更新一条记忆：正文 / 重要度 / 标签 / 元数据（PATCH；readOnly 拦截）。 */
+export function mnemosUpdateTool(
+  client: MnemosClient,
+  config: ConfigSource,
+  resolveWorkspacePath: WorkspacePathResolver,
+): ToolDefinition<UpdateArgs, UpdateResult> {
+  return {
+    name: 'mnemos_update',
+    description:
+      '更新一条 Mnemos 记忆（v6.1 PATCH）：可改 content（正文）/ importance（0–1）/ tags / metadata，只发显式给出的字段，至少给一个。' +
+      'id 必填；返回更新后的记忆摘要，变更会进 mnemos_history。readOnly 模式会拦截。' +
+      '要删除记忆请用控制台或 DELETE /v1/partitions/:p/memories/:id（本插件不暴露删除）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '记忆 id（mem_*）。' },
+        content: { type: 'string', description: '新的记忆正文（非空；隐私值仍用 {{key}} 占位符）。' },
+        importance: { type: 'number', description: '重要度，0–1（服务端按该值参与检索排序）。' },
+        tags: { type: 'array', items: { type: 'string' }, description: '标签（整体替换；最多 20 个，每个 ≤ 64 字符）。' },
+        metadata: { type: 'object', additionalProperties: true, description: '自由元数据（整体替换）。' },
+      },
+      required: ['id'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          ...BASE_PROPERTIES,
+          memory: OBJECT_SCHEMA,
+        },
+        required: ['ok'],
+      },
+      render: (_args, value) => text(value.ok ? renderUpdate(value) : renderFailure('mnemos_update', value)),
+    },
+    async execute(args, exec) {
+      try {
+        const settings = config()
+        if (settings.readOnly) return readOnlyResult()
+        if (typeof args.id !== 'string' || args.id.trim() === '') {
+          return {
+            ok: false,
+            error: 'mnemos_update 需要记忆 id。',
+            action: '先 mnemos_search / mnemos_get 拿到 mem_* 记忆 id，再传 id 与要更新的字段。',
+          }
+        }
+
+        const body: Parameters<MnemosClient['updateMemory']>[2] = {}
+        if (args.content !== undefined) {
+          if (typeof args.content !== 'string' || args.content.trim() === '') {
+            return {
+              ok: false,
+              error: 'content 必须是非空字符串。',
+              action: '要改正文就传非空 content；只改重要度 / 标签 / 元数据时不要传 content。',
+            }
+          }
+          body.content = args.content
+        }
+        if (args.importance !== undefined) {
+          if (typeof args.importance !== 'number' || !Number.isFinite(args.importance) || args.importance < 0 || args.importance > 1) {
+            return {
+              ok: false,
+              error: `importance 必须是 0–1 之间的数字，收到 ${String(args.importance)}。`,
+              action: '把 importance 改成 0 到 1 之间的数（例如 0.8）。',
+            }
+          }
+          body.importance = args.importance
+        }
+        if (args.tags !== undefined) {
+          if (!Array.isArray(args.tags) || args.tags.some((tag) => typeof tag !== 'string' || tag.trim() === '')) {
+            return {
+              ok: false,
+              error: 'tags 必须是字符串数组（元素非空）。',
+              action: '按 ["tag-a","tag-b"] 传 tags；清空标签传空数组 []。',
+            }
+          }
+          body.tags = args.tags.map((tag) => tag.trim()).slice(0, 20)
+        }
+        if (args.metadata !== undefined) {
+          const metadata = asRecord(args.metadata)
+          if (metadata === undefined) {
+            return {
+              ok: false,
+              error: 'metadata 必须是对象。',
+              action: '按 {"source":"...","ticket":"..."} 传 metadata。',
+            }
+          }
+          body.metadata = metadata
+        }
+        if (Object.keys(body).length === 0) {
+          return {
+            ok: false,
+            error: 'mnemos_update 至少需要 content / importance / tags / metadata 之一。',
+            action: '显式给出要更新的字段后重试；只读一条记忆用 mnemos_get。',
+          }
+        }
+
+        const ensured = await ensurePartition(client, settings, resolveWorkspacePath, exec)
+        const mutation = await client.updateMemory(ensured.info.slug, args.id.trim(), body)
+        const result: UpdateResult = { ok: true, memory: summarizeMemory(mutation.memory) }
+        if (ensured.warning !== undefined) result.warning = ensured.warning
+        return result
+      } catch (error) {
+        return failResult(error)
+      }
+    },
+  }
+}
+
+function renderUpdate(value: UpdateResult): string {
+  const memory = value.memory ?? {}
+  const head = `已更新 Mnemos 记忆：${displayText(memory.id)}`
+  const lines = [head]
+  if (memory.content !== undefined) lines.push(`内容：${String(memory.content)}`)
+  const meta = [
+    memory.category !== undefined && memory.category !== null ? `分类 ${String(memory.category)}` : '',
+    memory.importance !== undefined && memory.importance !== null ? `重要度 ${String(memory.importance)}` : '',
+    memory.confidence !== undefined && memory.confidence !== null ? `信心 ${String(memory.confidence)}` : '',
+    memory.status !== undefined && memory.status !== null ? `状态 ${String(memory.status)}` : '',
+    memory.updated_at !== undefined && memory.updated_at !== null ? `更新 ${String(memory.updated_at)}` : '',
+  ].filter(Boolean)
+  if (meta.length > 0) lines.push(meta.join(' · '))
+  if (Array.isArray(memory.tags) && memory.tags.length > 0) lines.push(`标签：${memory.tags.join(', ')}`)
+  if (value.warning !== undefined) lines.push(`注意：${value.warning}`)
+  return lines.join('\n')
+}
+
+/* ------------------------------------------------------------------ */
+/* 12. mnemos_status                                                   */
 /* ------------------------------------------------------------------ */
 
 interface StatusResult {
@@ -1300,6 +1801,8 @@ interface StatusResult {
   reachable: boolean
   baseUrl: string
   apiKeyConfigured: boolean
+  /** 鉴权模式：orgKey=已配置 orgApiKey；none=本地免密（请求不带 Authorization）。 */
+  authMode: 'orgKey' | 'none'
   partitionSlug?: string
   partitionExists?: boolean
   personId?: string
@@ -1307,7 +1810,13 @@ interface StatusResult {
   personExists?: boolean
 }
 
-/** 连接自检：服务可达性、分区是否可达、默认人是否存在、org key 是否配置（不打印密钥）。 */
+/**
+ * 连接自检：服务可达性、鉴权模式、分区是否可达、默认人是否存在（不打印密钥）。
+ *
+ * 免密模式（orgApiKey 为空）不再提前返回：照常 GET 分区 / 人，
+ * 服务端以 `MNEMOS_DEV_NO_API_KEY=1` 启动时能通过；仍返回 401 / 403 时
+ * `reachable=false` 并给出「配置 orgApiKey，或本地以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos」。
+ */
 export function mnemosStatusTool(
   client: MnemosClient,
   config: ConfigSource,
@@ -1316,8 +1825,10 @@ export function mnemosStatusTool(
   return {
     name: 'mnemos_status',
     description:
-      '检查 Mnemos 连接与绑定：baseUrl、orgApiKey 是否配置、当前工作区分区是否可达、默认人是否存在。' +
-      '只做读检查（不会自动建分区 / 建人），API Key 永远不会被打印。触发词：mnemos 状态 / 检查记忆服务 / check mnemos / health.',
+      '检查 Mnemos 连接与绑定：baseUrl、鉴权模式（orgKey / 本地免密）、当前工作区分区是否可达、默认人是否存在。' +
+      '只做读检查（不会自动建分区 / 建人），API Key 永远不会被打印。' +
+      '未配置 orgApiKey 时按免密模式照常探测；401 会提示配置 key 或本地以 MNEMOS_DEV_NO_API_KEY=1 启动。' +
+      '触发词：mnemos 状态 / 检查记忆服务 / check mnemos / health.',
     parameters: { type: 'object', properties: {} },
     output: {
       schema: {
@@ -1328,13 +1839,14 @@ export function mnemosStatusTool(
           reachable: { type: 'boolean' },
           baseUrl: { type: 'string' },
           apiKeyConfigured: { type: 'boolean' },
+          authMode: { type: 'string', enum: ['orgKey', 'none'] },
           partitionSlug: { type: 'string' },
           partitionExists: { type: 'boolean' },
           personId: { type: 'string' },
           personType: { type: 'string' },
           personExists: { type: 'boolean' },
         },
-        required: ['ok', 'reachable', 'baseUrl', 'apiKeyConfigured'],
+        required: ['ok', 'reachable', 'baseUrl', 'apiKeyConfigured', 'authMode'],
       },
       render: (_args, value) => text(renderStatus(value)),
     },
@@ -1342,11 +1854,13 @@ export function mnemosStatusTool(
       const settings = config()
       const baseUrl = client.resolvedBaseUrl()
       const apiKeyConfigured = client.isApiKeyConfigured()
+      const authMode = client.authMode()
       const base: StatusResult = {
         ok: false,
         reachable: false,
         baseUrl,
         apiKeyConfigured,
+        authMode,
         personId: settings.personId,
         personType: settings.personType,
       }
@@ -1359,16 +1873,8 @@ export function mnemosStatusTool(
       }
       base.partitionSlug = identity.slug
 
-      if (!apiKeyConfigured) {
-        return {
-          ...base,
-          error: '未配置 Mnemos org API Key（orgApiKey 为空）。',
-          action: '在「设置 → 插件 → dsh-mnemos-personal」填写 orgApiKey（控制台「密钥」创建 kind=org 的 Key）。',
-        }
-      }
-
       try {
-        // 只确认分区可达；不把分区大对象塞进状态结果。
+        // 只确认分区可达；不把分区大对象塞进状态结果。免密模式同样照常探测。
         await client.getPartition(identity.slug)
         let personExists = false
         try {
@@ -1389,6 +1895,10 @@ export function mnemosStatusTool(
         }
         return result
       } catch (error) {
+        if (error instanceof MnemosApiError && (error.status === 401 || error.status === 403)) {
+          // 鉴权失败：服务可能可达，但当前凭据不被接受；action 已按免密 / orgKey 区分。
+          return { ...base, reachable: false, error: error.message, action: error.action }
+        }
         if (error instanceof MnemosApiError && error.status === 404) {
           return {
             ...base,
@@ -1405,10 +1915,14 @@ export function mnemosStatusTool(
 }
 
 function renderStatus(value: StatusResult): string {
+  const auth =
+    value.authMode === 'none'
+      ? '免密模式（未配置 orgApiKey，请求不带 Authorization；本地需以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos）'
+      : 'orgApiKey 已配置（Bearer）'
   const lines = [
     `Mnemos 连接：${value.reachable ? '服务可达' : '不可达'}`,
     `地址：${value.baseUrl || '(未配置)'}`,
-    `鉴权：${value.apiKeyConfigured ? 'orgApiKey 已配置' : '未配置 orgApiKey'}`,
+    `鉴权：${auth}`,
   ]
   if (value.partitionSlug !== undefined) {
     lines.push(
@@ -1446,6 +1960,10 @@ export function createMnemosTools(
     mnemosBriefTool(client, config, resolveWorkspacePath),
     mnemosContextTool(client, config, resolveWorkspacePath),
     mnemosPersonTool(client, config, resolveWorkspacePath),
+    mnemosProfileTool(client, config, resolveWorkspacePath),
+    mnemosHistoryTool(client, config, resolveWorkspacePath),
+    mnemosFeedbackTool(client, config, resolveWorkspacePath),
+    mnemosUpdateTool(client, config, resolveWorkspacePath),
     mnemosStatusTool(client, config, resolveWorkspacePath),
   ]
 }
@@ -1459,5 +1977,9 @@ export const MNEMOS_TOOL_NAMES = [
   'mnemos_brief',
   'mnemos_context',
   'mnemos_person',
+  'mnemos_profile',
+  'mnemos_history',
+  'mnemos_feedback',
+  'mnemos_update',
   'mnemos_status',
 ] as const

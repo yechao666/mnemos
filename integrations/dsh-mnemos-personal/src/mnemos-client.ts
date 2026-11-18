@@ -3,6 +3,9 @@
  *
  * 契约来源：本仓库 `docs/v6-architecture.md` 第 3 节「API（v6，干净面）」：
  * - 鉴权：`Authorization: Bearer mnemos_live_*`；org key 可访问/创建本组织任意分区。
+ *   本地免密：`orgApiKey` 留空时请求**不带 Authorization**，服务端以 `MNEMOS_DEV_NO_API_KEY=1`
+ *   启动时跳过 key 校验；服务端仍返回 401 / 403 时，错误 `action` 会提示
+ *   「配置 orgApiKey，或本地以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos」。
  * - 端点默认挂在 `/v1/partitions/:partition/...`，`:partition` 支持分区 id 或 slug。
  * - JSON 一律 snake_case。
  * - 人 / 记忆列表统一**游标分页**：响应 `{ items, next_cursor, partition_stats }`，
@@ -144,6 +147,83 @@ export interface MnemosPersonContext {
   [key: string]: unknown
 }
 
+/** 一个人的事实（`GET /v1/partitions/:p/persons/:person/profile` 的 facts 项，v6.1 P1）。 */
+export interface MnemosPersonFact {
+  id?: string
+  partition_id?: string
+  person_id?: string
+  key?: string
+  value?: string
+  confidence?: number
+  valid_from?: string
+  valid_to?: string | null
+  source_memory_id?: string | null
+  created_at?: string
+  updated_at?: string
+  [key: string]: unknown
+}
+
+/** 人的画像（facts + 摘要；`force=1` 时强制重新生成）。 */
+export interface MnemosPersonProfile {
+  person?: MnemosPerson
+  /** 结构化事实（key / value / confidence）。 */
+  facts?: MnemosPersonFact[]
+  /** 服务端生成的画像摘要（可能为空串）。 */
+  summary?: string
+  generated_at?: string | null
+  /** 是否命中 person_profiles 缓存（force=1 时为 false）。 */
+  cached?: boolean
+  /** 原始响应（调试 / 兼容用）。 */
+  raw?: unknown
+  [key: string]: unknown
+}
+
+/** 一条记忆的变更历史（v6.1：ADD / UPDATE / MERGE / SUPERSEDE / FEEDBACK …）。 */
+export interface MnemosMemoryHistoryEntry {
+  id?: string
+  partition_id?: string
+  memory_id?: string
+  person_id?: string | null
+  /** 事件类型：ADD / UPDATE / MERGE / SUPERSEDE / FEEDBACK / PRIVACY / DELETE / NOOP … */
+  event?: string
+  old_content?: string | null
+  new_content?: string | null
+  /** 操作者标签（如 `api_key:xxx` / `user:xxx`）。 */
+  actor?: string | null
+  reason?: string | null
+  meta?: Record<string, unknown>
+  created_at?: string
+  [key: string]: unknown
+}
+
+/** 记忆反馈的请求体（`POST /v1/partitions/:p/memories/:id/feedback`）。 */
+export interface MemoryFeedbackBody {
+  /** true = 有用，false = 没用（服务端据此升降 confidence 并计数）。 */
+  helpful: boolean
+  /** 触发本次检索的 query（可选，便于归因）。 */
+  query?: string
+}
+
+/** 更新记忆的请求体（PATCH；只发显式给出的字段，全部可选但至少一个）。 */
+export interface MemoryUpdateBody {
+  content?: string
+  category?: string
+  importance?: number
+  confidence?: number
+  status?: string
+  tags?: string[]
+  metadata?: Record<string, unknown>
+  expires_at?: string | null
+  /** v6.2：整体替换占位符映射（正文未使用的键忽略）。 */
+  placeholders?: Record<string, string>
+}
+
+/** 单条记忆变更（feedback / update）的归一结果。 */
+export interface MemoryMutationResult {
+  memory?: MnemosMemory
+  raw: unknown
+}
+
 /** v6 游标分页响应（归一后）。 */
 export interface CursorPage<T> {
   items: T[]
@@ -175,7 +255,7 @@ export interface MnemosApiErrorInit {
   message: string
   /** HTTP 状态码；网络层失败时为 undefined。 */
   status?: number
-  /** 服务端 `error.code`，或本地错误码（network_error / timeout / missing_api_key …）。 */
+  /** 服务端 `error.code`，或本地错误码（network_error / timeout / missing_base_url / invalid_base_url …）。 */
   code?: string
   /** 建议的下一步动作（工具层原样透传给模型）。 */
   action?: string
@@ -333,6 +413,21 @@ function actionFor(status: number | undefined, code: string): string {
   return '检查 baseUrl / orgApiKey 与 Mnemos 服务日志后重试。'
 }
 
+/**
+ * 未配置 orgApiKey（免密模式）时服务端仍要求鉴权的提示。
+ *
+ * 本地开发：以 `MNEMOS_DEV_NO_API_KEY=1` 启动 Mnemos 即可不校验 key；
+ * 否则在设置页填 orgApiKey。这段文案同时被 status 工具复用。
+ */
+export const NO_API_KEY_ACTION =
+  '配置 orgApiKey，或本地以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos 后重试。'
+
+/** 免密模式下 401 / 403 的错误 action（带「为什么不带 Authorization」的说明）。 */
+function noApiKeyAuthAction(status: number | undefined): string {
+  const suffix = status === 403 ? '（服务端也可能要求 key 的 admin / 分区作用域）' : ''
+  return `请求未携带 Authorization（orgApiKey 未配置）：${NO_API_KEY_ACTION}${suffix}`
+}
+
 /** 网络层异常（fetch 直接 reject）统一归一。 */
 function isTimeoutError(error: unknown): boolean {
   return error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
@@ -472,6 +567,51 @@ function normalizeSearch(payload: unknown): MemorySearchResult {
 }
 
 /**
+ * 画像响应归一：容忍 `{ profile }` 包装 / 裸对象；facts 容忍 `items` 包装或裸数组。
+ * 服务端 v6.1 的响应是 `{ person, facts, summary, generated_at, cached }`。
+ */
+export function extractPersonProfile(payload: unknown): MnemosPersonProfile {
+  const root = asRecord(payload)
+  const node = asRecord(root?.profile) ?? root ?? {}
+  const profile: MnemosPersonProfile = { raw: payload }
+  const person = asRecord(node.person)
+  if (person !== undefined) profile.person = person as MnemosPerson
+  const factsRaw = Array.isArray(node.facts)
+    ? node.facts
+    : Array.isArray(asRecord(node.facts)?.items)
+      ? (asRecord(node.facts)?.items as unknown[])
+      : []
+  profile.facts = factsRaw.filter(isRecord) as MnemosPersonFact[]
+  const summary = node.summary
+  if (typeof summary === 'string') profile.summary = summary
+  const generatedAt = stringField(node, 'generated_at', 'generatedAt')
+  if (generatedAt !== undefined) profile.generated_at = generatedAt
+  const cached = node.cached
+  if (typeof cached === 'boolean') profile.cached = cached
+  return profile
+}
+
+/** 历史响应归一：`{ items }` / `{ history }` / 裸数组。 */
+export function extractMemoryHistory(payload: unknown): MnemosMemoryHistoryEntry[] {
+  const record = asRecord(payload)
+  if (record !== undefined) {
+    for (const key of ['items', 'history', 'events']) {
+      const value = record[key]
+      if (Array.isArray(value)) return value.filter(isRecord) as MnemosMemoryHistoryEntry[]
+    }
+  }
+  if (Array.isArray(payload)) return payload.filter(isRecord) as MnemosMemoryHistoryEntry[]
+  return []
+}
+
+/** 单条记忆变更响应归一：`{ memory }` / 裸记忆对象。 */
+export function extractMemoryMutation(payload: unknown): MemoryMutationResult {
+  const record = asRecord(payload)
+  const memory = (asRecord(record?.memory) ?? asRecord(record?.result) ?? record) as MnemosMemory | undefined
+  return { memory, raw: payload }
+}
+
+/**
  * 读取活配置的 Mnemos 客户端：每次请求都重新解析配置，
  * 因此设置页改动（baseUrl / orgApiKey / personId …）无需重建客户端或重挂工具。
  */
@@ -499,6 +639,15 @@ export class MnemosClient {
   /** 当前是否配置了 org API Key（只报布尔，绝不返回密钥）。 */
   isApiKeyConfigured(): boolean {
     return Boolean((this.config().orgApiKey ?? '').trim())
+  }
+
+  /**
+   * 当前鉴权模式：
+   * - `orgKey`：配置了 orgApiKey，请求带 `Authorization: Bearer …`；
+   * - `none`：留空（本地免密，请求不带 Authorization）。
+   */
+  authMode(): 'orgKey' | 'none' {
+    return this.isApiKeyConfigured() ? 'orgKey' : 'none'
   }
 
   /** 生效超时（毫秒）。 */
@@ -541,18 +690,13 @@ export class MnemosClient {
       }
     }
 
+    // 鉴权：配置了 orgApiKey 就带 Bearer；留空则为「免密模式」，**不发 Authorization**
+    //（服务端以 MNEMOS_DEV_NO_API_KEY=1 启动时不校验 key）。不再本地短路：
+    // 让请求真正到达服务端，由服务端的 401 / 403 报出可操作的下一步。
     const apiKey = (this.config().orgApiKey ?? '').trim()
-    if (!apiKey) {
-      throw new MnemosApiError({
-        message: '未配置 Mnemos org API Key：orgApiKey 为空。',
-        code: 'missing_api_key',
-        action: '在「设置 → 插件 → dsh-mnemos-personal」填写 orgApiKey（控制台「密钥」创建 kind=org 的 Key，建议带 admin）。',
-        method,
-        path,
-      })
-    }
 
-    const headers: Record<string, string> = { Accept: 'application/json', Authorization: `Bearer ${apiKey}` }
+    const headers: Record<string, string> = { Accept: 'application/json' }
+    if (apiKey !== '') headers.Authorization = `Bearer ${apiKey}`
     if (options.body !== undefined) headers['Content-Type'] = 'application/json'
 
     let response: Response
@@ -591,7 +735,11 @@ export class MnemosClient {
         stringField(error, 'message') ?? (typeof payload === 'string' ? payload.slice(0, 500) : response.statusText)
       const requestId =
         stringField(error, 'requestId', 'request_id') ?? response.headers.get('x-request-id') ?? undefined
-      const action = actionFor(response.status, code)
+      // 免密模式下的 401 / 403 用专用提示；其余情况沿用按状态码归一的 action。
+      const action =
+        apiKey === '' && (response.status === 401 || response.status === 403)
+          ? noApiKeyAuthAction(response.status)
+          : actionFor(response.status, code)
       throw new MnemosApiError({
         message: `Mnemos ${method} ${path} -> ${response.status} ${code}: ${detail}（${action}）`,
         status: response.status,
@@ -753,6 +901,20 @@ export class MnemosClient {
     })
   }
 
+  /** `GET /v1/partitions/:p/persons/:person/profile` —— 人的画像（facts + summary；force=1 强制刷新）。 */
+  async getPersonProfile(
+    partitionRef: string,
+    personRef: string,
+    options: { force?: boolean } = {},
+  ): Promise<MnemosPersonProfile> {
+    const payload = await this.request(
+      'GET',
+      this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}/profile`),
+      { query: { force: options.force === true ? '1' : undefined } },
+    )
+    return extractPersonProfile(payload)
+  }
+
   /** `GET /v1/partitions/:p/persons/:person/dream` —— 人级做梦状态。 */
   getPersonDream(partitionRef: string, personRef: string): Promise<unknown> {
     return this.request('GET', this.partitionPath(partitionRef, `/persons/${encodeURIComponent(personRef)}/dream`))
@@ -880,5 +1042,34 @@ export class MnemosClient {
   /** `GET /v1/partitions/:p/memories/:id` —— 记忆详情。 */
   getMemory(partitionRef: string, id: string): Promise<unknown> {
     return this.request('GET', this.partitionPath(partitionRef, `/memories/${encodeURIComponent(id)}`))
+  }
+
+  /** `GET /v1/partitions/:p/memories/:id/history` —— 该记忆的变更历史（新→旧）。 */
+  async getMemoryHistory(partitionRef: string, id: string): Promise<MnemosMemoryHistoryEntry[]> {
+    const payload = await this.request(
+      'GET',
+      this.partitionPath(partitionRef, `/memories/${encodeURIComponent(id)}/history`),
+    )
+    return extractMemoryHistory(payload)
+  }
+
+  /** `POST /v1/partitions/:p/memories/:id/feedback` —— 记一次有用 / 没用（升降 confidence）。 */
+  async feedbackMemory(partitionRef: string, id: string, body: MemoryFeedbackBody): Promise<MemoryMutationResult> {
+    const payload = await this.request(
+      'POST',
+      this.partitionPath(partitionRef, `/memories/${encodeURIComponent(id)}/feedback`),
+      { body },
+    )
+    return extractMemoryMutation(payload)
+  }
+
+  /** `PATCH /v1/partitions/:p/memories/:id` —— 更新记忆（content / importance / tags / metadata …）。 */
+  async updateMemory(partitionRef: string, id: string, body: MemoryUpdateBody): Promise<MemoryMutationResult> {
+    const payload = await this.request(
+      'PATCH',
+      this.partitionPath(partitionRef, `/memories/${encodeURIComponent(id)}`),
+      { body },
+    )
+    return extractMemoryMutation(payload)
   }
 }

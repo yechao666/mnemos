@@ -1,7 +1,7 @@
 {
   "name": "dsh-mnemos-personal",
   "version": "0.1.0",
-  "description": "Mnemos v6（中立记忆服务）接入 dsh：以工作区为分区（Partition）、记忆按人（Person）组织，提供 mnemos_workspace / mnemos_add / mnemos_search / mnemos_get / mnemos_brief / mnemos_context / mnemos_person / mnemos_status 8 个 Agent 工具。只需主机半边，通过 `dsh plugin --profile <name> add link:<path>` 热插拔，不改 dsh 源码。",
+  "description": "Mnemos v6（中立记忆服务）接入 dsh：以工作区为分区（Partition）、记忆按人（Person）组织，提供 mnemos_workspace / mnemos_add / mnemos_search / mnemos_get / mnemos_brief / mnemos_context / mnemos_person / mnemos_profile / mnemos_history / mnemos_feedback / mnemos_update / mnemos_status 12 个 Agent 工具（orgApiKey 可留空走本地免密）。只需主机半边，通过 `dsh plugin --profile <name> add link:<path>` 热插拔，不改 dsh 源码。",
   "type": "module",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

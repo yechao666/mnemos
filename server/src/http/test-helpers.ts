@@ -12,7 +12,7 @@ import type { ApiScope, Role } from '../../../shared/src/types.ts';
 import type { AppContext, Logger, Metrics, Platform } from '../contracts.ts';
 import { migrate } from '../db/index.ts';
 import { createMemoryService } from '../engine/index.ts';
-import { loadEnv } from '../env.ts';
+import { loadEnv, type Env } from '../env.ts';
 import { newApiKeySecret, nowIso, sha256 } from '../lib/ids.ts';
 import { createHttpServer } from './server.ts';
 
@@ -147,11 +147,12 @@ function addPartition(db: DatabaseSync, id: string, orgId: string, slug: string,
   ).run(id, orgId, slug, name, AT, AT);
 }
 
-function fakeEnv() {
+function fakeEnv(overrides: Partial<Env> = {}) {
   return loadEnv({
     host: '127.0.0.1',
     port: 0,
     authDisabled: false,
+    devNoApiKey: false,
     quotaEnforce: false,
     demoMode: false,
     metricsEnabled: false,
@@ -160,6 +161,7 @@ function fakeEnv() {
     shutdownTimeoutMs: 1_000,
     dreamSchedulerEnabled: false,
     dreamTickMs: 60_000,
+    ...overrides,
   });
 }
 
@@ -177,8 +179,9 @@ export async function closeServer(server: Server): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-/** 建立一份完整的 HTTP 测试夹具（调用方负责在 t.after 里 close）。 */
-export async function setupHttpFixture(): Promise<HttpFixture> {
+/** 建立一份完整的 HTTP 测试夹具（调用方负责在 t.after 里 close）。
+ *  options.env 可覆盖 Env 字段（如 devNoApiKey: true），不传时与旧行为一致。 */
+export async function setupHttpFixture(options: { env?: Partial<Env> } = {}): Promise<HttpFixture> {
   const db = new DatabaseSync(':memory:');
   migrate(db);
 
@@ -227,7 +230,7 @@ export async function setupHttpFixture(): Promise<HttpFixture> {
   const engine = createMemoryService(db);
   const logger = fakeLogger();
   const metrics = fakeMetrics();
-  const env = fakeEnv();
+  const env = fakeEnv(options.env);
   const platform = fakePlatform(logger, metrics);
   const app: AppContext = { db, engine, env, startedAt: Date.now(), logger, metrics, platform };
 

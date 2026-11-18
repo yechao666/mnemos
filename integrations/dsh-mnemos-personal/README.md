@@ -4,7 +4,8 @@
 **以工作区作为分区（Partition）**、**记忆按人（Person）组织**，人 / 记忆列表使用 v6 游标分页。
 
 - **host-only**：没有浏览器半端，设置页用 dsh 的自动表单（导出 `Config` + `.volatile()` 字段）。
-- **8 个 Agent 工具**：工作区绑定、写入、检索、读取、简报、人物上下文、人管理、自检。
+- **12 个 Agent 工具**：工作区绑定、写入、检索、读取、简报、人物上下文、人管理、画像、历史、反馈、更新、自检。
+- **免密可用**：`orgApiKey` 可留空（本地免密，请求不带 `Authorization`，服务端以 `MNEMOS_DEV_NO_API_KEY=1` 启动）。
 - **零 harness 依赖**：运行时只依赖 `@deepseek-ai/schemastery`（表单 schema），不 import `cordis` / `dsh-tools` / `dsh-system-prompt` / `dsh-llm`（避免两份模块 Symbol 冲突，见 `src/dsh-types.d.ts`）。
 - **热插拔**：`dsh plugin --profile <name> add link:<本目录>`，不改 dsh 源码。
 - **旧插件不动**：`integrations/dsh-mnemos`（项目级共享记忆 + 任务）保持可用，两者可同时安装（行 id 不同：`dsh-mnemos` / `dsh-mnemos-personal`）。
@@ -43,15 +44,30 @@
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `baseUrl` | `http://127.0.0.1:4380` | Mnemos 服务地址（不带尾斜杠、不带 `/v1`）。 |
-| `orgApiKey` | `''` | **org key**（`mnemos_live_*`，控制台「密钥」里 kind=org）。按工作区自动建分区需要 admin 作用域；读写需要 `memories:read` / `memories:write`。 |
+| `orgApiKey` | `''` | **org key**（`mnemos_live_*`，控制台「密钥」里 kind=org）。按工作区自动建分区需要 admin 作用域；读写需要 `memories:read` / `memories:write`。**可留空**：留空时请求不带 Authorization，走本地免密（见 2.1）。 |
 | `personId` | `dsh-agent` | 默认人的 external_id。 |
 | `personType` | `agent` | 默认人的类型：`human` / `agent` / `service`。 |
 | `partitionMode` | `workspace` | `workspace`（按工作区派生）或 `fixed`（用 `fixedPartition`）。 |
 | `fixedPartition` | `''` | fixed 模式的分区 slug（或分区 id）。 |
-| `readOnly` | `false` | 只读模式：拦截 `mnemos_add` / `mnemos_person action=upsert`，也不自动建分区 / 建人。 |
-| `systemPrompt` | `true` | 向 Agent 注入「本工作区已绑定分区 X，记忆按人组织；默认人 Y」+ 使用时机。 |
+| `readOnly` | `false` | 只读模式：拦截 `mnemos_add` / `mnemos_update` / `mnemos_person action=upsert`，也不自动建分区 / 建人。 |
+| `systemPrompt` | `true` | 向 Agent 注入「本工作区已绑定分区 X，记忆按人组织；默认人 Y」+ 使用时机 + 免密说明。 |
 
 所有字段都是 `.volatile()`：设置页保存后无需重挂插件，下一次工具调用即生效。
+
+### 2.1 本地免密（`orgApiKey` 留空）
+
+`orgApiKey` 留空时插件进入**本地免密模式**：所有请求不再带 `Authorization` 头，也**不会**在本地报
+`missing_api_key` 短路。服务端需以 `MNEMOS_DEV_NO_API_KEY=1` 启动（生产环境启动会拒绝该开关）：
+
+```bash
+MNEMOS_DEV_NO_API_KEY=1 pnpm --dir server start
+```
+
+- 服务端未开启免密时，v1 仍会返回 `401`；插件把 `action` 归一成
+  「配置 orgApiKey，或本地以 MNEMOS_DEV_NO_API_KEY=1 启动 Mnemos 后重试」。
+- `mnemos_status` 在免密模式下照常探测分区 / 默认人，返回 `authMode='none'`（有 key 时 `'orgKey'`）
+  与 `apiKeyConfigured=false`；无 key 且 401 时 `reachable=false` 并给出同上 action。
+- 免密只建议本地开发使用；远程 / 生产部署请填 org key（控制台「密钥」创建，自动建分区建议带 admin）。
 
 ---
 
@@ -66,7 +82,11 @@
 | `mnemos_brief` | 人的简报（v6 人级；最近 person 记忆 + 相关分区共享，压缩文本） | `person_id`（默认 self） | 否 |
 | `mnemos_context` | 人的上下文（资料 + 简报 + 相关记忆 + 共享知识），返回可直接注入的 `prompt` | `person_id`（默认 self）、`query` | 否 |
 | `mnemos_person` | `list`（**游标**分页）/ `get` / `upsert` 人 | `action`、`person_id`、`type`、`display_name`、`attributes`、`status`、`q`、`cursor`、`limit` | upsert 是 |
-| `mnemos_status` | 连接自检：可达性、分区是否存在、默认人是否存在、key 是否配置（不打印密钥） | 无 | 否 |
+| `mnemos_profile` | 人物画像：结构化 facts + 服务端摘要（`force=true` 强制重算，默认用缓存） | `person_id`（默认 self）、`force` | 否（force 时服务端重算画像） |
+| `mnemos_history` | 一条记忆的变更时间线（ADD / UPDATE / MERGE / SUPERSEDE / FEEDBACK / PRIVACY；含 event / actor / created_at / old→new） | `id`（`mem_*`） | 否 |
+| `mnemos_feedback` | 给一条记忆记反馈（有用 / 没用），服务端据此升降 `confidence` 并计数 | `id`、`helpful`、`query` | 是（写 feedback + history） |
+| `mnemos_update` | 更新记忆正文 / 重要度 / 标签 / 元数据（PATCH，返回更新后摘要并进历史） | `id`、`content`、`importance`、`tags`、`metadata` | 是（readOnly 拦截） |
+| `mnemos_status` | 连接自检：可达性、鉴权模式（`orgKey` / `none`）、分区是否存在、默认人是否存在（不打印密钥） | 无 | 否 |
 
 **v6 分页协议**：人 / 记忆列表返回 `{ items, next_cursor, partition_stats }`；工具输出里对应
 `results` / `people`、`count`、`next_cursor`、`partition_stats`。要翻页时把上一页的
@@ -112,10 +132,15 @@ Mnemos 记忆系统（dsh-mnemos-personal）：本工作区已绑定分区 ws-de
 使用时机：
 - 开始任务前先调 mnemos_context 取默认人的上下文……
 - 想快速了解「关于这个人已知什么」用 mnemos_brief；……用游标翻页列表用 mnemos_get……
+- 想了解「这个人的资料被结构化成了哪些事实」用 mnemos_profile（facts + 摘要，force 可强制重算）；
+  看一条记忆的变更时间线用 mnemos_history（event/actor/old→new）。
+- 检索结果有用 / 没用时用 mnemos_feedback 记一次；需要修正记忆正文 / 重要度 / 标签 / 元数据用 mnemos_update（readOnly 会拦）。
 - 写记忆遇到隐私值（手机号 / 邮箱 / 身份证 / 银行卡等）时用 placeholders 抽离：真实值放映射，
   正文只写 {{key}} 占位符（如 text: "手机号是 {{phone_a1b2}}", placeholders: {"phone_a1b2":"18334423321"}）；
   正文只落 token，mnemos_brief / mnemos_context 会由服务端自动还原。
 硬性限制：readOnly 模式会拦截记忆写入与人变更；orgApiKey 不要出现在回复里……
+鉴权与免密：orgApiKey 留空时是本地免密模式——请求不带 Authorization；此时 Mnemos 需以
+MNEMOS_DEV_NO_API_KEY=1 启动，否则返回 401（调 mnemos_status 自检，action 会提示配置 orgApiKey 或开启本地免密）。
 ```
 
 提示段是**动态求值**的：每个会话按自己的工作区 / fixed 配置算分区 slug。
@@ -135,8 +160,8 @@ node --test test/*.test.mjs       # 或 pnpm test（= build + 测试）
 ```
 
 - `pnpm build`：`tsc -p tsconfig.build.json` 产出 `lib/`，再 `tsc -p tsconfig.json --noEmit` 类型检查。
-- 测试：`node --test` + 本地 `http.createServer` **假 Mnemos v6**（实现 partitions / stats / persons 游标列表 / 人级 memories / brief / context / dream / 全局 memories / search），**不依赖真实后端**。
-- 测试覆盖：slug 稳定性与不同路径隔离、fixed 模式、默认人、按人隔离、v6 游标分页（persons / memories）、人级写入路径、占位符写入（正文只存 token / 映射透传 / 非法 key 报错）、分区 id 作为引用、检索主路径与 `GET memories?q=` 退化、`scope=session` 缺省会话 id、readOnly 拦截、错误归一、brief / context prompt、系统提示文案、设置热更新。
+- 测试：`node --test` + 本地 `http.createServer` **假 Mnemos v6**（实现 partitions / stats / persons 游标列表 / 人级 memories / brief / context / dream / 全局 memories / search / profile / history / feedback / PATCH memory），**不依赖真实后端**。
+- 测试覆盖（当前 94 个用例）：slug 稳定性与不同路径隔离、fixed 模式、默认人、按人隔离、v6 游标分页（persons / memories）、人级写入路径、占位符写入（正文只存 token / 映射透传 / 非法 key 报错）、分区 id 作为引用、检索主路径与 `GET memories?q=` 退化、`scope=session` 缺省会话 id、readOnly 拦截（含 `mnemos_update`）、错误归一、brief / context prompt、画像 / 历史 / 反馈 / 更新、免密模式（无 key 不带 Authorization / 401 提示 / status authMode）、系统提示文案、设置热更新。
 
 ### 5.2 安装到 dsh profile
 
@@ -146,7 +171,8 @@ node --test test/*.test.mjs       # 或 pnpm test（= build + 测试）
 dsh plugin --profile desktop add link:/Volumes/wd2025/devel/aiworker/mnemos/integrations/dsh-mnemos-personal
 ```
 
-安装后到「设置 → 插件 → dsh-mnemos-personal」填 `baseUrl` 与 `orgApiKey`，然后在任意工作区开新会话，
+安装后到「设置 → 插件 → dsh-mnemos-personal」填 `baseUrl`（`orgApiKey` 可留空：本地以
+`MNEMOS_DEV_NO_API_KEY=1` 启动 Mnemos 即免密；远程 / 生产请填 org key），然后在任意工作区开新会话，
 调 `mnemos_workspace` / `mnemos_status` 自检。卸载：
 
 ```bash
@@ -164,12 +190,14 @@ dsh plugin --profile desktop remove dsh-mnemos-personal
 
 - 端点：`POST /v1/partitions`（幂等 upsert）、`GET /v1/partitions/:p`、`GET /v1/partitions/:p/stats`、
   `GET /v1/partitions/:p/persons`（`cursor/limit/q/type/status/sort`）、`PUT/GET/PATCH .../persons/:person`、
+  `GET .../persons/:person/profile`（v6.1 画像，`force=1` 强制重算）、
   `GET/POST .../persons/:person/memories`、`GET .../persons/:person/brief`、`POST .../persons/:person/context`、
-  `GET/POST .../persons/:person/dream[/run]`、`GET/POST/GET-by-id .../memories`、`POST .../memories/search`。
+  `GET/POST .../persons/:person/dream[/run]`、`GET/POST/GET-by-id .../memories`、`POST .../memories/search`、
+  `GET .../memories/:id/history`、`POST .../memories/:id/feedback`、`PATCH .../memories/:id`（v6.1）。
 - 分页协议：所有人 / 记忆列表按 `{ items, next_cursor, partition_stats }` 解析；`limit` 默认 50、上限 200。
 - 计数：分区统计读 `partition_stats`（`/stats`）；人的计数读 persons 行的 `memory_count` 等。
 - 分区引用：`:partition` 支持内部 id 或 slug（客户端原样拼路径）。
-- 鉴权 / 参数：`Authorization: Bearer <orgApiKey>`；JSON snake_case；错误体 `{ error: { code, message } }`。
+- 鉴权 / 参数：有 `orgApiKey` 时 `Authorization: Bearer <orgApiKey>`；留空时**不带** Authorization（本地免密，服务端 `MNEMOS_DEV_NO_API_KEY=1`）。JSON snake_case；错误体 `{ error: { code, message } }`。
 
 **兼容 / 容错点**（对照 v6 后端的 `serialize.ts` / `routes/v1.ts` 实现，两侧都容错）：
 
@@ -187,12 +215,16 @@ dsh plugin --profile desktop remove dsh-mnemos-personal
 5. **写入人标识**：人级写记忆路径优先用内部 id，服务端同时支持 id 或 external。
 6. **分区统计降级**：`GET /stats` 若 404 / 405（旧服务），`mnemos_workspace` 仍返回分区 / 人并带 warning。
 7. **slug 长度**：v6 slug 上限 48 字符，`ws-<basename>-<hash8>` 的 basename 截断到 36（哈希仍唯一）。
+8. **v6.1 四类端点**：画像（`/profile`）、历史（`/history`）、反馈（`/feedback`）、更新（`PATCH /memories/:id`）
+   在旧服务上可能 404；工具会返回 `{ ok:false, error, action }`，不影响其它工具。历史里的 `actor` 是服务端
+   归一过的可读字符串（如 `api_key:xxx`），插件原样渲染。
 
 **待真实 v6 后端联调确认**（本轮用假 v6 服务 + 对照 v6 后端实现验证，但没有连真实服务）：
 
 1. 部署后的 v6 服务版本是否已包含 `GET /stats`、人级 memories、`POST .../memories/search` 兼容端点。
 2. org key 是否带 admin（自动建分区）；非 admin 时插件按 slug 直连并带 warning。
 3. 人级 brief 的 `brief_enabled` 设置 / LLM 润色是否可用（插件只读结果，不影响调用）。
+4. `MNEMOS_DEV_NO_API_KEY=1` 免密部署是否已上线；未上线时无 key 的 `mnemos_status` 会报 401 并提示配置 key。
 
 ---
 
@@ -208,8 +240,8 @@ integrations/dsh-mnemos-personal/
 ├── src/
 │   ├── config.ts         # Config schema + 默认值 + resolveConfig（解包 volatile）
 │   ├── workspace.ts      # 工作区路径规范化 / slug / 分区推导 / 会话工作区解析
-│   ├── mnemos-client.ts  # v6 `/v1/partitions/...` 客户端（游标分页、超时、错误归一、分区/人缓存）
-│   ├── tools.ts          # 8 个工具（execute 不抛，{ ok, error, action }）
+│   ├── mnemos-client.ts  # v6 `/v1/partitions/...` 客户端（游标分页、画像 / 历史 / 反馈 / PATCH、超时、错误归一、分区/人缓存）
+│   ├── tools.ts          # 12 个工具（execute 不抛，{ ok, error, action }）
 │   ├── index.ts          # apply：工具 + 动态系统提示 + 设置页
 │   └── dsh-types.d.ts    # 本地最小化 dsh 宿主类型（零 harness 运行时依赖）
 ├── lib/                  # pnpm build 产物（d.ts 声明 + js）
@@ -221,8 +253,11 @@ integrations/dsh-mnemos-personal/
 - 只支持「一个插件实例 = 一个默认人」；同一会话要读写多个人时显式传 `person_id`（不支持按会话自动切人）。
 - 分区 slug 由路径哈希决定，工作区目录**改名 / 移动**会得到新分区（旧分区数据不迁移）；需要稳定身份时用 `fixed` 模式。
 - 中文目录名的 basename 会被清洗成 `workspace` 兜底段（哈希仍唯一），slug 里看不到中文。
-- 工具不暴露「记忆更新 / 删除」（v6 的 PATCH / DELETE 留给后续版本）；`mnemos_person` 也暂不暴露 `update` 动作，
+- 工具已暴露 `mnemos_update`（PATCH 正文 / 重要度 / 标签 / 元数据）与 `mnemos_feedback`（反馈），
+  但**不暴露删除**（`DELETE /memories/:id` 留给控制台或后续版本）；`mnemos_person` 也暂不暴露 `update` 动作，
   但客户端已实现 `PATCH persons/:person`，后续加动作即可。
+- `readOnly` 只拦截 `mnemos_add` / `mnemos_update` / `mnemos_person action=upsert` 与自动建分区 / 建档；
+  `mnemos_feedback` 仍可写反馈（它只调整 `confidence` / 计数，不改记忆正文）。
 - `mnemos_get` 暂不透出占位符 `reveal` 参数：需要解密真实值时走 `mnemos_brief` / `mnemos_context`
   或 `GET /v1/partitions/:p/memories/:id?reveal=placeholders`。
 - v6 不再做事实抽取：`mnemos_add` 的 `infer` 参数已移除，记忆按原文入库（仍可用 `messages` 多轮内容）。
