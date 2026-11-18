@@ -936,6 +936,17 @@
   gap: 14px;
 }
 
+
+/* 规则表「动作 / 打码」：badge 不能随 vstack 拉满列宽（文字换行时尤其明显） */
+.privacy-rule-action {
+  align-items: flex-start;
+}
+.privacy-rule-action .badge {
+  width: fit-content;
+  max-width: 100%;
+  align-self: flex-start;
+}
+
 /* ------------------------------ 试跑预览 ------------------------------ */
 .privacy-preview-text {
   margin: 0;
@@ -979,6 +990,12 @@
   background: rgba(0, 0, 0, 0.18);
   color: var(--text-dim);
   font-size: 11px;
+}
+
+
+.privacy-hit-row .badge {
+  width: fit-content;
+  justify-self: start;
 }
 
 .privacy-hit-value {

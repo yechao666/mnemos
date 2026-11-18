@@ -220,7 +220,7 @@ export function PrivacyRulesPage() {
       header: '动作 / 打码',
       width: 168,
       render: (rule) => (
-        <div className="vstack gap-2">
+        <div className="vstack gap-2 privacy-rule-action">
           <Badge tone={rule.action === 'placeholder' ? 'cyan' : 'green'} size="sm">
             {PRIVACY_ACTION_LABEL[rule.action] ?? rule.action}
           </Badge>
