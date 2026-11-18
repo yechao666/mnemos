@@ -1,5 +1,6 @@
 import type {
   ApiKey,
+  LlmStage,
   MemoryScope,
   Partition,
   PartitionSettings,
@@ -44,6 +45,9 @@ import {
   personProfileQuerySchema,
   personUpdateSchema,
   personUpsertSchema,
+  llmProviderCreateSchema,
+  llmProviderUpdateSchema,
+  llmStagePutSchema,
   privacyGroupApplySchema,
   privacyGroupQuerySchema,
   privacyPreviewSchema,
@@ -874,6 +878,7 @@ export function registerConsoleRoutes(router: Router): void {
         personId: person.id,
         maxChars: query.maxChars,
         force: query.force,
+        allowLlm: query.allowLlm === true,
       });
       rc.json(brief);
     },
@@ -949,6 +954,116 @@ export function registerConsoleRoutes(router: Router): void {
         actorForUser(rc, auth.user),
       );
       rc.json(result);
+    },
+  });
+
+  /* --- v6.4：大模型设置（供应商 / 阶段 / 用量 / 状态，owner+admin） --- */
+  router.add({
+    method: 'GET',
+    path: '/api/llm/providers',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      requireConsoleRole(rc, 'admin');
+      rc.json({ items: rc.app.engine.listLlmProviders() });
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/llm/providers',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const auth = requireConsoleRole(rc, 'admin');
+      const body = await rc.body(llmProviderCreateSchema);
+      const provider = rc.app.engine.createLlmProvider(body, actorForUser(rc, auth.user));
+      rc.json({ provider }, 201);
+    },
+  });
+
+  router.add({
+    method: 'PATCH',
+    path: '/api/llm/providers/:id',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const auth = requireConsoleRole(rc, 'admin');
+      const body = await rc.body(llmProviderUpdateSchema);
+      const provider = rc.app.engine.updateLlmProvider(rc.params.id ?? '', body, actorForUser(rc, auth.user));
+      rc.json({ provider });
+    },
+  });
+
+  router.add({
+    method: 'DELETE',
+    path: '/api/llm/providers/:id',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      const auth = requireConsoleRole(rc, 'admin');
+      rc.app.engine.deleteLlmProvider(rc.params.id ?? '', actorForUser(rc, auth.user));
+      rc.res.statusCode = 204;
+      rc.res.end();
+    },
+  });
+
+  router.add({
+    method: 'POST',
+    path: '/api/llm/providers/:id/test',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const auth = requireConsoleRole(rc, 'admin');
+      const id = rc.params.id ?? '';
+      const result = await rc.app.engine.testLlmProvider(id);
+      writeAudit(rc.app.db, {
+        orgId: auth.org.id,
+        actor: actorForUser(rc, auth.user),
+        action: 'llm.provider.test',
+        resourceType: 'llm_provider',
+        resourceId: id,
+        detail: { ok: result.ok, latencyMs: result.latencyMs, model: result.model, error: result.error },
+      });
+      rc.json(result);
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/api/llm/stages',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      requireConsoleRole(rc, 'admin');
+      rc.json({ items: rc.app.engine.listLlmStages() });
+    },
+  });
+
+  router.add({
+    method: 'PUT',
+    path: '/api/llm/stages/:stage',
+    auth: 'console',
+    handler: async (rc: RequestContext) => {
+      const auth = requireConsoleRole(rc, 'admin');
+      const body = await rc.body(llmStagePutSchema);
+      const config = rc.app.engine.upsertLlmStage(rc.params.stage as LlmStage, body, actorForUser(rc, auth.user));
+      rc.json({ config });
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/api/llm/usage',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      requireConsoleRole(rc, 'admin');
+      const query = rc.query(usageQuerySchema);
+      rc.json({ items: rc.app.engine.llmUsage(query.days), days: query.days });
+    },
+  });
+
+  router.add({
+    method: 'GET',
+    path: '/api/llm/status',
+    auth: 'console',
+    handler: (rc: RequestContext) => {
+      requireConsoleRole(rc, 'admin');
+      rc.json(rc.app.engine.llmStatus());
     },
   });
 

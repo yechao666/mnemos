@@ -659,4 +659,52 @@ CREATE TABLE IF NOT EXISTS memory_placeholders (
 );
 CREATE INDEX IF NOT EXISTS idx_placeholders_memory ON memory_placeholders(memory_id);
 
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '9');
+/* ------------------------------------------------------------------ */
+/* v6.4：大模型设置（schema v10）                                       */
+/* ------------------------------------------------------------------ */
+
+CREATE TABLE IF NOT EXISTS llm_providers (
+  id                 TEXT PRIMARY KEY,
+  name               TEXT NOT NULL UNIQUE,
+  protocol           TEXT NOT NULL DEFAULT 'openai',
+  base_url           TEXT NOT NULL,
+  default_model      TEXT,
+  api_key_cipher     TEXT NOT NULL DEFAULT '',
+  api_key_encrypted  INTEGER NOT NULL DEFAULT 0,
+  input_price        REAL NOT NULL DEFAULT 0,
+  output_price       REAL NOT NULL DEFAULT 0,
+  enabled            INTEGER NOT NULL DEFAULT 1,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS llm_stage_configs (
+  stage         TEXT PRIMARY KEY,
+  provider_id   TEXT,
+  model         TEXT,
+  temperature   REAL NOT NULL DEFAULT 0.2,
+  max_tokens    INTEGER NOT NULL DEFAULT 1024,
+  timeout_ms    INTEGER NOT NULL DEFAULT 20000,
+  system_prompt TEXT,
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS llm_calls (
+  id                TEXT PRIMARY KEY,
+  stage             TEXT NOT NULL,
+  provider_id       TEXT,
+  model             TEXT,
+  protocol          TEXT,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  duration_ms       INTEGER NOT NULL DEFAULT 0,
+  status            TEXT NOT NULL,
+  error             TEXT,
+  created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_stage ON llm_calls(stage, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_created ON llm_calls(created_at DESC);
+
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '10');

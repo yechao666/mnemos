@@ -7,12 +7,11 @@ import type {
   PersonFactInput,
   PersonProfile,
 } from '../../../shared/src/types.ts';
-import type { LlmConfig } from '../env.ts';
 import { writeAudit } from '../lib/audit.ts';
 import { newId, nowIso, sha256 } from '../lib/ids.ts';
 import { tx } from '../db/index.ts';
 import { engineErrors } from './errors.ts';
-import { llmText } from './llm.ts';
+import { callLlm, type LlmLike } from './llm.ts';
 import { resolvePerson } from './persons.ts';
 import { toMemory, toPersonFact, type MemoryRow, type PersonFactRow } from './rows.ts';
 
@@ -461,7 +460,7 @@ function buildProfilePrompt(person: Person, facts: PersonFact[], memories: Memor
  */
 export async function refreshPersonProfile(
   db: DatabaseSync,
-  llm: LlmConfig | null,
+  llm: LlmLike,
   partitionId: string,
   personRef: string,
   options: { force?: boolean } = {},
@@ -478,7 +477,7 @@ export async function refreshPersonProfile(
   const memories = recentMemories(db, partitionId, person.id);
   let summary = buildDeterministicSummary(facts, memories);
   if (llm) {
-    const text = await llmText(llm, {
+    const text = await callLlm(llm, 'profile', {
       system: '你是企业记忆系统的画像归纳助手。只输出中文画像正文，不输出标题或解释，不编造资料之外的信息。',
       prompt: buildProfilePrompt(person, facts, memories),
       maxChars: SUMMARY_MAX_CHARS,

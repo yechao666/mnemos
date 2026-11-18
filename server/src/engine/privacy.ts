@@ -13,7 +13,6 @@ import type {
   PrivacyScanHit,
   PrivacyScanResult,
 } from '../../../shared/src/types.ts';
-import type { LlmConfig } from '../env.ts';
 import { tx } from '../db/index.ts';
 import { decryptField, encryptField, encryptionKeyFromEnv } from '../lib/crypto.ts';
 import { newId, nowIso } from '../lib/ids.ts';
@@ -21,7 +20,7 @@ import { memoryContentHash } from '../lib/text.ts';
 import { validateValue } from '../lib/validators.ts';
 import { engineErrors } from './errors.ts';
 import { writeHistory } from './history.ts';
-import { llmText } from './llm.ts';
+import { callLlm, type LlmLike } from './llm.ts';
 import { embedText, EMBEDDING_DIM, EMBEDDING_MODEL, embeddingToBlob } from './embed.ts';
 import { findPartitionById } from './partition.ts';
 import { parseSettings, type MemoryRow } from './rows.ts';
@@ -628,7 +627,7 @@ export function deletePrivacyRule(db: DatabaseSync, id: string): PrivacyRule {
 export interface PrivacyScanOptions {
   /** 预取规则（避免预览/批处理重复查询）；缺省从 DB 读取。 */
   rules?: PrivacyRule[];
-  llm?: LlmConfig | null;
+  llm?: LlmLike;
   /** 是否执行 prompt 规则（还需要 privacyLlmEnabled + llm 均可用）。 */
   allowPrompt?: boolean;
 }
@@ -856,18 +855,18 @@ function parseEntitiesJson(raw: string): Array<Record<string, unknown>> {
  * 无 LLM / 调用失败 / 返回非 JSON 均返回空数组，调用方回退正则。
  */
 export async function extractPromptEntities(
-  llm: LlmConfig | null,
+  llm: LlmLike,
   rules: PrivacyRule[],
   text: string,
 ): Promise<PromptEntity[]> {
-  if (!llm || !llm.baseUrl || !llm.apiKey || !llm.model || rules.length === 0) return [];
+  if (!llm || rules.length === 0) return [];
   const ruleLines = rules.map((rule) => `- ${rule.code}: ${rule.instruction ?? rule.name}`).join('\n');
   const prompt =
     `待扫描文本：\n${text}\n\n` +
     `启用规则（code: 抽取要求）：\n${ruleLines}\n\n` +
     '请只返回 JSON，不要解释。格式：{"entities":[{"code":"规则 code","value":"原文中出现的片段"}]}。' +
     'value 必须逐字出现在待扫描文本中；不确定就不要返回。';
-  const raw = await llmText(llm, {
+  const raw = await callLlm(llm, 'privacy', {
     system: '你是隐私信息抽取器。严格依据给定规则从文本中抽取敏感片段，只输出 JSON。',
     prompt,
     maxChars: 2_000,
@@ -894,7 +893,7 @@ export async function extractPromptEntities(
 async function applyPromptRules(
   accumulator: ScanAccumulator,
   rules: PrivacyRule[],
-  llm: LlmConfig | null,
+  llm: LlmLike,
 ): Promise<void> {
   const promptRules = rules.filter((rule) => rule.enabled && rule.kind === 'prompt' && Boolean(rule.instruction));
   if (promptRules.length === 0 || !llm) return;
@@ -1297,7 +1296,7 @@ export function applyPrivacyToMemorySync(
 /** 异步版：regex + prompt（privacyLlmEnabled + LLM 可用时）。 */
 export async function applyPrivacyToMemory(
   db: DatabaseSync,
-  llm: LlmConfig | null,
+  llm: LlmLike,
   partitionId: string,
   memoryId: string,
   options: { reason?: string; allowPrompt?: boolean } = {},
@@ -1325,7 +1324,7 @@ export interface PrivacyRescanResult {
 /** 管理端点重扫：按分区（可限定人）逐条应用 regex + prompt；幂等。 */
 export async function rescanPrivacy(
   db: DatabaseSync,
-  llm: LlmConfig | null,
+  llm: LlmLike,
   partitionId: string,
   options: { personId?: string; limit?: number } = {},
 ): Promise<PrivacyRescanResult> {

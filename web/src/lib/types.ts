@@ -726,3 +726,85 @@ export interface HealthInfo {
   version: string;
   uptimeMs?: number;
 }
+
+/* ------------------------------------------------------------------ */
+/* v6.4 大模型设置（契约 docs/llm-settings.md）                        */
+/* 后端直连 OpenAI 兼容 / Anthropic API，不依赖 DSH。                  */
+/* ------------------------------------------------------------------ */
+
+export type LlmProtocol = 'openai' | 'anthropic';
+export type LlmStage = 'brief' | 'dream' | 'profile' | 'privacy' | 'extract';
+
+export interface LlmProvider {
+  id: string;
+  name: string;
+  protocol: LlmProtocol;
+  baseUrl: string;
+  defaultModel?: string;
+  /** 永不返回明文；只写不回显。 */
+  hasApiKey: boolean;
+  apiKeyMasked?: string;
+  /** $ / 1M tokens，用于成本估算。 */
+  inputPrice: number;
+  outputPrice: number;
+  enabled: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface LlmProviderInput {
+  name: string;
+  protocol?: LlmProtocol;
+  baseUrl: string;
+  /** 新增或更新时写入；编辑时留空表示保持不变。 */
+  apiKey?: string;
+  clearApiKey?: boolean;
+  defaultModel?: string;
+  inputPrice?: number;
+  outputPrice?: number;
+  enabled?: boolean;
+}
+
+export interface LlmStageConfig {
+  stage: LlmStage;
+  providerId?: string;
+  model?: string;
+  temperature: number;
+  maxTokens: number;
+  timeoutMs: number;
+  systemPrompt?: string;
+  enabled: boolean;
+  updatedAt?: string;
+}
+
+export interface LlmStageConfigInput {
+  providerId?: string | null;
+  model?: string | null;
+  temperature?: number;
+  maxTokens?: number;
+  timeoutMs?: number;
+  systemPrompt?: string | null;
+  enabled?: boolean;
+}
+
+export interface LlmTestResult {
+  ok: boolean;
+  latencyMs?: number;
+  model?: string;
+  error?: string;
+}
+
+export interface LlmUsageSummary {
+  stage: LlmStage;
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+  estimatedCost: number;
+}
+
+export interface LlmStatus {
+  envFallbackConfigured: boolean;
+  providers: number;
+  stages: number;
+  encryptionConfigured: boolean;
+}

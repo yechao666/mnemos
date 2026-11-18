@@ -1234,3 +1234,105 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* ==========================================================================
+   v6.4 模型设置（供应商 / 阶段 / 用量）
+   ========================================================================== */
+
+.v6-llm-provider {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.v6-llm-provider-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: var(--tone-tint);
+  color: var(--tone);
+  border: 1px solid var(--tone-line);
+}
+
+.v6-llm-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.v6-llm-meta > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.v6-llm-meta > div > span:first-child {
+  flex-shrink: 0;
+}
+
+.v6-llm-meta > div > span:last-child {
+  min-width: 0;
+  text-align: right;
+}
+
+.v6-llm-stage-table {
+  min-width: 1080px;
+}
+
+.v6-llm-stage-table thead th {
+  white-space: nowrap;
+}
+
+.v6-llm-stage-table tbody td {
+  vertical-align: top;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.v6-llm-stage-table .input,
+.v6-llm-stage-table .select {
+  height: 32px;
+  font-size: 12px;
+}
+
+.v6-llm-stage-desc {
+  max-width: 168px;
+  line-height: 1.45;
+}
+
+.v6-llm-warn {
+  margin-top: 4px;
+  color: var(--amber);
+}
+
+.v6-llm-stage-subrow > td {
+  background: rgba(255, 255, 255, 0.018);
+  border-top: none;
+}
+
+.v6-llm-stage-prompt-row > td {
+  padding-top: 12px;
+  padding-bottom: 14px;
+}
+
+.v6-llm-stage-prompt-row .textarea {
+  min-height: 96px;
+}
+
+@media (max-width: 900px) {
+  .v6-llm-meta > div {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .v6-llm-meta > div > span:last-child {
+    text-align: left;
+  }
+}

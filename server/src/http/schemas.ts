@@ -270,6 +270,7 @@ export const memoryListQuerySchema = cursorQuerySchema.extend({
 export const personBriefQuerySchema = z.object({
   force: booleanQuerySchema.optional(),
   maxChars: z.coerce.number().int().min(100).max(5000).optional(),
+  allowLlm: booleanQuerySchema.optional(),
 });
 
 /** 人的上下文生成入参。 */
@@ -434,3 +435,43 @@ export const orgUserUpdateSchema = z
     name: z.string().trim().min(1).max(80).optional(),
   })
   .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
+
+/* ------------------------------------------------------------------ */
+/* v6.4：大模型设置                                                     */
+/* ------------------------------------------------------------------ */
+
+export const llmProtocolSchema = z.enum(['openai', 'anthropic']);
+export const llmStageSchema = z.enum(['brief', 'dream', 'profile', 'privacy', 'extract']);
+
+const llmBaseUrlSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(500)
+  .refine((value) => /^https?:\/\//i.test(value), 'baseUrl 必须以 http:// 或 https:// 开头');
+
+export const llmProviderCreateSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  protocol: llmProtocolSchema.optional(),
+  baseUrl: llmBaseUrlSchema,
+  apiKey: z.string().trim().max(500).optional(),
+  defaultModel: z.string().trim().max(200).optional(),
+  inputPrice: z.coerce.number().min(0).max(1_000_000).optional(),
+  outputPrice: z.coerce.number().min(0).max(1_000_000).optional(),
+  enabled: z.boolean().optional(),
+});
+
+export const llmProviderUpdateSchema = llmProviderCreateSchema
+  .partial()
+  .extend({ clearApiKey: z.boolean().optional() })
+  .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
+
+export const llmStagePutSchema = z.object({
+  providerId: z.string().trim().max(128).nullable().optional(),
+  model: z.string().trim().max(200).nullable().optional(),
+  temperature: z.coerce.number().min(0).max(2).optional(),
+  maxTokens: z.coerce.number().int().min(1).max(8_192).optional(),
+  timeoutMs: z.coerce.number().int().min(1_000).max(120_000).optional(),
+  systemPrompt: z.string().max(8_000).nullable().optional(),
+  enabled: z.boolean().optional(),
+});

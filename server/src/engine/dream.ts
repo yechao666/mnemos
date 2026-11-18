@@ -8,10 +8,9 @@ import type {
   MemoryDreamRun,
   MemoryDreamStatus,
 } from '../../../shared/src/types.ts';
-import type { LlmConfig } from '../env.ts';
 import { newId, nowIso } from '../lib/ids.ts';
 import { EngineError, engineErrors } from './errors.ts';
-import { llmText } from './llm.ts';
+import { callLlm, type LlmLike } from './llm.ts';
 import { applyPrivacyToMemory } from './privacy.ts';
 import {
   addMemory,
@@ -73,10 +72,10 @@ function insightText(memories: Memory[]): string {
   return text.length > 6_000 ? text.slice(0, 6_000) : text;
 }
 
-async function polishInsight(llm: LlmConfig | null, memories: Memory[]): Promise<string> {
+async function polishInsight(llm: LlmLike, memories: Memory[]): Promise<string> {
   const base = insightText(memories);
   if (!llm) return base;
-  const polished = await llmText(llm, {
+  const polished = await callLlm(llm, 'dream', {
     system:
       '你是记忆巩固器。把用户提供的多条记忆合并为 3–8 条稳定洞见（事实、偏好、约束、决策、待办）。' +
       '不要编造，不要复述逐条原文；每条一行，以 "- " 开头。',
@@ -134,7 +133,7 @@ function systemActor(): Actor {
  */
 export async function runDream(
   db: DatabaseSync,
-  llm: LlmConfig | null,
+  llm: LlmLike,
   input: MemoryDreamInput,
   actor: Actor,
 ): Promise<MemoryDreamResult> {

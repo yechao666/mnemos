@@ -1,4 +1,4 @@
-# Mnemos v6.1 · 分区 + 人的中立记忆服务
+# Mnemos v6.4 · 分区 + 人的中立记忆服务
 
 **Mnemos** 是一个可自托管的记忆服务：**以「分区」隔离，以「人」组织**。
 它不预设业务形态——消费类 App 的真人用户、研发团队的智能体、后台服务账号都是「人」；
@@ -12,15 +12,17 @@
 - **百万级人列表**：游标分页（keyset）、FTS5 前缀检索、`partition_stats` 反规范化计数、
   控制台虚拟滚动；列表接口**不返回 total、不做 `COUNT(*)`**。
 - **单文件 SQLite**：`node:sqlite` 内置，无外部数据库/消息队列；离线可用，配置 LLM 后可选增强。
+- **v6.4 大模型设置**：多个供应商 + 按阶段（brief/dream/profile/privacy/extract）分配模型，
+  后端直连 OpenAI 兼容 / Anthropic API；密钥加密、测试连接、按阶段用量/成本，无配置回退环境变量或确定性逻辑。
 - **生态齐全**：TypeScript SDK、Python SDK、MCP server、LangChain `BaseStore` 适配器、DSH 插件。
 
-> **版本 6.3.0**（schema v9）。v6 是干净重建：旧领域（Agent 注册表 / 任务 / 任务简报 / 项目记录 /
+> **版本 6.4.0**（schema v10）。v6 是干净重建：旧领域（Agent 注册表 / 任务 / 任务简报 / 项目记录 /
 > 复盘 / Webhooks）已从代码、表、路由与文档中删除，**不兼容 v5 端点**。v5 保留在 `v5` 分支，
-> 数据目录也彼此分离（v5 `data/`，v6.1 `data-v6/`）。详见[与 v5 的关系](#与-v5-的关系)。
+> 数据目录也彼此分离（v5 `data/`，v6 `data-v6/`）。详见[与 v5 的关系](#与-v5-的关系)。
 
 ---
 
-## v6.1 功能总览
+## v6.4 功能总览
 
 | 能力 | 说明 | 入口 |
 | --- | --- | --- |
@@ -35,7 +37,8 @@
 | 多模态附件 | 写记忆带 `attachments[]`（URL/caption）；详情返回、列表只给 count；caption 参与检索 | 写记忆 body |
 | PII / 合规 | `settings.piiRedaction=basic` 脱敏手机/邮箱/身份证/银行卡；`persons.consent`；审计 | settings + person PATCH |
 | 隐私规则库（v6.3） | 18 个行业/领域分组 × 85 条规则（68 regex + 17 prompt）；15 种校验器 + 上下文关键词 + 大小写；默认只启用 email/id_card/phone/bank_card，其余按组一键启停（分区覆盖）；写入占位符 + 映射表抽离（正文只存 token，reveal 才解密） | `/api/privacy/groups`、`POST /api/privacy/groups/:key/apply`、`/api/privacy/rules`、写记忆 `placeholders`；目录见 [`docs/privacy-catalog.md`](docs/privacy-catalog.md) |
-| 可选加密 | `MNEMOS_ENCRYPTION_KEY` → 附件 URL AES-256-GCM 加密（不加密正文，保护 FTS） | 环境变量 |
+| 大模型设置（v6.4） | 供应商 CRUD + 按阶段分配 brief/dream/profile/privacy/extract（模型/温度/maxTokens/超时/系统提示词）；OpenAI 兼容 + Anthropic 直连；Key AES-256-GCM + 掩码；测试连接；按阶段用量/成本；阶段关闭/失败回退确定性 | `/api/llm/providers`、`/api/llm/stages`、`/api/llm/usage`、`/api/llm/status`；控制台「模型设置」；详见 [`docs/llm-settings.md`](docs/llm-settings.md) |
+| 可选加密 | `MNEMOS_ENCRYPTION_KEY` → 模型 API Key / 附件 URL / 占位符值 AES-256-GCM 加密（不加密正文，保护 FTS） | 环境变量 |
 | 幂等写入 | `Idempotency-Key` 24h 回放；不同 body 409 | 写接口请求头 |
 | 评测 | 7 场景：改写召回/时效/冲突/隔离/反馈/合并/画像 | `pnpm eval` |
 
@@ -274,6 +277,10 @@ pnpm dev        # 启动 http://127.0.0.1:4380（node --watch）
   （Vite 4381，代理 `/api`、`/v1` 到 4380）。
 - 数据目录默认 `data-v6/`（已 gitignore）；环境变量示例见 [`.env.example`](.env.example)。
   服务端**不会自动加载 `.env`**：需要时用 `node --env-file=.env server/src/main.ts`。
+- **启用大模型（可选）**：启动前设 `MNEMOS_LLM_BASE_URL` + `MNEMOS_LLM_API_KEY`
+  （+ `MNEMOS_LLM_MODEL`，默认 `gpt-4o-mini`）即启用环境变量回退；或登录控制台 →
+  组织设置 → **模型设置**，新建供应商并给 `brief/dream/profile/privacy` 分配模型（推荐，
+  支持 Anthropic）。未配置或调用失败时，简报/做梦/画像/隐私抽取都走确定性实现，功能不受影响。
 
 重置演示数据（`--force` 会清空全部演示数据，可重复执行）：
 
@@ -328,6 +335,7 @@ curl -s -X POST http://127.0.0.1:4380/api/ops/jobs/tick \
 | 设置 | 检索模式/权重、embedding、merge/dedupe 阈值、实体抽取、**PII 脱敏**、保留期、配额 |
 | 密钥 | 分区 key（创建/轮换/吊销）；组织 key（仅 owner 可见）在同一页 |
 | 用量 / 审计 / API 文档 | 分区级用量与审计、控制台内的 API 摘要 |
+| 模型设置 | 供应商（新增/编辑/启停/测试连接，Key 只写不回显）、五阶段模型分配（温度/上限/超时/提示词）、近 30 天用量与成本 |
 | 组织设置 | 账号管理、组织级 Key |
 
 控制台不做 `COUNT(*)`、不逐行请求 stats、不一次性加载全量列表；分页协议与 `/v1` 一致
@@ -402,7 +410,10 @@ curl -s "$BASE/v1/partitions/mnemos-dev/persons?limit=3&sort=recent" \
 
 - `limit` 默认 50、最大 200；`next_cursor` 为 `null` 时没有下一页；**没有 total**。
 - 翻下一页：把 `next_cursor` 原样传给 `cursor`；换 `sort` 必须重新从第一页开始。
-- 错误体固定 `{ "error": { "code", "message", "requestId" } }`；错误码见 [API 文档](docs/api.md#8-错误码)。
+- 错误体固定 `{ "error": { "code", "message", "requestId" } }`；错误码见 [API 文档](docs/api.md#9-错误码)。
+
+> 大模型设置是**组织级控制台 API**（`/api/llm/*`，admin/owner；公开 API Key 不可访问），
+> 端点/字段/示例见 [API 文档](docs/api.md#76-大模型设置v64) 与 [llm-settings](docs/llm-settings.md)。
 
 ---
 
@@ -479,8 +490,9 @@ DeepSeek Harness（dsh）：
 ## 与 v5 的关系
 
 - v6 在分支 `v6-rebuild`/`main` 上**重建**；v5 完整保留在 `v5` 分支，可继续检出使用。
-- **数据不迁移**：v5 使用 `data/`（`projects` 等旧表），v6.1 使用 `data-v6/`。
-  v6 启动时检测到 v5 schema 会**拒绝启动**；v6/v6.1/v6.2 库会自动升级到 schema v9（含隐私规则库：`privacy_rule_groups` + `privacy_rules` 新字段）。
+- **数据不迁移**：v5 使用 `data/`（`projects` 等旧表），v6 使用 `data-v6/`。
+  v6 启动时检测到 v5 schema 会**拒绝启动**；v6 及后续版本库会自动幂等升级到 schema v10
+  （v9 新增隐私规则库，v10 新增 `llm_providers` / `llm_stage_configs` / `llm_calls`，均为纯新增）。
 - **端点不兼容**：`/v1/projects/...`、`/v1/agents/...`、`/v1/tasks/...`、`/v1/memories`、
   `/v1/memories/search`、`/v1/context`、`/v1/graph` 等全部移除；改为
   `/v1/partitions/:p/persons/:person/...`。v5 的 `page/page_size + total` 改为游标分页。
@@ -520,10 +532,11 @@ mnemos/
 | --- | --- |
 | [`docs/roadmap-v6.1.md`](docs/roadmap-v6.1.md) | v6.1 契约、P0/P1/P2 完成状态与验收证据 |
 | [`docs/v6-architecture.md`](docs/v6-architecture.md) | v6 唯一契约：模型、存储、API、控制台、性能、插件、验收 |
-| [`docs/architecture.md`](docs/architecture.md) | 实现架构：schema v9、索引、检索融合、写管线、jobs、画像、图、附件、隐私规则库、加密 |
-| [`docs/api.md`](docs/api.md) | API 参考：鉴权、游标、v1 与控制台端点、检索信号、历史/反馈、画像/生命周期、隐私规则与占位符、错误码 |
+| [`docs/architecture.md`](docs/architecture.md) | 实现架构：schema v10、索引、检索融合、写管线、jobs、画像、图、附件、隐私规则库、LLM 路由、加密 |
+| [`docs/api.md`](docs/api.md) | API 参考：鉴权、游标、v1 与控制台端点、检索信号、历史/反馈、画像/生命周期、隐私规则与占位符、大模型设置、错误码 |
 | [`docs/privacy-rules.md`](docs/privacy-rules.md) | v6.3 隐私规则域：分组模型与整组启停、校验器/上下文、regex/prompt 扫描、占位符协议、端点、v8→v9 迁移 |
 | [`docs/privacy-catalog.md`](docs/privacy-catalog.md) | v6.3 规则库目录：18 组 / 85 条规则、校验器映射、默认策略与误报边界（从 `privacy-catalog.ts` 生成） |
+| [`docs/llm-settings.md`](docs/llm-settings.md) | v6.4 大模型设置：供应商/阶段、OpenAI 兼容 + Anthropic 协议、密钥加密、env fallback、失败降级、用量成本、控制台 |
 | [`docs/v6-scale.md`](docs/v6-scale.md) | 百万级设计、检索候选/延迟预算、seed-scale/perf-persons、验收步骤 |
 | [`docs/eval.md`](docs/eval.md) | 评测 harness（`pnpm eval`）：7 场景、阈值、JSON 输出与 CI |
 | [`docs/operations.md`](docs/operations.md) | 部署、配置、备份恢复、jobs/回填/reconcile、维护、升级、排障 |

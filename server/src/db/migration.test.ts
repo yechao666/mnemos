@@ -86,10 +86,10 @@ function columnsOf(db: DatabaseSync, table: string): Set<string> {
   return new Set(rows.map((row) => row.name));
 }
 
-test('迁移 v6→v9：保留数据、补列、回填 hash/valid_from、建新表', () => {
+test('迁移 v6→v10：保留数据、补列、回填 hash/valid_from、建新表', () => {
   const db = makeV6Database();
   migrate(db);
-  assert.equal(getSchemaVersion(db), 9);
+  assert.equal(getSchemaVersion(db), 10);
 
   const memoryColumns = columnsOf(db, 'memories');
   for (const column of [
@@ -162,7 +162,7 @@ test('迁移 v6→v9：保留数据、补列、回填 hash/valid_from、建新�
 
   // 幂等：重复迁移不重复回填、不改版本
   migrate(db);
-  assert.equal(getSchemaVersion(db), 9);
+  assert.equal(getSchemaVersion(db), 10);
   assert.equal(tableCount(db, 'memories'), 2);
   db.close();
 });

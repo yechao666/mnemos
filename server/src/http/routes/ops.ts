@@ -5,6 +5,7 @@ import type { OpsStatus } from '../../../../shared/src/types.ts';
 import { SCHEMA_VERSION, getSchemaVersion, tableCount } from '../../db/index.ts';
 import { parseSettings, type PartitionRow } from '../../engine/rows.ts';
 import { processJobsAsync } from '../../engine/jobs.ts';
+import { createLlmRouter } from '../../engine/llm.ts';
 import { requireConsoleAuth, type ConsoleAuth } from '../middleware/auth.ts';
 import { errors } from '../respond.ts';
 import type { RequestContext } from '../context.ts';
@@ -214,7 +215,7 @@ export function registerOpsRoutes(router: Router): void {
     handler: async (rc: RequestContext) => {
       requireOpsAdmin(rc);
       const body = await rc.body(jobsTickSchema);
-      const result = await processJobsAsync(rc.app.db, rc.app.env.llm, { limit: body.limit ?? 10 });
+      const result = await processJobsAsync(rc.app.db, createLlmRouter(rc.app.db, rc.app.env.llm), { limit: body.limit ?? 10 });
       rc.json({ ...result, at: new Date().toISOString() });
     },
   });

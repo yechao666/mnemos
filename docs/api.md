@@ -1,10 +1,12 @@
-# Mnemos v6.3 API 参考
+# Mnemos v6.4 API 参考
 
 > 契约：[`v6-architecture.md`](v6-architecture.md) + [`roadmap-v6.1.md`](roadmap-v6.1.md) +
 > [`privacy-rules.md`](privacy-rules.md)（隐私规则域 / schema v9）+
-> [`privacy-catalog.md`](privacy-catalog.md)（规则库目录：18 组 / 85 条）。
-> 本文以 v6.3 契约为准；v6.2 引入「隐私规则域」（第 6 节）与写入占位符协议，v6.3 增加
-> 规则库分组、整组启停与校验器/上下文/大小写字段，其余端点沿用 v6.1。
+> [`privacy-catalog.md`](privacy-catalog.md)（规则库目录：18 组 / 85 条）+
+> [`llm-settings.md`](llm-settings.md)（大模型设置 / schema v10）。
+> 本文以 v6.4 契约为准；v6.2 引入「隐私规则域」（第 6 节）与写入占位符协议，v6.3 增加
+> 规则库分组、整组启停与校验器/上下文/大小写字段，v6.4 增加控制台「大模型设置」端点
+> （第 7.6 节），其余端点沿用 v6.1。
 >
 > 两套 JSON 命名约定，**不是两套能力**：
 >
@@ -1401,6 +1403,199 @@ owner 管理组织与组织级 Key。
 
 > 组织级 key 的创建 body 与分区 key 相同（`name/scopes/rateLimitPerMin/expiresAt/allowedIps`），
 > 不绑定分区。
+
+### 7.6 大模型设置（v6.4）
+
+> 设计、协议、密钥加密与成本公式见 [`llm-settings.md`](llm-settings.md)。本节只列端点与字段。
+> **仅控制台会话**：全部端点要求组织 **admin 或 owner**；公开 `/v1` API Key 无权限（403）。
+> 所有写操作写审计：`llm.provider.create/update/delete`、`llm.provider.test`、`llm.stage.update`；
+> 审计 detail 不含明文密钥。
+
+| 方法 | 路径 | 角色 | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/api/llm/providers` | admin | 供应商列表（含禁用的），`{ items }` |
+| `POST` | `/api/llm/providers` | admin | 新建供应商，201 `{ provider }` |
+| `PATCH` | `/api/llm/providers/:id` | admin | 部分更新，`{ provider }`；省略 `apiKey` = 不变 |
+| `DELETE` | `/api/llm/providers/:id` | admin | 删除，204 |
+| `POST` | `/api/llm/providers/:id/test` | admin | 发一条最小请求，返回连通性 |
+| `GET` | `/api/llm/stages` | admin | 五个阶段的完整配置，`{ items }`（未配置行返回默认值） |
+| `PUT` | `/api/llm/stages/:stage` | admin | upsert 阶段配置，`{ config }` |
+| `GET` | `/api/llm/usage?days=30` | admin | 按阶段汇总调用数 / tokens / 估算成本，`{ items, days }` |
+| `GET` | `/api/llm/status` | admin | env 回退、供应商/阶段计数、加密状态 |
+
+#### 7.6.1 LlmProvider 字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | `llm_…` |
+| `name` | string | 唯一名称；重名 `409 CONFLICT` |
+| `protocol` | `openai` \| `anthropic` | 默认 `openai` |
+| `baseUrl` | string | 不带尾斜杠；拼接规则见 [llm-settings](llm-settings.md#43-baseurl--model-对照) |
+| `defaultModel` | string? | 阶段未填 `model` 时使用 |
+| `hasApiKey` | boolean | 库里是否存有密钥（永不返回明文；解密失败时仍为 true） |
+| `apiKeyMasked` | string? | 前 3 位 + `…` + 后 4 位（短 key 显示 `••••`；无法解密时为空） |
+| `inputPrice` | number | $ / 1M prompt tokens，0 表示未填 |
+| `outputPrice` | number | $ / 1M completion tokens |
+| `enabled` | boolean | 禁用后阶段不会解析到它 |
+| `createdAt` / `updatedAt` | string | ISO 8601 UTC |
+
+`POST` body（`LlmProviderInput`）：
+
+```json
+{
+  "name": "openai-main",
+  "protocol": "openai",
+  "baseUrl": "https://api.openai.com/v1",
+  "apiKey": "sk-…",
+  "defaultModel": "gpt-4o-mini",
+  "inputPrice": 0.15,
+  "outputPrice": 0.6,
+  "enabled": true
+}
+```
+
+- `apiKey` 可省略（创建后 `hasApiKey=false`；本地无鉴权服务仍需填占位值才会被解析）。
+- `PATCH` 语义：`apiKey` 非空 → 替换；省略 → 保持；`clearApiKey=true` → 清空（优先于 `apiKey`）。
+- `PATCH` 也可改 `name/protocol/baseUrl/defaultModel/inputPrice/outputPrice/enabled`。
+
+#### 7.6.2 LlmStageConfig 字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `stage` | `brief` \| `dream` \| `profile` \| `privacy` \| `extract` | 主键 |
+| `providerId` | string? | 空 = 未绑定供应商（回退 env） |
+| `model` | string? | 空 = `provider.defaultModel` |
+| `temperature` | number | 0–2，默认 0.2 |
+| `maxTokens` | number | 1–8192，默认 1024 |
+| `timeoutMs` | number | 1000–120000，默认 20000 |
+| `systemPrompt` | string? | 覆盖内置提示词；≤8000 字符 |
+| `enabled` | boolean | false = 该阶段不调 LLM（不回退 env） |
+| `updatedAt` | string? | 最近更新时间 |
+
+`PUT /api/llm/stages/:stage` body（`LlmStageConfigInput`，全部可选）：
+
+```json
+{
+  "providerId": "llm_ab12",
+  "model": "gpt-4o-mini",
+  "temperature": 0.2,
+  "maxTokens": 1024,
+  "timeoutMs": 20000,
+  "systemPrompt": null,
+  "enabled": true
+}
+```
+
+- `providerId: null` / `model: null` / `systemPrompt: null` 表示清空该字段。
+- `stage` 不在枚举内 → `400 VALIDATION_ERROR`；温度/上限/超时越界同样 400。
+- 响应为 `{ "config": LlmStageConfig }`（camelCase）。只有保存过的阶段行参与路由；
+  未保存的阶段默认值仅用于 `GET /stages` 展示。
+
+#### 7.6.3 测试连接
+
+`POST /api/llm/providers/:id/test` → 裸 `LlmTestResult`：
+
+```json
+{ "ok": true, "latencyMs": 412, "model": "gpt-4o-mini" }
+```
+
+失败示例（仍返回 200，`ok=false`；供应商不存在才是 404）：
+
+```json
+{ "ok": false, "latencyMs": 8010, "model": "gpt-4o-mini", "error": "HTTP 401: invalid api key" }
+```
+
+- 用 `defaultModel ?? 'gpt-4o-mini'` 发一条最小请求：`messages=[{role:'user',content:'ping'}]`、
+  `max_tokens=8`、`temperature=0`；总超时 15s。
+- `error` 为可读原因（`HTTP <status>: <body 前 200 字>`、请求超时、响应非 JSON、未配置 API Key 等，
+  网络异常 ≤300 字符），不含密钥。
+- **不写 `llm_calls`、不计入 `usage`**：测试连接不污染阶段用量。
+
+#### 7.6.4 用量与状态
+
+`GET /api/llm/usage?days=30`：`days` 1–90（默认 30），返回 `{ items, days }`：
+
+```json
+{
+  "days": 30,
+  "items": [
+    { "stage": "brief", "calls": 120, "promptTokens": 180000, "completionTokens": 60000, "estimatedCost": 0.063 },
+    { "stage": "dream", "calls": 8, "promptTokens": 32000, "completionTokens": 12000, "estimatedCost": 0.276 },
+    { "stage": "profile", "calls": 12, "promptTokens": 48000, "completionTokens": 18000, "estimatedCost": 0.414 }
+  ]
+}
+```
+
+- `calls` 统计窗口内**全部调用**（含失败/超时）；tokens 按实际记录累加（失败通常为 0）；
+  `estimatedCost = prompt/1e6×inputPrice + completion/1e6×outputPrice`，保留 6 位小数，单位美元。
+- 只返回**有调用记录**的阶段（按 brief→dream→profile→privacy→extract 顺序）；无调用的阶段不出现。
+
+`GET /api/llm/status`：
+
+```json
+{ "envFallbackConfigured": false, "providers": 2, "stages": 2, "encryptionConfigured": true }
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `envFallbackConfigured` | env 回退齐全（`MNEMOS_LLM_BASE_URL` + `MNEMOS_LLM_API_KEY`；model 有默认 `gpt-4o-mini`） |
+| `providers` | 供应商总数（含禁用） |
+| `stages` | 已保存的阶段配置行数（0–5；未保存的阶段走 env / 确定性） |
+| `encryptionConfigured` | `MNEMOS_ENCRYPTION_KEY` 已配置（密钥加密落库） |
+
+#### 7.6.5 示例
+
+```bash
+# 列表（Key 只有掩码）
+curl -s "$BASE/api/llm/providers" -H "authorization: Bearer $TOKEN" | jq .
+```
+
+```json
+{
+  "items": [
+    {
+      "id": "llm_0f3c9a72d4e14f81",
+      "name": "openai-main",
+      "protocol": "openai",
+      "baseUrl": "https://api.openai.com/v1",
+      "defaultModel": "gpt-4o-mini",
+      "hasApiKey": true,
+      "apiKeyMasked": "sk-…abcd",
+      "inputPrice": 0.15,
+      "outputPrice": 0.6,
+      "enabled": true,
+      "createdAt": "2026-11-18T02:10:00.000Z",
+      "updatedAt": "2026-11-18T02:10:00.000Z"
+    }
+  ]
+}
+```
+
+```bash
+# 更换密钥（不传其他字段 = 保持不变）
+curl -s -X PATCH "$BASE/api/llm/providers/llm_0f3c9a72d4e14f81" \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"apiKey":"sk-新密钥"}' | jq .
+
+# 清除密钥
+curl -s -X PATCH "$BASE/api/llm/providers/llm_0f3c9a72d4e14f81" \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"clearApiKey":true}' | jq .
+```
+
+错误：
+
+| HTTP | code | 场景 |
+| --- | --- | --- |
+| 400 | `VALIDATION_ERROR` | 协议/阶段非法、温度/上限/超时越界、`baseUrl` 空 |
+| 403 | `FORBIDDEN` | 非 admin/owner，或用 API Key 调用 `/api/llm/*` |
+| 404 | `NOT_FOUND` | 供应商 id 不存在 |
+| 409 | `CONFLICT` | 供应商 `name` 重复 |
+
+> 删除供应商时服务端会把阶段配置的 `providerId` 置空（其余参数保留），不会留下悬空引用；
+> 阶段因此回到「未绑定供应商」并回退 env / 确定性，可在控制台重新选择。
+> 阶段 `enabled=false` 或供应商 `enabled=false` 时**不产生调用**（也不写 `llm_calls`），
+> 且不会回退 env —— 这是「显式关闭」；只有未配置/未完成配置才回退 env。
 
 ---
 

@@ -3,13 +3,12 @@ import { CATEGORY_LABEL } from '../../../shared/src/constants.ts';
 import type { BriefInput, Memory, MemoryBrief, MemoryBriefItem } from '../../../shared/src/types.ts';
 import { sha256 } from '../lib/ids.ts';
 import { engineErrors } from './errors.ts';
-import { llmText } from './llm.ts';
+import { callLlm, llmModelLabel, type LlmLike } from './llm.ts';
 import { briefSourceMemories } from './memories.ts';
 import { resolveMemoryPlaceholders } from './privacy.ts';
 import { findPartitionById } from './partition.ts';
 import { resolvePersonRow } from './persons.ts';
 import { parseSettings, toBrief, type BriefRow } from './rows.ts';
-import type { LlmConfig } from '../env.ts';
 
 const CONDENSE_MODEL = 'mnemos-condense';
 const MAX_ITEM_CHARS = 240;
@@ -53,7 +52,7 @@ export function condenseMemories(
 }
 
 async function polishWithLlm(
-  llm: LlmConfig | null,
+  llm: LlmLike,
   memories: Memory[],
   maxChars: number,
 ): Promise<{ text: string; model: string } | null> {
@@ -63,7 +62,7 @@ async function polishWithLlm(
     .map((memory) => `- [${CATEGORY_LABEL[memory.category] ?? memory.category}] ${cleanText(memory.content, 300)}`)
     .join('\n');
   if (!source) return null;
-  const text = await llmText(llm, {
+  const text = await callLlm(llm, 'brief', {
     system:
       '你是记忆压缩器。把用户提供的记忆条目压缩成可直接注入系统提示词的要点列表：' +
       '保留事实、偏好、约束、决策与待办；每条一行，以 "- " 开头；不要编造，不要解释。',
@@ -72,7 +71,7 @@ async function polishWithLlm(
     timeoutMs: 20_000,
   });
   if (!text) return null;
-  return { text: text.slice(0, maxChars), model: llm.model };
+  return { text: text.slice(0, maxChars), model: llmModelLabel(llm, 'brief') || CONDENSE_MODEL };
 }
 
 /**
@@ -81,7 +80,7 @@ async function polishWithLlm(
  */
 export async function generateBrief(
   db: DatabaseSync,
-  llm: LlmConfig | null,
+  llm: LlmLike,
   input: BriefInput,
 ): Promise<MemoryBrief> {
   const partition = findPartitionById(db, input.partitionId);
@@ -103,7 +102,7 @@ export async function generateBrief(
     briefSourceMemories(db, input.partitionId, personId, 100),
   );
   const sourceHash = sha256(
-    `${sources.map((memory) => `${memory.id}:${memory.updatedAt}`).join('|')}|${maxChars}|v6|${llm?.model ?? CONDENSE_MODEL}`,
+    `${sources.map((memory) => `${memory.id}:${memory.updatedAt}`).join('|')}|${maxChars}|v6|${llmModelLabel(llm, 'brief') || CONDENSE_MODEL}`,
   );
 
   const cached = db

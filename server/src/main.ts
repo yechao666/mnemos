@@ -1,7 +1,7 @@
 import { APP_VERSION } from '../../shared/src/constants.ts';
 import type { AppContext } from './contracts.ts';
 import { getSchemaVersion, migrate, openDatabase, tableCount } from './db/index.ts';
-import { createMemoryService } from './engine/index.ts';
+import { createLlmRouter, createMemoryService } from './engine/index.ts';
 import { startDreamScheduler } from './engine/dream-scheduler.ts';
 import { startMemoryJobWorker } from './engine/jobs.ts';
 import { assertEnv, ensureDir, loadEnv } from './env.ts';
@@ -82,7 +82,13 @@ try {
 }
 
 const server = createHttpServer(context);
-const jobWorker = startMemoryJobWorker({ db, logger, tickMs: 1_000, batchSize: 10, llm: env.llm });
+const jobWorker = startMemoryJobWorker({
+  db,
+  logger,
+  tickMs: 1_000,
+  batchSize: 10,
+  llm: createLlmRouter(db, env.llm),
+});
 logger.info('memory_jobs.worker_started', { tickMs: 1_000, batchSize: 10 });
 let stopDreamScheduler: () => void = () => {};
 

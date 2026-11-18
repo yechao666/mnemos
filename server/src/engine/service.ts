@@ -18,6 +18,14 @@ import type {
   MemorySearchInput,
   MemorySearchResponse,
   MemoryService,
+  LlmProvider,
+  LlmProviderInput,
+  LlmStage,
+  LlmStageConfig,
+  LlmStageConfigInput,
+  LlmStatus,
+  LlmTestResult,
+  LlmUsageSummary,
   Partition,
   PartitionInput,
   PartitionStats,
@@ -42,6 +50,18 @@ import type {
 import type { LlmConfig } from '../env.ts';
 import { writeAudit } from '../lib/audit.ts';
 import { generateBrief } from './brief.ts';
+import { createLlmRouter } from './llm.ts';
+import {
+  createLlmProvider as createLlmProviderRecord,
+  deleteLlmProvider as deleteLlmProviderRecord,
+  listLlmProviders as listLlmProvidersRecord,
+  listLlmStages as listLlmStagesRecord,
+  llmStatus as llmStatusRecord,
+  llmUsage as llmUsageRecord,
+  testLlmProvider as testLlmProviderRecord,
+  updateLlmProvider as updateLlmProviderRecord,
+  upsertLlmStage as upsertLlmStageRecord,
+} from './llm-settings.ts';
 import { buildContext } from './context.ts';
 import { dreamStatus, runDream } from './dream.ts';
 import {
@@ -124,7 +144,9 @@ function orgOfPartition(db: DatabaseSync, partitionId: string): string | undefin
 
 /** 组装 v6 记忆服务。 */
 export function createMemoryService(db: DatabaseSync, options: MemoryServiceOptions = {}): MemoryService {
-  const llm = options.llm ?? null;
+  // v6.4：阶段路由客户端（fallback = 环境变量 LlmConfig，兼容旧调用 / 测试 fake）。
+  const envFallback = options.llm ?? null;
+  const llm = createLlmRouter(db, envFallback);
 
   return {
     /* --- 分区 --- */
@@ -517,6 +539,84 @@ export function createMemoryService(db: DatabaseSync, options: MemoryServiceOpti
         },
       });
       return result;
+    },
+    /* --- v6.4：大模型设置 --- */
+    listLlmProviders(): LlmProvider[] {
+      return listLlmProvidersRecord(db);
+    },
+    createLlmProvider(input: LlmProviderInput, actor: Actor): LlmProvider {
+      const provider = createLlmProviderRecord(db, input);
+      audit(db, {
+        actor,
+        action: 'llm.provider.create',
+        resourceType: 'llm_provider',
+        resourceId: provider.id,
+        detail: { name: provider.name, protocol: provider.protocol, baseUrl: provider.baseUrl, enabled: provider.enabled },
+      });
+      return provider;
+    },
+    updateLlmProvider(id: string, input: Partial<LlmProviderInput>, actor: Actor): LlmProvider {
+      const provider = updateLlmProviderRecord(db, id, input);
+      audit(db, {
+        actor,
+        action: 'llm.provider.update',
+        resourceType: 'llm_provider',
+        resourceId: provider.id,
+        detail: {
+          name: provider.name,
+          protocol: provider.protocol,
+          baseUrl: provider.baseUrl,
+          defaultModel: provider.defaultModel,
+          inputPrice: provider.inputPrice,
+          outputPrice: provider.outputPrice,
+          enabled: provider.enabled,
+          apiKeyChanged: typeof input.apiKey === 'string' && input.apiKey.trim() !== '',
+          apiKeyCleared: input.clearApiKey === true,
+        },
+      });
+      return provider;
+    },
+    deleteLlmProvider(id: string, actor: Actor): void {
+      deleteLlmProviderRecord(db, id);
+      audit(db, {
+        actor,
+        action: 'llm.provider.delete',
+        resourceType: 'llm_provider',
+        resourceId: id,
+      });
+    },
+    async testLlmProvider(id: string): Promise<LlmTestResult> {
+      // 审计由路由层写入（需要控制台会话的 actor / org）。
+      return testLlmProviderRecord(db, id);
+    },
+    listLlmStages(): LlmStageConfig[] {
+      return listLlmStagesRecord(db);
+    },
+    upsertLlmStage(stage: LlmStage, input: LlmStageConfigInput, actor: Actor): LlmStageConfig {
+      const config = upsertLlmStageRecord(db, stage, input);
+      audit(db, {
+        actor,
+        action: 'llm.stage.update',
+        resourceType: 'llm_stage',
+        resourceId: stage,
+        detail: {
+          stage,
+          providerId: config.providerId,
+          model: config.model,
+          temperature: config.temperature,
+          maxTokens: config.maxTokens,
+          timeoutMs: config.timeoutMs,
+          enabled: config.enabled,
+          hasSystemPrompt: Boolean(config.systemPrompt),
+        },
+      });
+      return config;
+    },
+    llmUsage(days: number): LlmUsageSummary[] {
+      return llmUsageRecord(db, days);
+    },
+    llmStatus(): LlmStatus {
+      return llmStatusRecord(db, envFallback);
     },
   };
 }

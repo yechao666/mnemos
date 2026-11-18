@@ -11,7 +11,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 export type Db = DatabaseSync;
 
 /** v6 重建：全新空库自动建；v5 库不迁移（v5 保留在 data/，v6 使用 data-v6/）。 */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 /** 打开 SQLite（WAL）。:memory: 用于测试。 */
 export function openDatabase(dbPath: string): Db {

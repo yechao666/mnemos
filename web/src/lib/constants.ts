@@ -7,6 +7,8 @@ import type {
   MemoryHistoryEvent,
   MemoryScope,
   MemorySearchMode,
+  LlmProtocol,
+  LlmStage,
   PersonStatus,
   PersonType,
   PiiRedactionMode,
@@ -21,7 +23,7 @@ import type {
 
 export const APP_NAME = 'Mnemos';
 export const APP_TAGLINE = '分区 · 人 · 记忆';
-export const APP_VERSION = '6.3.0';
+export const APP_VERSION = '6.4.0';
 
 /** 人/记忆列表每页条数（游标分页；契约默认 50，最大 200）。 */
 export const PAGE_SIZE = 50;
@@ -430,4 +432,71 @@ export const HISTORY_EVENT_META: Record<MemoryHistoryEvent, { label: string; ton
   FEEDBACK: { label: '反馈', tone: 'cyan', desc: '用户标记有帮助/没帮助' },
   RESTORE: { label: '恢复', tone: 'lime', desc: '记忆被恢复' },
   PRIVACY: { label: '隐私处理', tone: 'pink', desc: '隐私规则 / 占位符替换' },
+};
+
+/* ------------------------------------------------------------------ */
+/* v6.4 大模型设置                                                     */
+/* ------------------------------------------------------------------ */
+
+export const LLM_PROTOCOLS: {
+  value: LlmProtocol;
+  label: string;
+  baseUrlHint: string;
+  desc: string;
+}[] = [
+  {
+    value: 'openai',
+    label: 'OpenAI 兼容',
+    baseUrlHint: 'https://api.openai.com/v1',
+    desc: 'POST {baseUrl}/chat/completions，Bearer 鉴权；兼容 OpenAI / DeepSeek / 通义 / vLLM / Ollama。',
+  },
+  {
+    value: 'anthropic',
+    label: 'Anthropic',
+    baseUrlHint: 'https://api.anthropic.com',
+    desc: 'POST {baseUrl}/v1/messages，x-api-key + anthropic-version: 2023-06-01。',
+  },
+];
+
+export const LLM_PROTOCOL_LABEL: Record<LlmProtocol, string> = {
+  openai: 'OpenAI 兼容',
+  anthropic: 'Anthropic',
+};
+
+/** 阶段顺序与说明（契约 docs/llm-settings.md 第 1 节）。 */
+export const LLM_STAGES: {
+  value: LlmStage;
+  label: string;
+  desc: string;
+}[] = [
+  { value: 'brief', label: '简报', desc: '把“关于这个人已知什么”压缩成可注入的简报。' },
+  { value: 'dream', label: '做梦', desc: '定时把新记忆巩固成洞见 / 整理。' },
+  { value: 'profile', label: '画像', desc: '人详情页的事实摘要与画像。' },
+  { value: 'privacy', label: '隐私', desc: '按提示词抽取 PII 实体。' },
+  { value: 'extract', label: '抽取（预留）', desc: '规则实体抽取暂不调 LLM；预留给后续模型抽取。' },
+];
+
+export const LLM_STAGE_LABELS: Record<LlmStage, string> = Object.fromEntries(
+  LLM_STAGES.map((item) => [item.value, item.label]),
+) as Record<LlmStage, string>;
+
+/** 阶段表单初值：与后端未配置阶段的补全值一致（0.2 / 1024 / 20s / 启用）。 */
+export const LLM_STAGE_DEFAULTS: Record<
+  LlmStage,
+  { temperature: number; maxTokens: number; timeoutMs: number }
+> = Object.fromEntries(
+  LLM_STAGES.map((item) => [
+    item.value,
+    { temperature: 0.2, maxTokens: 1024, timeoutMs: 20000 },
+  ]),
+) as Record<LlmStage, { temperature: number; maxTokens: number; timeoutMs: number }>;
+
+/** 与服务端一致的取值范围。 */
+export const LLM_LIMITS = {
+  temperatureMin: 0,
+  temperatureMax: 2,
+  maxTokensMin: 1,
+  maxTokensMax: 8192,
+  timeoutMsMin: 1000,
+  timeoutMsMax: 120000,
 };

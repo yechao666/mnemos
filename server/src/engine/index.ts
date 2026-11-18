@@ -46,7 +46,21 @@ export {
   toMemoryJob,
 } from './jobs.ts';
 export { writeHistory, listMemoryHistory } from './history.ts';
-export { llmText } from './llm.ts';
+export { callLlm, createLlmRouter, decryptProviderApiKey, isLlmClient, llmModelLabel, llmText } from './llm.ts';
+export type { LlmClient, LlmLike, LlmTextInput } from './llm.ts';
+export {
+  LLM_STAGE_DEFAULTS,
+  LLM_STAGES,
+  createLlmProvider,
+  deleteLlmProvider,
+  listLlmProviders,
+  listLlmStages,
+  llmStatus,
+  llmUsage,
+  testLlmProvider,
+  updateLlmProvider,
+  upsertLlmStage,
+} from './llm-settings.ts';
 export {
   buildDeterministicSummary,
   getPersonProfile,

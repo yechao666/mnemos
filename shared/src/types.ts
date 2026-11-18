@@ -411,6 +411,84 @@ export interface MemoryDetail {
 }
 
 /* ------------------------------------------------------------------ */
+/* v6.4：大模型设置                                                     */
+/* ------------------------------------------------------------------ */
+
+export type LlmProtocol = 'openai' | 'anthropic';
+export type LlmStage = 'brief' | 'dream' | 'profile' | 'privacy' | 'extract';
+
+export interface LlmProvider {
+  id: string;
+  name: string;
+  protocol: LlmProtocol;
+  baseUrl: string;
+  defaultModel?: string;
+  hasApiKey: boolean;
+  apiKeyMasked?: string;
+  inputPrice: number;
+  outputPrice: number;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LlmProviderInput {
+  name: string;
+  protocol?: LlmProtocol;
+  baseUrl: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+  defaultModel?: string;
+  inputPrice?: number;
+  outputPrice?: number;
+  enabled?: boolean;
+}
+
+export interface LlmStageConfig {
+  stage: LlmStage;
+  providerId?: string;
+  model?: string;
+  temperature: number;
+  maxTokens: number;
+  timeoutMs: number;
+  systemPrompt?: string;
+  enabled: boolean;
+  updatedAt?: string;
+}
+
+export interface LlmStageConfigInput {
+  providerId?: string | null;
+  model?: string | null;
+  temperature?: number;
+  maxTokens?: number;
+  timeoutMs?: number;
+  systemPrompt?: string | null;
+  enabled?: boolean;
+}
+
+export interface LlmTestResult {
+  ok: boolean;
+  latencyMs?: number;
+  model?: string;
+  error?: string;
+}
+
+export interface LlmUsageSummary {
+  stage: LlmStage;
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+  estimatedCost: number;
+}
+
+export interface LlmStatus {
+  envFallbackConfigured: boolean;
+  providers: number;
+  stages: number;
+  encryptionConfigured: boolean;
+}
+
+/* ------------------------------------------------------------------ */
 /* v6.2：隐私规则域                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -1073,6 +1151,17 @@ export interface MemoryService {
   /* --- v6.1 P2：实体 / 关系图 --- */
   entityGraph(query: EntityGraphQuery): EntityGraph;
   listEntities(query: EntityListQuery): EntityList;
+
+  /* --- v6.4：大模型设置 --- */
+  listLlmProviders(): LlmProvider[];
+  createLlmProvider(input: LlmProviderInput, actor: Actor): LlmProvider;
+  updateLlmProvider(id: string, input: Partial<LlmProviderInput>, actor: Actor): LlmProvider;
+  deleteLlmProvider(id: string, actor: Actor): void;
+  testLlmProvider(id: string): Promise<LlmTestResult>;
+  listLlmStages(): LlmStageConfig[];
+  upsertLlmStage(stage: LlmStage, input: LlmStageConfigInput, actor: Actor): LlmStageConfig;
+  llmUsage(days: number): LlmUsageSummary[];
+  llmStatus(): LlmStatus;
 
   /* --- v6.2：隐私规则 --- */
   listPrivacyRules(partitionId?: string): PrivacyRule[];

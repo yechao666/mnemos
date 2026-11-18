@@ -293,6 +293,7 @@ const memorySearchV1Schema = z.object({
 const briefQueryV1Schema = z.object({
   force: booleanQuerySchema.optional(),
   max_chars: z.coerce.number().int().min(100).max(5000).optional(),
+  allow_llm: booleanQuerySchema.optional(),
 });
 
 const contextV1Schema = z.object({
@@ -1201,6 +1202,7 @@ export function registerV1Routes(router: Router): void {
         personId: person.id,
         maxChars: query.max_chars,
         force: query.force,
+        allowLlm: query.allow_llm === true,
       });
       markUsage(rc, partition, 'brief', 'api', brief.count);
       rc.json(briefV1(brief));

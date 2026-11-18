@@ -17,6 +17,7 @@ import { SettingsPage } from '../pages/SettingsPage.tsx';
 import { PrivacyRulesPage } from '../pages/PrivacyRulesPage.tsx';
 import { ApiDocsPage } from '../pages/ApiDocsPage.tsx';
 import { OrgSettingsPage } from '../pages/OrgSettingsPage.tsx';
+import { ModelsPage } from '../pages/ModelsPage.tsx';
 import { NotFoundPage } from '../pages/NotFoundPage.tsx';
 
 function BootScreen() {
@@ -69,6 +70,7 @@ export function AppRoutes() {
           <Route path="docs" element={<ApiDocsPage />} />
         </Route>
         <Route path="/org/privacy" element={<PrivacyRulesPage />} />
+        <Route path="/org/models" element={<ModelsPage />} />
         <Route path="/org" element={<OrgSettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>

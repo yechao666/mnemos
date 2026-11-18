@@ -1,9 +1,10 @@
-# Mnemos v6.1 架构
+# Mnemos v6.4 架构
 
-> 契约：[`v6-architecture.md`](v6-architecture.md) + [`roadmap-v6.1.md`](roadmap-v6.1.md)。
-> 本文描述 v6.3 的实现结构：分层、schema v9 表与索引、FTS 与触发器、计数维护、
-> 混合检索与融合、写入/异步任务管线、画像与生命周期、图/附件/PII/加密、鉴权隔离、
-> 控制台与百万级列表的性能预算。
+> 契约：[`v6-architecture.md`](v6-architecture.md) + [`roadmap-v6.1.md`](roadmap-v6.1.md) +
+> [`llm-settings.md`](llm-settings.md)（大模型设置 / schema v10）。
+> 本文描述 v6.4 的实现结构：分层、schema v10 表与索引、FTS 与触发器、计数维护、
+> 混合检索与融合、写入/异步任务管线、画像与生命周期、图/附件/PII/加密、
+> LLM 供应商与阶段路由、鉴权隔离、控制台与百万级列表的性能预算。
 >
 > v6 是**干净重建**：核心只有 **分区（Partition）+ 人（Person）+ 记忆（Memory）**。
 > 旧领域（agents / tasks / 任务简报 / 项目记录 / 复盘 / 报告 / webhooks）在 v6 的代码、
@@ -33,17 +34,19 @@
 │  partitions · persons · memories · brief · context · dream       │
 │  retrieval（混合检索） · embed（hash-384） · history · jobs      │
 │  profile（facts/画像） · graph · attachments · pii/crypto        │
-│  cursor（keyset） · rows（映射/设置归一化） · llm（可选）        │
+│  cursor（keyset） · rows（映射/设置归一化） · llm（协议/路由）    │
+│  llm-settings（供应商/阶段/用量/测试连接）                       │
 └───────────────┬──────────────────────────────────────────────────┘
                 │ node:sqlite（内置，无第三方驱动）
 ┌───────────────▼──────────────────────────────────────────────────┐
-│ SQLite（WAL，schema v9）                                          │
+│ SQLite（WAL，schema v10）                                         │
 │  partitions · persons(+fts) · memories(+fts) · sessions           │
 │  partition_stats（触发器维护） · memory_briefs · dream_runs      │
 │  memory_history · memory_feedback · memory_jobs                   │
 │  person_facts · person_profiles · memory_attachments              │
 │  entities · memory_entities · relations · idempotency_keys        │
 │  privacy_rules · privacy_rule_groups · memory_placeholders        │
+│  llm_providers · llm_stage_configs · llm_calls（v6.4）            │
 │  api_keys · audit_logs · usage_events · maintenance_runs          │
 │  orgs · users · user_sessions（仅控制台登录/权限）                │
 └──────────────────────────────────────────────────────────────────┘
@@ -81,7 +84,7 @@ Partition（App / 项目 / 租户 / DSH 工作区）
 
 | 表 | 用途 | 关键约束/字段 |
 | --- | --- | --- |
-| `meta` | schema 版本等元数据 | `schema_version = 9` |
+| `meta` | schema 版本等元数据 | `schema_version = 10` |
 | `orgs` | 组织 | `slug UNIQUE` |
 | `users` | 控制台账号（登录/角色） | `email UNIQUE`，`failed_login_attempts`、`locked_until` |
 | `user_sessions` | 控制台会话 | 只存 `sha256(token)`，`expires_at` |
@@ -111,6 +114,9 @@ Partition（App / 项目 / 租户 / DSH 工作区）
 | `privacy_rule_groups` | 隐私规则库分组（v6.3，18 组） | `key` 主键；`sort_order`；启动时按 catalog 幂等 upsert |
 | `privacy_rules` | 隐私规则（global + 分区覆盖） | `UNIQUE(scope, partition_id, code)`；v9 列 `group_key` / `validator` / `context_keywords` / `case_sensitive` / `region` / `severity` |
 | `memory_placeholders` | 记忆占位符映射（v6.2） | `UNIQUE(memory_id, placeholder)`；值 `value_cipher` + `encrypted`（AES-256-GCM，可选） |
+| `llm_providers` | LLM 供应商（v6.4） | `name UNIQUE`；`protocol`；`base_url`；`api_key_cipher` + `api_key_encrypted`；`input_price/output_price`（$/1M） |
+| `llm_stage_configs` | 按阶段的模型分配（v6.4） | `stage` 主键（brief/dream/profile/privacy/extract）；`provider_id`/`model`/`temperature`/`max_tokens`/`timeout_ms`/`system_prompt`/`enabled` |
+| `llm_calls` | LLM 调用流水（v6.4） | 只记录元数据（stage/provider/model/protocol/tokens/duration/status/error），**不记录 prompt/响应** |
 
 v6.1 **仍不创建**的旧表：`projects`、`agents`、`tasks`、`task_briefs`、`memory_terms`、
 `webhooks`、`webhook_deliveries`、`reports`、`records`、`retrospectives`、`project_members` 等。
@@ -145,7 +151,7 @@ idx_memories_recent   (partition_id, created_at DESC, id DESC)
 idx_memories_session  (partition_id, session_id)
 ```
 
-v6.1/v6.2/v6.3 新增（schema v7/v8/v9）索引与隐私表：
+v6.1/v6.2/v6.3/v6.4 新增（schema v7/v8/v9/v10）索引与隐私/LLM 表：
 
 ```sql
 idx_memories_valid  (partition_id, person_id, valid_to, created_at DESC)  -- 默认列表 + 时序
@@ -163,6 +169,8 @@ idx_entities_partition  (partition_id, mention_count DESC)
 idx_memory_entities_entity (entity_id)
 idx_relations_partition (partition_id, weight DESC)
 idx_privacy_rules_group (scope, partition_id, group_key)   -- v9 按组过滤
+idx_llm_calls_stage     (stage, created_at DESC)           -- v10 usage 按阶段聚合
+idx_llm_calls_created   (created_at DESC)                  -- v10 时间窗
 ```
 
 其余索引：`idx_partitions_org`、`idx_sessions_person`、`idx_dream_runs_partition/person`、
@@ -369,6 +377,56 @@ GET /v1/partitions/:p/memories?cursor=...&limit=50&person_id=...&scope=...&categ
 
 ---
 
+### 4.9 大模型路由与调用（v6.4）
+
+- **三张表的分工**：
+  - `llm_providers`：供应商（协议、baseUrl、默认模型、加密后的 Key、单价、启停）；
+  - `llm_stage_configs`：五阶段（brief/dream/profile/privacy/extract）的模型分配与采样参数；
+  - `llm_calls`：每次实际请求的元数据流水（tokens/耗时/状态），usage 与成本由它聚合。
+- **解析流程**（`createLlmRouter(db, fallbackLlm)`，每次调用按阶段解析）：
+
+```
+callLlm(stage, input)
+  │
+  ├─ 有 llm_stage_configs[stage] 行？
+  │    ├─ enabled=false ────────────────→ ''（不发请求）
+  │    └─ 解析 providerId → llm_providers
+  │         ├─ provider 不存在 ───────────→ 回退 env（视为配置未完成）
+  │         ├─ provider.enabled=false ───→ ''（不发请求）
+  │         ├─ 无 key / 无 model ────────→ 回退 env（视为配置未完成）
+  │         └─ model = stage.model || provider.defaultModel
+  │              └─ protocol = provider.protocol，apiKey 解密后发请求
+  │
+  └─ 无阶段行（或配置未完成）
+       └─ env fallback：MNEMOS_LLM_BASE_URL + MNEMOS_LLM_API_KEY
+            └─ 有 → openai 协议、MNEMOS_LLM_MODEL（默认 gpt-4o-mini）
+            └─ 无 → ''（调用方走确定性逻辑）
+```
+
+- **协议**：
+  - `openai`：`POST {baseUrl}/chat/completions`（已以 `/chat/completions` 结尾则原样），
+    `Authorization: Bearer`，读 `choices[0].message.content` 与 `usage.prompt_tokens/completion_tokens`；
+  - `anthropic`：`POST {baseUrl}/v1/messages`（baseUrl 已含 `/v1` 时拼 `/messages`，
+    已含 `/v1/messages` 时原样），`x-api-key` + `anthropic-version: 2023-06-01`，
+    读 `content[].text` 与 `usage.input_tokens/output_tokens`。
+- **密钥**：`api_key_cipher` 用 `lib/crypto` 的 AES-256-GCM（`MNEMOS_ENCRYPTION_KEY` 派生）；
+  未配置密钥时明文 + `api_key_encrypted=0`。API 只返回 `hasApiKey` / `apiKeyMasked`，永不出明文。
+  更新时省略 `apiKey` 保持不变，`clearApiKey=true` 清除。
+- **失败**：超时/非 2xx/结构异常一律返回 `''`，写 `llm_calls(status='error'|'timeout')` 后由调用方
+  回退确定性实现；**不发请求**的路径（阶段/供应商禁用、无配置）不写流水。失败不影响写入、检索、
+  简报接口的成功响应。不记录 prompt 与响应正文。
+- **调用点**（均把原来的 `llmText` 换成 `callLlm(stage, …)`）：
+  - `brief`：`engine/brief.ts` 的人级/分区级简报润色（确定性摘要始终先生成，LLM 只改写）；
+  - `dream`：`engine/dream.ts` 的洞见归并润色；
+  - `profile`：`engine/profile.ts` 的画像摘要（≤800 字）；
+  - `privacy`：`engine/privacy.ts` 的 prompt 规则抽取（JSON entities，服务端校验 value 出现在原文）。
+  - `extract`：预留，v6.4 无调用点。
+- **用量**：`llm_calls` 按 `(stage, created_at)` 与 `created_at` 建索引；`GET /api/llm/usage`
+  时间窗聚合 calls/tokens，并按供应商单价估算成本（`prompt/1e6×input + completion/1e6×output`）。
+  测试连接不写 `llm_calls`，避免污染业务用量。
+- **配置读取**：router 每次调用实时读 DB（SQLite 单进程，开销可忽略）；控制台修改后下一次调用
+  即生效，无需重启；env fallback 在启动时由 `loadEnv` 读取，修改需重启。
+
 ## 5. 鉴权与隔离
 
 | 主体 | 凭据 | 能力 |
@@ -396,7 +454,8 @@ GET /v1/partitions/:p/memories?cursor=...&limit=50&person_id=...&scope=...&categ
   /persons/:personRef               人详情（资料 + 计数 + 最近记忆 + 简报 + 做梦）
   /memories                         记忆列表（person/scope/category 筛选 + FTS）
   /keys /usage /audit /settings /docs
-/org                                组织设置（账号、组织级 API Key）
+/org                                组织设置（账号、组织级 API Key、模型设置）
+/org/models                         模型设置（供应商 / 阶段分配 / 测试连接 / 用量）
 ```
 
 - `web/src/lib/api.ts` 统一封装 `/api`，做 camelCase/snake_case 归一化；
@@ -410,11 +469,14 @@ GET /v1/partitions/:p/memories?cursor=...&limit=50&person_id=...&scope=...&categ
 
 ## 7. 迁移与版本
 
-- 空库启动自动执行 `schema.sql`，写入 `meta.schema_version = 9`；`CREATE ... IF NOT EXISTS`
+- 空库启动自动执行 `schema.sql`，写入 `meta.schema_version = 10`；`CREATE ... IF NOT EXISTS`
   可重复执行，缺失的索引/触发器会补齐。
 - v6 库（`schema_version=6`）启动时**幂等升级到 v7**：`ensureColumns` 补 `memories` / `persons`
   新列，`backfillV7` 回填 `normalized_hash` 与 `valid_from`；新表由 `schema.sql` 的
   `IF NOT EXISTS` 建好。embedding 不在迁移里同步计算，由 worker / `pnpm backfill:embeddings` 补齐。
+- v9 库（`schema_version=9`）启动时**幂等升级到 v10**：`schema.sql` 的 `IF NOT EXISTS` 建
+  `llm_providers` / `llm_stage_configs` / `llm_calls` 与两个索引；纯新增，不改既有表与数据；
+  默认仍走 v6.3 行为（阶段表为空 → env → 确定性）。
 - v8 库（`schema_version=8`）启动时**幂等升级到 v9**：`ensureColumns` 给 `privacy_rules` 补
   `group_key` / `validator` / `context_keywords` / `case_sensitive` / `region` / `severity`，
   `schema.sql` 建 `privacy_rule_groups` 与 `idx_privacy_rules_group`；旧内置 code

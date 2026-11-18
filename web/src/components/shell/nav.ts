@@ -13,6 +13,7 @@ export interface NavEntry {
 export const NAV_ENTRIES: NavEntry[] = [
   { to: '/partitions', label: '分区', icon: 'layers' },
   { to: '/org/privacy', label: '隐私规则', icon: 'shield', end: true },
+  { to: '/org/models', label: '模型设置', icon: 'cpu' },
   { to: '/org', label: '组织设置', icon: 'settings', end: true },
 ];
 
@@ -48,6 +49,9 @@ export function breadcrumbs(pathname: string, partitions: Partition[]): Crumb[] 
     return crumbs;
   }
 
+  if (pathname.startsWith('/org/models')) {
+    return [{ label: '组织设置', to: '/org' }, { label: '模型设置' }];
+  }
   if (pathname.startsWith('/org/privacy')) {
     return [{ label: '组织设置', to: '/org' }, { label: '隐私规则' }];
   }

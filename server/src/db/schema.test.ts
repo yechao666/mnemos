@@ -16,7 +16,7 @@ function tableNames(db: DatabaseSync): Set<string> {
   return new Set(rows.map((row) => row.name));
 }
 
-test('schema v9：核心表 + v6.1/v6.2/v6.3 新表存在、旧领域表不建、schema_version=9', () => {
+test('schema v10：核心表 + v6.1/v6.2/v6.3/v6.4 新表存在、旧领域表不建、schema_version=10', () => {
   const db = fresh();
   const tables = tableNames(db);
 
@@ -53,6 +53,10 @@ test('schema v9：核心表 + v6.1/v6.2/v6.3 新表存在、旧领域表不建�
     'memory_placeholders',
     /* v6.3 规则库分组 */
     'privacy_rule_groups',
+    /* v6.4 大模型设置 */
+    'llm_providers',
+    'llm_stage_configs',
+    'llm_calls',
   ]) {
     assert.ok(tables.has(table), `缺少表 ${table}`);
   }
@@ -69,7 +73,7 @@ test('schema v9：核心表 + v6.1/v6.2/v6.3 新表存在、旧领域表不建�
     assert.ok(!tables.has(oldTable), `v6 不应存在旧表 ${oldTable}`);
   }
 
-  assert.equal(getSchemaVersion(db), 9);
+  assert.equal(getSchemaVersion(db), 10);
   db.close();
 });
 

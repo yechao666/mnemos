@@ -1,8 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { ContextInput, Memory, Person, PersonContext } from '../../../shared/src/types.ts';
-import type { LlmConfig } from '../env.ts';
 import { estimateTokens } from '../lib/usage.ts';
 import { generateBrief } from './brief.ts';
+import type { LlmLike } from './llm.ts';
 import { engineErrors } from './errors.ts';
 import { personMemories, sharedMemories } from './memories.ts';
 import { findPartitionById } from './partition.ts';
@@ -28,7 +28,7 @@ const DEFAULT_BUDGET_TOKENS = 2_000;
  */
 export async function buildContext(
   db: DatabaseSync,
-  llm: LlmConfig | null,
+  llm: LlmLike,
   input: ContextInput,
 ): Promise<PersonContext> {
   if (!findPartitionById(db, input.partitionId)) throw engineErrors.notFound('分区不存在');

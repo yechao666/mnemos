@@ -167,7 +167,10 @@ export function OrgSettingsPage() {
           <Button size="sm" icon="shield" onClick={() => navigate('/org/privacy')}>
             全局隐私规则
           </Button>
-          <span className="tiny dim">组织密钥在任一分区的「密钥」页管理（仅 owner）；隐私规则可在「隐私规则」页维护。</span>
+          <Button size="sm" icon="cpu" onClick={() => navigate('/org/models')}>
+            模型设置
+          </Button>
+          <span className="tiny dim">组织密钥在任一分区的「密钥」页管理（仅 owner）；隐私规则可在「隐私规则」页维护；模型供应商与阶段分配在「模型设置」页配置。</span>
         </div>
       </Card>
 

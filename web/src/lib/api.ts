@@ -25,6 +25,15 @@ import type {
   EntityGraphTypeCount,
   EntitySummary,
   HealthInfo,
+  LlmProvider,
+  LlmProviderInput,
+  LlmProtocol,
+  LlmStage,
+  LlmStageConfig,
+  LlmStageConfigInput,
+  LlmStatus,
+  LlmTestResult,
+  LlmUsageSummary,
   Memory,
   MemoryAttachment,
   MemoryAttachmentInput,
@@ -1144,6 +1153,175 @@ function privacyRuleBody(input: PrivacyRuleInput): Record<string, unknown> {
 }
 
 /* ------------------------------------------------------------------ */
+/* v6.4 大模型设置归一化                                                */
+/* 契约 docs/llm-settings.md；后端尚未上线时页面用错误态稳定展示。       */
+/* ------------------------------------------------------------------ */
+
+const LLM_STAGE_VALUES: LlmStage[] = ['brief', 'dream', 'profile', 'privacy', 'extract'];
+
+function asLlmStage(value: unknown): LlmStage {
+  return typeof value === 'string' && (LLM_STAGE_VALUES as string[]).includes(value)
+    ? (value as LlmStage)
+    : 'brief';
+}
+
+function asLlmProtocol(value: unknown): LlmProtocol {
+  return value === 'anthropic' ? 'anthropic' : 'openai';
+}
+
+function optNum(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value);
+  return undefined;
+}
+
+/** 从裸数组 / {items} / {providers} 等常见包裹里取出列表。 */
+function llmList(source: unknown, keys: string[]): unknown[] {
+  if (Array.isArray(source)) return source;
+  const record = asRecord(source);
+  for (const key of keys) {
+    if (Array.isArray(record[key])) return record[key] as unknown[];
+  }
+  return [];
+}
+
+function adaptLlmProvider(input: unknown): LlmProvider {
+  const raw = asRecord(input);
+  return {
+    id: str(raw.id),
+    name: str(raw.name),
+    protocol: asLlmProtocol(raw.protocol),
+    baseUrl: str(raw.baseUrl ?? raw.base_url),
+    defaultModel: optStr(raw.defaultModel ?? raw.default_model),
+    hasApiKey: bool(raw.hasApiKey ?? raw.has_api_key),
+    apiKeyMasked: optStr(raw.apiKeyMasked ?? raw.api_key_masked),
+    inputPrice: num(raw.inputPrice ?? raw.input_price),
+    outputPrice: num(raw.outputPrice ?? raw.output_price),
+    enabled: raw.enabled !== false,
+    createdAt: optStr(raw.createdAt ?? raw.created_at),
+    updatedAt: optStr(raw.updatedAt ?? raw.updated_at),
+  };
+}
+
+function adaptLlmProviderList(source: unknown): LlmProvider[] {
+  return llmList(source, ['items', 'providers']).map(adaptLlmProvider);
+}
+
+function adaptLlmStageConfig(input: unknown, fallbackStage?: LlmStage): LlmStageConfig {
+  const raw = asRecord(input);
+  const stage = fallbackStage ?? asLlmStage(raw.stage);
+  const defaults = LLM_STAGE_FALLBACK[stage];
+  return {
+    stage,
+    providerId: optStr(raw.providerId ?? raw.provider_id),
+    model: optStr(raw.model),
+    temperature: num(raw.temperature, defaults.temperature),
+    maxTokens: num(raw.maxTokens ?? raw.max_tokens, defaults.maxTokens),
+    timeoutMs: num(raw.timeoutMs ?? raw.timeout_ms, defaults.timeoutMs),
+    systemPrompt: optStr(raw.systemPrompt ?? raw.system_prompt),
+    enabled: raw.enabled !== false,
+    updatedAt: optStr(raw.updatedAt ?? raw.updated_at),
+  };
+}
+
+/** 与后端未配置阶段的补全值一致（0.2 / 1024 / 20s）；内联避免 api 反向依赖 UI 层。 */
+const LLM_STAGE_FALLBACK: Record<LlmStage, { temperature: number; maxTokens: number; timeoutMs: number }> = {
+  brief: { temperature: 0.2, maxTokens: 1024, timeoutMs: 20000 },
+  dream: { temperature: 0.2, maxTokens: 1024, timeoutMs: 20000 },
+  profile: { temperature: 0.2, maxTokens: 1024, timeoutMs: 20000 },
+  privacy: { temperature: 0.2, maxTokens: 1024, timeoutMs: 20000 },
+  extract: { temperature: 0.2, maxTokens: 1024, timeoutMs: 20000 },
+};
+
+function adaptLlmStageList(source: unknown): LlmStageConfig[] {
+  return llmList(source, ['items', 'stages']).map((item) => {
+    const raw = asRecord(item);
+    return adaptLlmStageConfig(raw.config ?? item);
+  });
+}
+
+function adaptLlmTestResult(input: unknown): LlmTestResult {
+  const raw = asRecord(input);
+  const result = asRecord(raw.result ?? raw);
+  return {
+    ok: bool(result.ok),
+    latencyMs: optNum(result.latencyMs ?? result.latency_ms ?? result.ms),
+    model: optStr(result.model),
+    error: optStr(result.error ?? result.message),
+  };
+}
+
+function adaptLlmStatus(input: unknown): LlmStatus {
+  const raw = asRecord(input);
+  const count = (value: unknown): number => (Array.isArray(value) ? value.length : num(value));
+  return {
+    envFallbackConfigured: bool(raw.envFallbackConfigured ?? raw.env_fallback_configured),
+    providers: count(raw.providers),
+    stages: count(raw.stages),
+    encryptionConfigured: bool(raw.encryptionConfigured ?? raw.encryption_configured),
+  };
+}
+
+function adaptLlmUsage(input: unknown): LlmUsageSummary {
+  const raw = asRecord(input);
+  return {
+    stage: asLlmStage(raw.stage),
+    calls: num(raw.calls),
+    promptTokens: num(raw.promptTokens ?? raw.prompt_tokens),
+    completionTokens: num(raw.completionTokens ?? raw.completion_tokens),
+    estimatedCost: num(raw.estimatedCost ?? raw.estimated_cost ?? raw.cost),
+  };
+}
+
+function adaptLlmUsageList(source: unknown): LlmUsageSummary[] {
+  return llmList(source, ['items', 'usage', 'rows']).map(adaptLlmUsage);
+}
+
+function llmProviderBody(input: LlmProviderInput): Record<string, unknown> {
+  return {
+    name: input.name,
+    protocol: input.protocol,
+    baseUrl: input.baseUrl,
+    defaultModel: input.defaultModel === undefined ? undefined : input.defaultModel,
+    inputPrice: input.inputPrice,
+    outputPrice: input.outputPrice,
+    enabled: input.enabled,
+    apiKey: input.apiKey || undefined,
+    clearApiKey: input.clearApiKey || undefined,
+  };
+}
+
+function llmStageBody(input: LlmStageConfigInput): Record<string, unknown> {
+  return {
+    providerId: input.providerId ?? null,
+    model: input.model ?? null,
+    temperature: input.temperature,
+    maxTokens: input.maxTokens,
+    timeoutMs: input.timeoutMs,
+    systemPrompt: input.systemPrompt ?? null,
+    enabled: input.enabled,
+  };
+}
+
+/**
+ * 把 LLM 接口的原始错误翻译成可读提示（403/404/网络错误不崩页面）。
+ * 供模型设置页统一展示。
+ */
+export function llmErrorHint(message: string | null | undefined): string {
+  const text = (message ?? '').trim();
+  if (!text) return '请求未成功，请稍后重试。';
+  if (/403|forbidden|权限不足|需要管理员|需要\s*(owner|admin)/i.test(text)) {
+    return '需要管理员（owner / admin）权限才能管理模型设置。';
+  }
+  if (/404|not.?found|不存在|未找到|未实现|未上线/i.test(text)) {
+    return '后端尚未提供该接口（v6.4 模型设置 API 可能未上线），请确认服务版本。';
+  }
+  if (/401|unauthorized|登录已失效/i.test(text)) return '登录已失效，请重新登录。';
+  if (/无法连接|network|fetch/i.test(text)) return '无法连接 Mnemos 服务，请确认后端已启动。';
+  return text;
+}
+
+/* ------------------------------------------------------------------ */
 /* API                                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -1688,6 +1866,65 @@ export const api = {
           limit: params.limit,
         }),
       }),
+  },
+
+  /* --- v6.4：大模型设置（owner/admin） --- */
+  llm: {
+    /** env fallback 是否配置、供应商/阶段数量、密钥加密状态。 */
+    status: async (): Promise<LlmStatus> => adaptLlmStatus(await request<unknown>('/api/llm/status')),
+
+    providers: {
+      list: async (): Promise<LlmProvider[]> =>
+        adaptLlmProviderList(await request<unknown>('/api/llm/providers')),
+      create: async (input: LlmProviderInput): Promise<LlmProvider> => {
+        const raw = asRecord(
+          await request<unknown>('/api/llm/providers', {
+            method: 'POST',
+            body: JSON.stringify(llmProviderBody(input)),
+          }),
+        );
+        return adaptLlmProvider(raw.provider ?? raw);
+      },
+      update: async (providerId: string, input: Partial<LlmProviderInput>): Promise<LlmProvider> => {
+        const raw = asRecord(
+          await request<unknown>(`/api/llm/providers/${encodeURIComponent(providerId)}`, {
+            method: 'PATCH',
+            body: JSON.stringify(llmProviderBody(input as LlmProviderInput)),
+          }),
+        );
+        return adaptLlmProvider(raw.provider ?? raw);
+      },
+      remove: (providerId: string) =>
+        request<{ ok: boolean }>(`/api/llm/providers/${encodeURIComponent(providerId)}`, {
+          method: 'DELETE',
+        }),
+      /** 发一条最小请求验证连通性；返回 ok / 延迟 / 实际模型 / 错误。 */
+      test: async (providerId: string): Promise<LlmTestResult> =>
+        adaptLlmTestResult(
+          await request<unknown>(`/api/llm/providers/${encodeURIComponent(providerId)}/test`, {
+            method: 'POST',
+          }),
+        ),
+    },
+
+    stages: {
+      list: async (): Promise<LlmStageConfig[]> =>
+        adaptLlmStageList(await request<unknown>('/api/llm/stages')),
+      /** 逐阶段 upsert：PUT /api/llm/stages/:stage。 */
+      update: async (stage: LlmStage, input: LlmStageConfigInput): Promise<LlmStageConfig> => {
+        const raw = asRecord(
+          await request<unknown>(`/api/llm/stages/${encodeURIComponent(stage)}`, {
+            method: 'PUT',
+            body: JSON.stringify(llmStageBody(input)),
+          }),
+        );
+        return adaptLlmStageConfig(raw.config ?? raw, stage);
+      },
+    },
+
+    /** 近 N 天按 stage 汇总 calls / tokens / estimatedCost。 */
+    usage: async (days = 30): Promise<LlmUsageSummary[]> =>
+      adaptLlmUsageList(await request<unknown>(`/api/llm/usage${qs({ days })}`)),
   },
 
   org: {

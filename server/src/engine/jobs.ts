@@ -1,8 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { MemoryJob, MemoryJobStatus, MemoryJobType } from '../../../shared/src/types.ts';
-import type { LlmConfig } from '../env.ts';
 import { newId, nowIso } from '../lib/ids.ts';
 import { blobToEmbedding, embedText, EMBEDDING_DIM, EMBEDDING_MODEL, embeddingToBlob } from './embed.ts';
+import type { LlmLike } from './llm.ts';
 import { applyPrivacyToMemory, applyPrivacyToMemorySync } from './privacy.ts';
 import { getPersonProfile } from './profile.ts';
 import { resolvePerson } from './persons.ts';
@@ -336,7 +336,7 @@ export function executeJob(db: DatabaseSync, job: JobRow): void {
 /** privacy 任务异步执行（regex + prompt；无 LLM 时等价于 regex）。 */
 export async function runPrivacyJob(
   db: DatabaseSync,
-  llm: LlmConfig | null,
+  llm: LlmLike,
   partitionId: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
@@ -345,7 +345,7 @@ export async function runPrivacyJob(
   await applyPrivacyToMemory(db, llm, partitionId, memoryId, { reason: 'privacy:job' });
 }
 
-async function executeJobAsync(db: DatabaseSync, llm: LlmConfig | null, job: JobRow): Promise<void> {
+async function executeJobAsync(db: DatabaseSync, llm: LlmLike, job: JobRow): Promise<void> {
   if (job.type === 'privacy') {
     await runPrivacyJob(db, llm, job.partition_id, parseJson<Record<string, unknown>>(job.payload, {}));
     return;
@@ -411,7 +411,7 @@ export function processJobs(
  */
 export async function processJobsAsync(
   db: DatabaseSync,
-  llm: LlmConfig | null,
+  llm: LlmLike,
   options: { limit?: number; maxAttempts?: number; now?: number } = {},
 ): Promise<ProcessJobsResult> {
   const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_JOB_ATTEMPTS);
@@ -460,7 +460,7 @@ export interface StartJobWorkerOptions {
   tickMs?: number;
   batchSize?: number;
   /** v6.2：prompt 隐私规则需要的 LLM 配置（缺省则 privacy 任务只跑 regex）。 */
-  llm?: LlmConfig | null;
+  llm?: LlmLike;
 }
 
 /** 启动同进程 worker：默认 1s tick、每批 10 条；timer.unref 不阻止进程退出。 */

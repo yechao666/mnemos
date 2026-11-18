@@ -1,6 +1,7 @@
-# 运维手册（v6.1）
+# 运维手册（v6.4）
 
-> 配套：[安全模型](security.md) · [可观测性](observability.md) · [百万级与压测](v6-scale.md) · [API](api.md)
+> 配套：[安全模型](security.md) · [可观测性](observability.md) · [百万级与压测](v6-scale.md) ·
+> [API](api.md) · [大模型设置](llm-settings.md)
 > 示例假设服务在 `http://127.0.0.1:4380`，演示账号 `admin@mnemos.dev / Demo123456`（仅演示环境）。
 
 ---
@@ -118,7 +119,7 @@ pnpm start
 
 创建后立即在控制台修改密码，并从环境变量中移除明文密码。
 
-## 3. 配置项（v6.1）
+## 3. 配置项（v6.4）
 
 完整列表与注释见 [`.env.example`](../.env.example)。生产要点：
 
@@ -144,8 +145,10 @@ pnpm start
 | `MNEMOS_BODY_LIMIT_BYTES` | `1048576` | 请求体上限 |
 | `MNEMOS_DREAM_SCHEDULER/TICK_MS` | `1` / `60000` | 分区级做梦调度 |
 | `MNEMOS_WECOM_MOCK` | 跟随 `MNEMOS_DEMO` | 登录页企业微信 Mock；生产必须 0 |
-| `MNEMOS_ENCRYPTION_KEY` | 空 | v6.1 P2：配置后 AES-256-GCM 加密 `memory_attachments.url`；空=明文 |
-| `MNEMOS_LLM_*` | 空 | 可选模型；不配则离线确定性实现（画像摘要同样回退确定性） |
+| `MNEMOS_ENCRYPTION_KEY` | 空 | v6.4：AES-256-GCM 加密模型 API Key，同时保护附件 URL 与占位符值；空=明文（仅开发） |
+| `MNEMOS_LLM_BASE_URL` | 空 | LLM 阶段未配置时的回退 baseUrl（OpenAI 兼容，兼容 `OPENAI_BASE_URL`） |
+| `MNEMOS_LLM_API_KEY` | 空 | 回退密钥（兼容 `OPENAI_API_KEY`）；与 baseUrl 同时存在才启用回退 |
+| `MNEMOS_LLM_MODEL` | `gpt-4o-mini` | 回退模型；不配则离线确定性实现（画像摘要同样回退确定性） |
 | `MNEMOS_STORAGE` | `sqlite` | postgres 未实现，启动会拒绝 |
 
 启动时 `assertEnv` 校验：数据/备份目录可写、端口/超时/维护间隔/日志级别合法、
@@ -330,7 +333,97 @@ curl -s "http://127.0.0.1:4380/api/ops/maintenance?limit=20" -H "authorization: 
 
 失败会在 `maintenance_runs` 记录 `failed`，不中断调度器；大库首次归档建议低峰执行。
 
-## 9. 密钥轮换与登录锁定
+## 9. 大模型设置与密钥轮换（v6.4）
+
+设计、字段、协议与成本公式见 [llm-settings.md](llm-settings.md)；本节只讲运维动作。
+
+### 9.1 优先级：控制台设置 > 环境变量 > 确定性
+
+| 顺序 | 来源 | 生效条件 | 说明 |
+| --- | --- | --- | --- |
+| 1 | `llm_stage_configs` + `llm_providers` | 阶段行存在、`enabled=true`、供应商存在且启用、模型/密钥可用 | 推荐方式；改完立即生效，无需重启 |
+| 2 | 环境变量 | 阶段未配置（或配置未完成）且 `MNEMOS_LLM_BASE_URL` + `MNEMOS_LLM_API_KEY` 非空 | 兼容 v6.3；协议固定 `openai`，模型 `MNEMOS_LLM_MODEL` |
+| 3 | 确定性逻辑 | 以上都不可用，或调用失败/超时 | 简报压缩、做梦规则归并、画像拼接、regex 隐私规则；主流程不受影响 |
+
+- **阶段 `enabled=false`**：显式关闭该阶段，不调 LLM、**不回退环境变量**、不写 `llm_calls`。
+- **供应商 `enabled=false`**：同上（显式禁用）。
+- 阶段启用但供应商被删/无密钥/无模型：视为「配置未完成」，回退环境变量；都没有则确定性。
+- 环境变量回退只支持 OpenAI 兼容协议；Anthropic 必须配供应商。
+- 环境变量在**启动时**读取（`loadEnv`），修改后需重启；控制台配置即时生效。
+- `GET /api/llm/status` 的 `envFallbackConfigured` 可确认当前 env 回退是否就绪。
+
+### 9.2 首次配置（控制台或 curl）
+
+1. 组织设置 → **模型设置** → 新建供应商（baseUrl、默认模型、API Key、价格、启用）。
+2. 点「测试连接」，确认 `ok=true` 与延迟；失败先看第 9.5 节。
+3. 阶段配置表逐行选择供应商/模型；建议先只配 `brief`，观察 `usage` 与日志再扩到其他阶段。
+4. `GET /api/llm/status`：`providers/stages` 计数符合预期，`encryptionConfigured=true`（生产）。
+5. 触发一次人级简报（`GET /api/partitions/:p/persons/:person/brief?force=true`），确认
+   `llm_calls` 出现 `status='ok'`。
+
+```bash
+# 测试连接（不回显密钥；15s 超时；不写 llm_calls）
+curl -s -X POST "$BASE/api/llm/providers/<id>/test" -H "authorization: Bearer $TOKEN" | jq .
+
+# 近 30 天用量
+curl -s "$BASE/api/llm/usage?days=30" -H "authorization: Bearer $TOKEN" | jq .
+
+# 直接查库排障（不记录 prompt，可安全查看）
+sqlite3 data-v6/mnemos.db \
+  "SELECT stage,status,model,count(*) FROM llm_calls WHERE created_at > datetime('now','-1 day') GROUP BY 1,2,3;"
+```
+
+### 9.3 密钥轮换
+
+`MNEMOS_ENCRYPTION_KEY` 是**共享加密密钥**：模型 API Key、附件 URL、隐私占位符值都用它
+（AES-256-GCM，密文格式 `v1:iv:tag:cipher`）。当前实现**没有 key id / 多密钥解密**，
+所以轮换是一个需要维护窗口的操作：
+
+1. 备份旧密钥（密码管理器/KMS），并确认 `data-v6/` 与备份目录的访问控制；
+2. 停服，设置新的 `MNEMOS_ENCRYPTION_KEY`，重启；
+3. 旧密文无法解密：
+   - 模型供应商 `hasApiKey` 仍为 true，但 `apiKeyMasked` 为空、测试连接报无法解密 →
+     在控制台对每个供应商重新 PATCH 一次 API Key；
+   - 附件 URL、占位符值需要按业务重新写入或从明文源恢复（没有自动 re-encrypt 脚本）；
+4. 逐个「测试连接」，并抽查附件/占位符读取；
+5. 确认无误后再销毁旧密钥；回滚方案 = 换回旧密钥并重启（期间不要覆盖旧密文）。
+
+> 建议：把 `MNEMOS_ENCRYPTION_KEY` 当作**长期密钥**，只在泄露/合规要求时轮换；
+> 轮换前先评估存量附件与占位符，必要时先导出明文再切换。只换模型 API Key（不动加密密钥）时，
+> 直接在控制台 PATCH 单个供应商即可，不影响其他数据。
+
+### 9.4 成本控制
+
+| 阶段 | 建议模型档位 | 理由 |
+| --- | --- | --- |
+| `privacy` | 小/快模型（gpt-4o-mini、qwen-plus、本地 Ollama） | 高频、短输出、JSON 抽取；失败自动回退 regex |
+| `brief` | 小/快模型 | 高频、有确定性兜底；`maxTokens` 1024 足够 |
+| `dream` | 大模型（claude-sonnet、gpt-4.1） | 低频、要求归并与抽象质量 |
+| `profile` | 大模型 | 低频、面向用户的画像摘要 |
+| `extract` | 不配（预留） | v6.4 无调用点 |
+
+- 价格填 `$/1M tokens`（不是 `$/1K`）；本地模型可填 0，成本仍按 token 统计。
+- 用 `maxTokens` 控 completion 成本：privacy 512、brief 1024、dream/profile 1200–1600。
+- 定期看 `usage`：`calls` 异常升高通常意味着上游重试/循环；持续 401 不会产生 tokens，但会刷日志。
+- 高敏场景可让 `privacy`/`brief` 走本地 vLLM/Ollama，只有 dream/profile 出网。
+
+### 9.5 故障排查
+
+| 现象 | 排查 |
+| --- | --- |
+| 「测试连接」401/403 | API Key 错、被吊销、缺模型权限；确认密钥填的是供应商 key，不是 Mnemos 的 `mnemos_live_…` |
+| 「测试连接」超时 | 出网被拦/代理未配/DNS；先在同一台机器 `curl` 供应商端点；本地 Ollama 确认 11434 监听 |
+| 404（Anthropic） | baseUrl 填错域名/代理路径；建议填 `https://api.anthropic.com`，服务端会补 `/v1/messages` |
+| 404（OpenAI 兼容） | baseUrl 少写 `/v1` 或多了路径；以 `/chat/completions` 结尾会被原样使用 |
+| 响应非 JSON / 结构异常 | 协议选错、baseUrl 指向网页/网关、模型名不对；先 curl 看原始响应与状态码 |
+| 配了阶段但仍走 env | 阶段行未保存（看 `/api/llm/status.stages` 计数）、`enabled=false`、供应商被禁用；`GET /stages` 的默认值不代表已保存 |
+| 配了 env 但没效果 | 只配了 key 或只配了 baseUrl；两者都要；修改后是否重启 |
+| `usage` 空 | 时间窗内无调用；调用全被 provider 禁用/阶段关闭（不发请求，不写 `llm_calls`）；`days` 范围 1–90 |
+| 成本明显偏高 | 检查是否把大模型配到 brief/privacy；`maxTokens` 是否过大；供应商价格是否误填 `$/1K` |
+| 供应商 `apiKeyMasked` 为空/测试报无法解密 | 加密密钥变更/丢失；重新 PATCH API Key（`hasApiKey` 仍为 true） |
+| 简报/画像突然变短 | LLM 失败回退确定性；查 `llm_calls.status/error` 与日志中的 LLM 告警 |
+
+## 10. 密钥轮换与登录锁定
 
 ```bash
 # 创建最小作用域分区 key（secret 只返回一次）
@@ -356,13 +449,14 @@ curl -s -X DELETE http://127.0.0.1:4380/api/partitions/<partition>/keys/<keyId> 
 
 - 管理员重置账号密码：`POST /api/org/users/:id/reset-password`（返回一次性临时密码并清理会话）。
 
-## 10. 升级与回滚
+## 11. 升级与回滚
 
 1. **备份**：`POST /api/ops/backup`。
 2. **预检**：`MNEMOS_DATA_DIR=data-v6 node scripts/preflight.ts`；确认目录可写、端口空闲、DB 完整性与 schema 版本。
 3. **部署**：拉代码 → `pnpm install --frozen-lockfile` → `pnpm build`（前端）→ 重启进程。
-4. **schema**：v6.1 启动时幂等执行 `schema.sql`（`IF NOT EXISTS`，补索引/触发器）；
-   v6 库自动升级到 v7（补列 + 回填 hash/valid_from），`meta.schema_version` 为 7；
+4. **schema**：启动时幂等执行 `schema.sql`（`IF NOT EXISTS`，补索引/触发器）；
+   v6 库自动升级到 v7（补列 + 回填 hash/valid_from），v8→v9 补隐私规则库，v9→v10 纯新增
+   `llm_providers` / `llm_stage_configs` / `llm_calls`（不改既有表）；当前 `meta.schema_version` 为 10；
    检测到 v5 库会拒绝启动。升级后跑 `pnpm backfill:embeddings` 补历史向量。
 5. **验证**：`/readyz`、`/health`、控制台登录、关键列表/搜索。
 6. **回滚**：停新版本 → 回退代码/镜像 → 启动旧版本。若期间 schema 已变更，
@@ -373,7 +467,7 @@ sqlite3 -readonly data-v6/mnemos.db "SELECT value FROM meta WHERE key='schema_ve
 sqlite3 -readonly data-v6/mnemos.db "PRAGMA integrity_check;"
 ```
 
-## 11. 容量与性能
+## 12. 容量与性能
 
 - 1M 人分区列表/搜索预算与实测、种子与压测步骤见 [v6-scale.md](v6-scale.md)。
 - 单进程单写者：写入串行；大量导入用批事务；避免与 VACUUM/备份争 I/O。
@@ -381,7 +475,7 @@ sqlite3 -readonly data-v6/mnemos.db "PRAGMA integrity_check;"
 - 用量事件会持续增长，可按需清理（保留审计）：`DELETE FROM usage_events WHERE created_at < ?`。
 - 审计日志按合规要求保留，建议外送 SIEM。
 
-## 12. 常见问题
+## 13. 常见问题
 
 | 现象 | 排查 |
 | --- | --- |
@@ -402,10 +496,13 @@ sqlite3 -readonly data-v6/mnemos.db "PRAGMA integrity_check;"
 | 检索没有 vector 信号 | 旧记忆未回填 embedding；跑 `pnpm backfill:embeddings` 或等 worker |
 | 图谱为空 | `settings.autoExtractEntities=false` 或 extract 任务未跑；看 `memory_jobs` |
 | 附件 URL 读不出 | 配置了 `MNEMOS_ENCRYPTION_KEY` 但换/丢了密钥；密文无法用新密钥解密 |
+| 模型设置 401/超时/404 | 见 [9.5 故障排查](#95-故障排查)；先用 curl 直连供应商排除网络/密钥问题 |
+| 阶段配置不生效 | 阶段行未保存/`enabled=false`/供应商禁用；看 `GET /api/llm/status.stages` 与 `llm_calls` |
+| 模型用量为 0 | 无实际调用（阶段关闭/供应商禁用不发请求），或 `days` 超出 1–90 |
 | 502/503 写重试重复 | 写接口未带 `Idempotency-Key`；v6.1 建议所有写请求带稳定幂等键 |
 | 恢复后 `/readyz` 503 | 备份不完整或 schema 不匹配；重新启动触发迁移并核对 `integrity_check` |
 
-## 13. 脚本现状（v6.1）
+## 14. 脚本现状（v6.4）
 
 | 脚本 | 用途 |
 | --- | --- |
