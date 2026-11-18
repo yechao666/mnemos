@@ -1,3 +1,4 @@
+import { useMemo, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import { APP_NAME, APP_TAGLINE, APP_VERSION } from '@lib/constants.ts';
 import { useAuth } from '@lib/auth.tsx';
@@ -25,7 +26,15 @@ export function Sidebar({ open, collapsed, onClose, onToggleCollapse }: SidebarP
   const healthTone = health.error ? 'red' : health.data?.ok ? 'green' : 'slate';
   const healthLabel = health.loading ? '检测中' : health.error ? '服务不可用' : health.data?.ok ? '服务正常' : '状态未知';
 
-  const quickPartitions = partitions.slice(0, 6);
+  const [quickFilter, setQuickFilter] = useState('');
+  const filteredPartitions = useMemo(() => {
+    const keyword = quickFilter.trim().toLowerCase();
+    if (!keyword) return partitions.slice(0, 6);
+    return partitions.filter(
+      (partition) =>
+        partition.name.toLowerCase().includes(keyword) || partition.slug.toLowerCase().includes(keyword),
+    );
+  }, [partitions, quickFilter]);
   const navLinkClass = ({ isActive }: { isActive: boolean }) => `nav-item${isActive ? ' active' : ''}`;
   const compactStyle = compact ? { justifyContent: 'center', padding: 0 } : undefined;
 
@@ -70,13 +79,40 @@ export function Sidebar({ open, collapsed, onClose, onToggleCollapse }: SidebarP
 
         {compact ? null : (
           <>
-            <div className="nav-section">快速访问</div>
-            {quickPartitions.length === 0 ? (
-              <div className="tiny dim" style={{ padding: '4px 10px' }}>
-                暂无分区
+            <div className="nav-section quick-section">
+              <span>快速访问</span>
+              {partitions.length > 0 ? <span className="quick-section-count mono">{partitions.length}</span> : null}
+            </div>
+            {partitions.length > 0 ? (
+              <div className="quick-filter">
+                <Icon name="search" size={13} />
+                <input
+                  value={quickFilter}
+                  onChange={(event) => setQuickFilter(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape') setQuickFilter('');
+                  }}
+                  placeholder="筛选快速访问…"
+                  aria-label="筛选快速访问分区"
+                />
+                {quickFilter ? (
+                  <button
+                    type="button"
+                    className="quick-filter-clear"
+                    aria-label="清除快速访问筛选"
+                    onClick={() => setQuickFilter('')}
+                  >
+                    <Icon name="x" size={12} />
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+            {filteredPartitions.length === 0 ? (
+              <div className="tiny dim" style={{ padding: '6px 10px' }}>
+                {partitions.length === 0 ? '暂无分区' : '没有匹配的分区'}
               </div>
             ) : (
-              quickPartitions.map((partition) => (
+              filteredPartitions.map((partition) => (
                 <NavLink
                   key={partition.id}
                   to={`/partitions/${partition.id}`}
